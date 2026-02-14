@@ -43,6 +43,13 @@ pub const V6_TX_VERSION: u32 = 6;
 #[cfg(zcash_unstable = "nu7")]
 pub const V6_VERSION_GROUP_ID: u32 = 0xFFFFFFFF;
 
+/// Transaction version 7, specified for tachyon transactions.
+#[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+pub const V7_TX_VERSION: u32 = 7;
+/// The version group ID for Zcash v7 transactions.
+#[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+pub const V7_VERSION_GROUP_ID: u32 = 0x26A7270B;
+
 /// This version is used exclusively for in-development transaction
 /// serialization, and will never be active under the consensus rules.
 /// When new consensus transaction versions are added, all call sites

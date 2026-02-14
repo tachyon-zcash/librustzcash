@@ -48,6 +48,9 @@ use zcash_protocol::constants::{
 #[cfg(zcash_unstable = "nu7")]
 use zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID};
 
+#[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+use zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID};
+
 #[cfg(zcash_unstable = "zfuture")]
 use {
     self::components::tze::{self, TzeIn, TzeOut},
@@ -84,6 +87,9 @@ pub enum TxVersion {
     /// Transaction version 6, specified in [ZIP 230](https://zips.z.cash/zip-0230).
     #[cfg(zcash_unstable = "nu7")]
     V6,
+    /// Transaction version 7, specified for tachyon transactions.
+    #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+    V7,
     /// This version is used exclusively for in-development transaction
     /// serialization, and will never be active under the consensus rules.
     /// When new consensus transaction versions are added, all call sites
@@ -106,6 +112,8 @@ impl TxVersion {
                 (V5_TX_VERSION, V5_VERSION_GROUP_ID) => Ok(TxVersion::V5),
                 #[cfg(zcash_unstable = "nu7")]
                 (V6_TX_VERSION, V6_VERSION_GROUP_ID) => Ok(TxVersion::V6),
+                #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+                (V7_TX_VERSION, V7_VERSION_GROUP_ID) => Ok(TxVersion::V7),
                 #[cfg(zcash_unstable = "zfuture")]
                 (ZFUTURE_TX_VERSION, ZFUTURE_VERSION_GROUP_ID) => Ok(TxVersion::ZFuture),
                 _ => Err(io::Error::new(
@@ -138,6 +146,8 @@ impl TxVersion {
                 TxVersion::V5 => V5_TX_VERSION,
                 #[cfg(zcash_unstable = "nu7")]
                 TxVersion::V6 => V6_TX_VERSION,
+                #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+                TxVersion::V7 => V7_TX_VERSION,
                 #[cfg(zcash_unstable = "zfuture")]
                 TxVersion::ZFuture => ZFUTURE_TX_VERSION,
             }
@@ -151,6 +161,8 @@ impl TxVersion {
             TxVersion::V5 => V5_VERSION_GROUP_ID,
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => V6_VERSION_GROUP_ID,
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => V7_VERSION_GROUP_ID,
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => ZFUTURE_VERSION_GROUP_ID,
         }
@@ -172,6 +184,8 @@ impl TxVersion {
             TxVersion::V5 => false,
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => false,
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => false,
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => false,
         }
@@ -189,6 +203,8 @@ impl TxVersion {
             TxVersion::V5 => true,
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => true,
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => true,
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => true,
         }
@@ -201,6 +217,8 @@ impl TxVersion {
             TxVersion::V5 => true,
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => true,
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => true,
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => true,
         }
@@ -215,6 +233,8 @@ impl TxVersion {
             TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 | TxVersion::V5 => false,
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => true,
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => true,
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => true,
         }
@@ -663,6 +683,8 @@ impl Transaction {
             TxVersion::V5 => Ok(Self::from_data_v5(data)),
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => Ok(Self::from_data_v6(data)),
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => Ok(Self::from_data_v6(data)),
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => Ok(Self::from_data_v6(data)),
         }
@@ -719,6 +741,8 @@ impl Transaction {
             TxVersion::V5 => Self::read_v5(reader.into_base_reader(), version),
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => Self::read_v6(reader.into_base_reader(), version),
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => Self::read_v6(reader.into_base_reader(), version),
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => Self::read_v6(reader.into_base_reader(), version),
         }
@@ -969,6 +993,8 @@ impl Transaction {
             TxVersion::V5 => self.write_v5(writer),
             #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => self.write_v6(writer),
+            #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+            TxVersion::V7 => self.write_v6(writer),
             #[cfg(zcash_unstable = "zfuture")]
             TxVersion::ZFuture => self.write_v6(writer),
         }

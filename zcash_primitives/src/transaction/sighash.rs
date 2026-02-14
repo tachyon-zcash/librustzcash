@@ -78,6 +78,8 @@ pub fn signature_hash<
 
         #[cfg(zcash_unstable = "nu7")]
         TxVersion::V6 => v6_signature_hash(tx, signable_input, txid_parts),
+        #[cfg(all(zcash_unstable = "zfuture", feature = "tx_v7"))]
+        TxVersion::V7 => v6_signature_hash(tx, signable_input, txid_parts),
         #[cfg(zcash_unstable = "zfuture")]
         TxVersion::ZFuture => v6_signature_hash(tx, signable_input, txid_parts),
     })
