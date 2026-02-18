@@ -87,6 +87,9 @@ redjubjub.workspace = true
 # - Transparent protocol
 ripemd.workspace = true
 
+# - Tachyon
+tachyon.workspace = true
+
 # - ZIP 32
 fpe.workspace = true
 
@@ -107,6 +110,7 @@ rand_xorshift.workspace = true
 transparent = { workspace = true, features = ["test-dependencies"] }
 sapling = { workspace = true, features = ["test-dependencies"] }
 orchard = { workspace = true, features = ["test-dependencies"] }
+tachyon = {workspace = true}
 zcash_protocol = { workspace = true, features = ["test-dependencies"] }
 
 [target.'cfg(unix)'.dev-dependencies]
@@ -116,6 +120,7 @@ pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
 default = ["multicore", "std", "circuits"]
 std = ["document-features", "redjubjub/std"]
 zip-233 = []
+tx_v7 = []
 
 ## Enables creating proofs
 circuits = ["orchard/circuit", "sapling/circuit"]

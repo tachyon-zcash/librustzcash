@@ -70,6 +70,9 @@ sapling = { package = "sapling-crypto", version = "0.5", default-features = fals
 orchard = { version = "0.11", default-features = false }
 pasta_curves = "0.5"
 
+# - Tachyon
+tachyon = {path = "../tachyon/crates/tachyon"}
+
 # - Transparent
 bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["alloc"] }
 block-buffer = { version = "=0.11.0-rc.3" } # later RCs require edition2024

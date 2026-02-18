@@ -344,6 +344,7 @@ pub struct TransactionData<A: Authorization> {
     orchard_bundle: Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
     #[cfg(zcash_unstable = "zfuture")]
     tze_bundle: Option<tze::Bundle<A::TzeAuth>>,
+    tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>,
 }
 
 impl<A: Authorization> TransactionData<A> {
@@ -363,6 +364,7 @@ impl<A: Authorization> TransactionData<A> {
         sprout_bundle: Option<sprout::Bundle>,
         sapling_bundle: Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
         orchard_bundle: Option<orchard::Bundle<A::OrchardAuth, ZatBalance>>,
+        tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>
     ) -> Self {
         TransactionData {
             version,
@@ -378,6 +380,7 @@ impl<A: Authorization> TransactionData<A> {
             sprout_bundle,
             sapling_bundle,
             orchard_bundle,
+            tachyon_bundle,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: None,
         }
@@ -459,6 +462,10 @@ impl<A: Authorization> TransactionData<A> {
     #[cfg(zcash_unstable = "zfuture")]
     pub fn tze_bundle(&self) -> Option<&tze::Bundle<A::TzeAuth>> {
         self.tze_bundle.as_ref()
+    }
+
+    pub fn tachyon_bundle(&self) -> Option<&tachyon::bundle::Stripped<ZatBalance>> {
+        self.tachyon_bundle.as_ref()
     }
 
     /// Returns the total fees paid by the transaction, given a function that can be used to
@@ -563,6 +570,7 @@ impl<A: Authorization> TransactionData<A> {
             orchard_bundle: f_orchard(self.orchard_bundle),
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: f_tze(self.tze_bundle),
+            tachyon_bundle: self.tachyon_bundle,
         }
     }
 
@@ -607,6 +615,7 @@ impl<A: Authorization> TransactionData<A> {
             orchard_bundle: f_orchard(self.orchard_bundle)?,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: f_tze(self.tze_bundle)?,
+            tachyon_bundle: self.tachyon_bundle,
         })
     }
 
@@ -649,6 +658,7 @@ impl<A: Authorization> TransactionData<A> {
             }),
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: self.tze_bundle.map(|b| b.map_authorization(f_tze)),
+            tachyon_bundle: self.tachyon_bundle,
         }
     }
 }
@@ -826,6 +836,7 @@ impl Transaction {
                 orchard_bundle: None,
                 #[cfg(zcash_unstable = "zfuture")]
                 tze_bundle: None,
+                tachyon_bundle: None,
             },
         })
     }
@@ -883,6 +894,7 @@ impl Transaction {
             orchard_bundle,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: None,
+            tachyon_bundle: None,
         };
 
         Ok(Self::from_data_v5(data))
@@ -916,6 +928,7 @@ impl Transaction {
             orchard_bundle,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle,
+            tachyon_bundle: None,
         };
 
         Ok(Self::from_data_v5(data))

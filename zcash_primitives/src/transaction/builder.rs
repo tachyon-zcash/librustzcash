@@ -849,6 +849,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             orchard_bundle,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle,
+            tachyon_bundle: None,
         };
 
         //
@@ -930,6 +931,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             orchard_bundle,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle,
+            tachyon_bundle: unauthed_tx.tachyon_bundle,
         };
 
         // The unwrap() here is safe because the txid hashing

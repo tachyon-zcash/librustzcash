@@ -1,4 +1,10 @@
 {
     //"rust-analyzer.cargo.features": "all",
+    "rust-analyzer.cargo.cfgs": [
+        "debug_assertions",
+        "miri",
+        "zcash_unstable=zfuture"      
+    ],
+    "rust-analyzer.cargo.features": ["tx_v7"],
     "rust-analyzer.server.extraEnv": { "RUSTUP_TOOLCHAIN": "stable" }
 }

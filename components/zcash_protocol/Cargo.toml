@@ -43,6 +43,7 @@ proptest.workspace = true
 [features]
 default = ["std"]
 std = ["document-features", "dep:memuse"]
+tx_v7 = []
 
 ## Exposes APIs that are useful for testing, such as `proptest` strategies.
 test-dependencies = [

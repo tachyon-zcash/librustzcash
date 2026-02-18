@@ -2368,6 +2368,7 @@ fn parse_tx<P: consensus::Parameters>(
                 tx_data.sprout_bundle().cloned(),
                 tx_data.sapling_bundle().cloned(),
                 tx_data.orchard_bundle().cloned(),
+                tx_data.tachyon_bundle().cloned(),
             )
             .freeze()
             .map(|t| (expiry_height, t))
