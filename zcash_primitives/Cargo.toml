@@ -49,7 +49,9 @@ group.workspace = true
 jubjub.workspace = true
 nonempty.workspace = true
 orchard.workspace = true
+pasta_curves.workspace = true
 sapling.workspace = true
+zcash_tachyon = { path = "../../tachyon/crates/tachyon" }
 zcash_spec.workspace = true
 
 # - Note Commitment Trees
