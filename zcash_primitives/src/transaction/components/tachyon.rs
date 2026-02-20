@@ -1,7 +1,8 @@
 //! Functions for parsing & serialization of Tachyon transaction components.
 
 use core2::io::{self, Read, Write};
-use pasta_curves::{Fp, group::GroupEncoding};
+use pasta_curves::Fp;
+use ff::PrimeField;
 
 use zcash_tachyon as tachyon;
 use zcash_encoding::{CompactSize, Vector};
@@ -144,7 +145,7 @@ fn read_tachygram<R: Read>(mut reader: R) -> io::Result<tachyon::Tachygram> {
     reader.read_exact(&mut bytes)?;
     
     // Convert bytes to Fp, then to Tachygram
-    let fp = Fp::from_repr(bytes).ok_or_else(|| {
+    let fp = Fp::from_repr(bytes).into_option().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "invalid field element for tachygram")
     })?;
     Ok(tachyon::Tachygram::from(fp))
@@ -160,7 +161,7 @@ fn read_anchor<R: Read>(mut reader: R) -> io::Result<tachyon::Anchor> {
     reader.read_exact(&mut bytes)?;
     
     // Convert bytes to Fp, then to Anchor
-    let fp = Fp::from_repr(bytes).ok_or_else(|| {
+    let fp = Fp::from_repr(bytes).into_option().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "invalid field element for anchor")
     })?;
     Ok(tachyon::Anchor::from(fp))

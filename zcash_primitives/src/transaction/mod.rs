@@ -579,6 +579,9 @@ impl<A: Authorization> TransactionData<A> {
         f_orchard: impl FnOnce(
             Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
         ) -> Option<orchard::bundle::Bundle<B::OrchardAuth, ZatBalance>>,
+        #[cfg(zcash_unstable = "nu7")] f_tachyon: impl FnOnce(
+            Option<zcash_tachyon::Bundle<A::TachyonAuth>>,
+        ) -> Option<zcash_tachyon::Bundle<B::TachyonAuth>>,
         #[cfg(zcash_unstable = "zfuture")] f_tze: impl FnOnce(
             Option<tze::Bundle<A::TzeAuth>>,
         )
@@ -599,7 +602,7 @@ impl<A: Authorization> TransactionData<A> {
             sapling_bundle: f_sapling(self.sapling_bundle),
             orchard_bundle: f_orchard(self.orchard_bundle),
             #[cfg(zcash_unstable = "nu7")]
-            tachyon_bundle: self.tachyon_bundle,
+            tachyon_bundle: f_tachyon(self.tachyon_bundle),
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: f_tze(self.tze_bundle),
         }
@@ -623,6 +626,9 @@ impl<A: Authorization> TransactionData<A> {
             Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
         )
             -> Result<Option<orchard::bundle::Bundle<B::OrchardAuth, ZatBalance>>, E>,
+        #[cfg(zcash_unstable = "nu7")] f_tachyon: impl FnOnce(
+            Option<zcash_tachyon::Bundle<A::TachyonAuth>>,
+        ) -> Result<Option<zcash_tachyon::Bundle<B::TachyonAuth>>, E>,
         #[cfg(zcash_unstable = "zfuture")] f_tze: impl FnOnce(
             Option<tze::Bundle<A::TzeAuth>>,
         ) -> Result<
@@ -645,7 +651,7 @@ impl<A: Authorization> TransactionData<A> {
             sapling_bundle: f_sapling(self.sapling_bundle)?,
             orchard_bundle: f_orchard(self.orchard_bundle)?,
             #[cfg(zcash_unstable = "nu7")]
-            tachyon_bundle: self.tachyon_bundle,
+            tachyon_bundle: f_tachyon(self.tachyon_bundle)?,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: f_tze(self.tze_bundle)?,
         })
@@ -657,7 +663,11 @@ impl<A: Authorization> TransactionData<A> {
         mut f_sapling: impl sapling_serialization::MapAuth<A::SaplingAuth, B::SaplingAuth>,
         mut f_orchard: impl orchard_serialization::MapAuth<A::OrchardAuth, B::OrchardAuth>,
         #[cfg(zcash_unstable = "zfuture")] f_tze: impl tze::MapAuth<A::TzeAuth, B::TzeAuth>,
-    ) -> TransactionData<B> {
+    ) -> TransactionData<B>
+    where
+        A::TachyonAuth: Clone,
+        B::TachyonAuth: From<A::TachyonAuth>,
+    {
         TransactionData {
             version: self.version,
             consensus_branch_id: self.consensus_branch_id,
@@ -689,7 +699,12 @@ impl<A: Authorization> TransactionData<A> {
                 )
             }),
             #[cfg(zcash_unstable = "nu7")]
-            tachyon_bundle: self.tachyon_bundle,
+            tachyon_bundle: self.tachyon_bundle.map(|b| tachyon::Bundle {
+                actions: b.actions,
+                value_balance: B::TachyonAuth::from(b.value_balance),
+                binding_sig: b.binding_sig,
+                stamp: b.stamp,
+            }),
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: self.tze_bundle.map(|b| b.map_authorization(f_tze)),
         }
