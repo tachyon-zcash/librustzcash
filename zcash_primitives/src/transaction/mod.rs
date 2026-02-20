@@ -344,7 +344,7 @@ pub struct TransactionData<A: Authorization> {
     orchard_bundle: Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
     #[cfg(zcash_unstable = "zfuture")]
     tze_bundle: Option<tze::Bundle<A::TzeAuth>>,
-    tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>,
+    tachyon_bundle: Option<zcash_tachyon::bundle::Stripped<ZatBalance>>,
 }
 
 impl<A: Authorization> TransactionData<A> {
@@ -364,7 +364,7 @@ impl<A: Authorization> TransactionData<A> {
         sprout_bundle: Option<sprout::Bundle>,
         sapling_bundle: Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
         orchard_bundle: Option<orchard::Bundle<A::OrchardAuth, ZatBalance>>,
-        tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>
+        tachyon_bundle: Option<zcash_tachyon::bundle::Stripped<ZatBalance>>
     ) -> Self {
         TransactionData {
             version,
@@ -400,6 +400,7 @@ impl<A: Authorization> TransactionData<A> {
         sprout_bundle: Option<sprout::Bundle>,
         sapling_bundle: Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
         orchard_bundle: Option<orchard::Bundle<A::OrchardAuth, ZatBalance>>,
+        tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>,
         tze_bundle: Option<tze::Bundle<A::TzeAuth>>,
     ) -> Self {
         TransactionData {
@@ -413,6 +414,7 @@ impl<A: Authorization> TransactionData<A> {
             sprout_bundle,
             sapling_bundle,
             orchard_bundle,
+            tachyon_bundle,
             tze_bundle,
         }
     }
@@ -464,7 +466,7 @@ impl<A: Authorization> TransactionData<A> {
         self.tze_bundle.as_ref()
     }
 
-    pub fn tachyon_bundle(&self) -> Option<&tachyon::bundle::Stripped<ZatBalance>> {
+    pub fn tachyon_bundle(&self) -> Option<&zcash_tachyon::bundle::Stripped<ZatBalance>> {
         self.tachyon_bundle.as_ref()
     }
 
@@ -1297,6 +1299,7 @@ pub mod testing {
                 sprout_bundle: None,
                 sapling_bundle,
                 orchard_bundle,
+                tachyon_bundle: None,
             }
         }
     }
@@ -1363,6 +1366,7 @@ pub mod testing {
             transparent_bundle in transparent::arb_bundle(),
             sapling_bundle in sapling::arb_bundle_for_version(version),
             orchard_bundle in orchard::arb_bundle_for_version(version),
+            tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>,
             tze_bundle in tze::arb_bundle(consensus_branch_id),
             version in Just(version)
         ) -> TransactionData<Authorized> {
@@ -1375,6 +1379,7 @@ pub mod testing {
                 sprout_bundle: None,
                 sapling_bundle,
                 orchard_bundle,
+                tachyon_bundle,
                 tze_bundle
             }
         }
@@ -1391,6 +1396,7 @@ pub mod testing {
             transparent_bundle in transparent::arb_bundle(),
             sapling_bundle in sapling::arb_bundle_for_version(version),
             orchard_bundle in orchard::arb_bundle_for_version(version),
+            tachyon_bundle: Option<tachyon::bundle::Stripped<ZatBalance>>,
             tze_bundle in tze::arb_bundle(consensus_branch_id),
             version in Just(version)
         ) -> TransactionData<Authorized> {
@@ -1404,6 +1410,7 @@ pub mod testing {
                 sprout_bundle: None,
                 sapling_bundle,
                 orchard_bundle,
+                tachyon_bundle,
                 tze_bundle
             }
         }

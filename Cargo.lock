@@ -834,15 +834,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "core2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "cpp_demangle"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1583,7 +1574,7 @@ version = "0.2.2"
 dependencies = [
  "blake2b_simd",
  "cc",
- "core2 0.3.3",
+ "core2",
  "document-features",
  "hex",
 ]
@@ -2982,7 +2973,7 @@ dependencies = [
  "aes",
  "bitvec",
  "blake2b_simd",
- "core2 0.3.3",
+ "core2",
  "ff",
  "fpe",
  "getset",
@@ -4113,7 +4104,7 @@ dependencies = [
  "blake2b_simd",
  "blake2s_simd",
  "bls12_381",
- "core2 0.3.3",
+ "core2",
  "document-features",
  "ff",
  "fpe",
@@ -4723,19 +4714,6 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows",
-]
-
-[[package]]
-name = "tachyon"
-version = "0.0.0"
-dependencies = [
- "bitvec",
- "blake2b_simd",
- "core2 0.4.0",
- "ff",
- "pasta_curves",
- "rand 0.8.5",
- "reddsa",
 ]
 
 [[package]]
@@ -6950,7 +6928,7 @@ dependencies = [
  "assert_matches",
  "bech32",
  "bs58",
- "core2 0.3.3",
+ "core2",
  "f4jumble",
  "proptest",
  "zcash_encoding",
@@ -7138,7 +7116,7 @@ dependencies = [
 name = "zcash_encoding"
 version = "0.3.0"
 dependencies = [
- "core2 0.3.3",
+ "core2",
  "nonempty",
 ]
 
@@ -7182,7 +7160,7 @@ dependencies = [
  "bls12_381",
  "bs58",
  "byteorder",
- "core2 0.3.3",
+ "core2",
  "document-features",
  "group",
  "hex",
@@ -7232,7 +7210,7 @@ dependencies = [
  "block-buffer 0.11.0-rc.3",
  "bs58",
  "chacha20poly1305",
- "core2 0.3.3",
+ "core2",
  "criterion 0.5.1",
  "crypto-common 0.2.0-rc.1",
  "document-features",
@@ -7258,7 +7236,6 @@ dependencies = [
  "secp256k1",
  "sha2 0.10.8",
  "subtle",
- "tachyon",
  "tracing",
  "zcash_address",
  "zcash_encoding",
@@ -7266,6 +7243,7 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_spec",
+ "zcash_tachyon",
  "zcash_transparent",
  "zip32",
 ]
@@ -7298,7 +7276,7 @@ dependencies = [
 name = "zcash_protocol"
 version = "0.7.1"
 dependencies = [
- "core2 0.3.3",
+ "core2",
  "document-features",
  "hex",
  "incrementalmerkletree",
@@ -7334,13 +7312,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zcash_tachyon"
+version = "0.0.0"
+dependencies = [
+ "bitvec",
+ "blake2b_simd",
+ "ff",
+ "group",
+ "pasta_curves",
+ "proptest",
+ "rand 0.8.5",
+ "reddsa",
+]
+
+[[package]]
 name = "zcash_transparent"
 version = "0.6.1"
 dependencies = [
  "bip32",
  "blake2b_simd",
  "bs58",
- "core2 0.3.3",
+ "core2",
  "document-features",
  "getset",
  "hex",

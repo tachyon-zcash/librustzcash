@@ -299,6 +299,7 @@ fn zip_0244() {
             txdata.sprout_bundle().cloned(),
             txdata.sapling_bundle().cloned(),
             txdata.orchard_bundle().cloned(),
+            txdata.tachyon_bundle.cloned(),
             txdata.tze_bundle().cloned(),
         );
         (tdata, txdata.digest(TxIdDigester))
