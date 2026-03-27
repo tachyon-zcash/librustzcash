@@ -212,9 +212,8 @@ fn read_proof<R: Read>(mut reader: R) -> io::Result<Proof> {
     let mut bytes = vec![0u8; TACHYON_PROOF_SIZE];
     reader.read_exact(&mut bytes)?;
     let arr: [u8; TACHYON_PROOF_SIZE] = bytes.try_into().expect("vec is TACHYON_PROOF_SIZE");
-    Proof::try_from(&arr).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "invalid tachyon proof")
-    })
+    Proof::try_from(&arr)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid tachyon proof"))
 }
 
 fn write_proof<W: Write>(mut writer: W, proof: &Proof) -> io::Result<()> {
