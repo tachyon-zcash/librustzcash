@@ -2723,7 +2723,6 @@ dependencies = [
 [[package]]
 name = "mock_ragu"
 version = "0.0.0"
-source = "git+https://github.com/S1nus/tachyon.git?rev=d4f9c0bc21c81e0d78f1fc52af4073bfb65cd3c7#d4f9c0bc21c81e0d78f1fc52af4073bfb65cd3c7"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -7434,7 +7433,6 @@ dependencies = [
 [[package]]
 name = "zcash_tachyon"
 version = "0.0.0"
-source = "git+https://github.com/S1nus/tachyon.git?rev=d4f9c0bc21c81e0d78f1fc52af4073bfb65cd3c7#d4f9c0bc21c81e0d78f1fc52af4073bfb65cd3c7"
 dependencies = [
  "blake2b_simd",
  "ff",
