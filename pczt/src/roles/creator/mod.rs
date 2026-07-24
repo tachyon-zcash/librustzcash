@@ -17,11 +17,11 @@ use crate::{
 use crate::orchard::bundle_version_for_revision;
 
 use zcash_protocol::consensus::BranchId;
+#[cfg(zcash_unstable = "nu7")]
+use zcash_protocol::constants::V7_TX_VERSION;
 use zcash_protocol::constants::{
     V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID,
 };
-#[cfg(zcash_unstable = "nu7")]
-use zcash_protocol::constants::V7_TX_VERSION;
 
 /// Initial flags allowing any modification.
 const INITIAL_TX_MODIFIABLE: u8 = FLAG_TRANSPARENT_INPUTS_MODIFIABLE

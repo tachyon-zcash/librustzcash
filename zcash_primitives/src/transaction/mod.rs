@@ -207,8 +207,10 @@ impl TxVersion {
         match self {
             TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 | TxVersion::V5 => false,
             TxVersion::V6 => true,
+            // It is undecided whether ZIP-233 will be included in the v7 (tachyon) format, so
+            // for now v7 does not carry a burn amount.
             #[cfg(zcash_unstable = "nu7")]
-            TxVersion::V7 => true,
+            TxVersion::V7 => false,
         }
     }
 
@@ -541,8 +543,12 @@ impl<A: Authorization> TransactionData<A> {
                         |b| {
                             let value_balance = match b {
                                 zcash_tachyon::TachyonBundle::NoBundle => 0i64,
-                                zcash_tachyon::TachyonBundle::Proven(s) => i64::from(s.value_balance),
-                                zcash_tachyon::TachyonBundle::Adjunct(s) => i64::from(s.value_balance),
+                                zcash_tachyon::TachyonBundle::Proven(s) => {
+                                    i64::from(s.value_balance)
+                                }
+                                zcash_tachyon::TachyonBundle::Adjunct(s) => {
+                                    i64::from(s.value_balance)
+                                }
                             };
                             ZatBalance::try_from(value_balance).map_err(|_| BalanceError::Overflow)
                         },
@@ -982,20 +988,25 @@ impl Transaction {
     }
 
     /// Reads a v7 (tachyon) transaction: the v6 (Ironwood) body followed by a tachyon bundle.
+    ///
+    /// It is undecided whether ZIP-233 will be included in the v7 format, so for now the v7
+    /// header carries no burn amount and this reads the plain v5-shaped header regardless of the
+    /// `zip-233` feature.
     #[cfg(zcash_unstable = "nu7")]
     fn read_v7<R: Read>(mut reader: R, version: TxVersion) -> io::Result<Self> {
-        let header_fragment = Self::read_v6_header_fragment(&mut reader)?;
+        let (consensus_branch_id, lock_time, expiry_height) =
+            Self::read_header_fragment(&mut reader)?;
 
         let transparent_bundle = Self::read_transparent(&mut reader)?;
         let sapling_bundle = sapling_serialization::read_v5_bundle(&mut reader)?;
         let orchard_bundle = orchard_serialization::read_v6_bundle(
             &mut reader,
-            header_fragment.consensus_branch_id,
+            consensus_branch_id,
             orchard::ValuePool::Orchard,
         )?;
         let ironwood_bundle = orchard_serialization::read_v6_bundle(
             &mut reader,
-            header_fragment.consensus_branch_id,
+            consensus_branch_id,
             orchard::ValuePool::Ironwood,
         )?;
 
@@ -1003,11 +1014,11 @@ impl Transaction {
 
         let data = TransactionData {
             version,
-            consensus_branch_id: header_fragment.consensus_branch_id,
-            lock_time: header_fragment.lock_time,
-            expiry_height: header_fragment.expiry_height,
+            consensus_branch_id,
+            lock_time,
+            expiry_height,
             #[cfg(feature = "zip-233")]
-            zip233_amount: header_fragment.zip233_amount,
+            zip233_amount: Zatoshis::ZERO,
             transparent_bundle,
             sprout_bundle: None,
             sapling_bundle,
@@ -1162,6 +1173,10 @@ impl Transaction {
     }
 
     /// Writes a v7 (tachyon) transaction: the v6 (Ironwood) body followed by a tachyon bundle.
+    ///
+    /// It is undecided whether ZIP-233 will be included in the v7 format, so for now the v7
+    /// header carries no burn amount and this writes the plain v5-shaped header regardless of the
+    /// `zip-233` feature.
     #[cfg(zcash_unstable = "nu7")]
     pub fn write_v7<W: Write>(&self, mut writer: W) -> io::Result<()> {
         if self.sprout_bundle.is_some() {
@@ -1170,7 +1185,7 @@ impl Transaction {
                 "Sprout components cannot be present when serializing to the V7 transaction format.",
             ));
         }
-        self.write_v6_header(&mut writer)?;
+        self.write_v5_header(&mut writer)?;
 
         self.write_transparent(&mut writer)?;
         self.write_v5_sapling(&mut writer)?;

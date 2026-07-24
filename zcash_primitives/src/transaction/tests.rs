@@ -1121,7 +1121,7 @@ fn zip_0244() {
     }
 }
 
-#[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+#[cfg(zcash_unstable = "nu7")]
 #[test]
 fn tachyon_v7_test_vectors() {
     use self::data::tachyon_vectors::*;
@@ -1276,7 +1276,10 @@ fn tachyon_v7_multi_action() {
         .map(|action| {
             let cv: EpAffine = action.cv.into();
             assert_eq!(cv, EpAffine::generator());
-            (EpAffine::from(action.rk).to_bytes(), action_sig_bytes(&action.sig))
+            (
+                EpAffine::from(action.rk).to_bytes(),
+                action_sig_bytes(&action.sig),
+            )
         })
         .collect();
     assert!(action_pairs.contains(&(EXPECTED_RK_42, [0x01u8; 64].to_vec())));
@@ -1287,7 +1290,12 @@ fn tachyon_v7_multi_action() {
     assert_eq!(binding_sig_bytes, [0x02u8; 64]);
 
     assert_eq!(stamped.stamp.tachygrams.len(), 3);
-    let tachygrams: Vec<Fp> = stamped.stamp.tachygrams.iter().map(|&tg| tg.into()).collect();
+    let tachygrams: Vec<Fp> = stamped
+        .stamp
+        .tachygrams
+        .iter()
+        .map(|&tg| tg.into())
+        .collect();
     for seed in [[0xAAu8; 64], [0xCCu8; 64], [0xDDu8; 64]] {
         assert!(tachygrams.contains(&Fp::from_uniform_bytes(&seed)));
     }
