@@ -15,14 +15,14 @@ use rand_core::SeedableRng;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::COIN;
 
-use zcash_pool_migration_backend::build::sign_pczt;
-use zcash_pool_migration_backend::engine::{
+use zcash_pool_migration::build::sign_pczt;
+use zcash_pool_migration::engine::{
     MigrationPlan, MigrationStatus, MigrationTxKind, MigrationTxState, PoolMigrationRead,
     PoolMigrationWrite, batch_unsigned_by_action_budget, build_preparation_unsigned,
     commit_preparation, plan_migration,
 };
-use zcash_pool_migration_backend::preparation::PREP_TX_ACTIONS;
-use zcash_pool_migration_backend::state::AdvanceStep;
+use zcash_pool_migration::preparation::PREP_TX_ACTIONS;
+use zcash_pool_migration::state::AdvanceStep;
 use zcash_pool_migration_memory::{CommitMock, TARGET_HEIGHT, regtest_network, spending_key};
 
 /// A planned single-note migration and the mock wallet that holds the note.
@@ -140,21 +140,29 @@ fn commits_a_multi_layer_migration_in_one_pass() {
         .collect();
     assert_eq!(layer0_ids.len(), 1, "one root transaction in layer 0");
     for tx in state.transactions() {
-        if let MigrationTxKind::Preparation { layer, .. } = tx.kind() {
-            if layer > 0 {
-                assert_eq!(
-                    tx.depends_on(),
-                    &layer0_ids,
-                    "a later layer broadcasts only after its predecessor mines"
-                );
-            }
+        if let MigrationTxKind::Preparation { layer, .. } = tx.kind()
+            && layer > 0
+        {
+            assert_eq!(
+                tx.depends_on(),
+                &layer0_ids,
+                "a later layer broadcasts only after its predecessor mines"
+            );
         }
     }
 
     // The state machine walks the broadcasts in dependency order: layer 0 first; layer 1 only once
     // layer 0 mines; the transfers only once the whole preparation mines.
     let mut state = state;
-    let target = BlockHeight::from_u32(2_100_000);
+    // A height past every scheduled broadcast (so each transaction is due, not blocked on the
+    // schedule) but within every expiry window (so none is expired and offered for rebuild): the
+    // latest scheduled height. This exercises the dependency-ordering walk, not expiry handling.
+    let target = state
+        .transactions()
+        .iter()
+        .map(|t| t.scheduled_height())
+        .max()
+        .expect("the committed migration has transactions");
     match state.next_step(target) {
         AdvanceStep::Prove { id } | AdvanceStep::Broadcast { id } => {
             assert!(layer0_ids.contains(&id), "layer 0 broadcasts first")

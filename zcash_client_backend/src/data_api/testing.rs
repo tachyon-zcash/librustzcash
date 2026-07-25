@@ -52,17 +52,24 @@ use super::{
     ReceivedNotes, ReceivedTransactionOutput, SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance,
     SentTransaction, TransactionDataRequest, TransactionStatus, WalletCommitmentTrees, WalletRead,
     WalletSummary, WalletTest, WalletWrite, Zip32Derivation,
+    anchor_retention::AnchorRetentionInterval,
     chain::{BlockSource, ChainState, CommitmentTreeRoot, ScanSummary, scan_cached_blocks},
     error::Error,
-    scanning::ScanRange,
+    scanning::{ScanPriority, ScanRange},
     wallet::{
         ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
-        input_selection::{GreedyInputSelector, InputSelector, SpendPolicy},
+        input_selection::{
+            GreedyInputSelector, InputSelector, LockFilter, LockedInputPolicy, SpendPolicy,
+        },
         propose_send_max_transfer, propose_standard_transfer_to_address, propose_transfer,
     },
 };
 use crate::{
-    data_api::{MaxSpendMode, TargetValue, error::RewindError, wallet::TargetHeight},
+    data_api::{
+        MaxSpendMode, TargetValue,
+        error::{LockError, RewindError},
+        wallet::TargetHeight,
+    },
     fees::{
         ChangeStrategy, DustOutputPolicy, StandardFeeRule,
         standard::{self, SingleOutputChangeStrategy},
@@ -71,7 +78,9 @@ use crate::{
     proto::compact_formats::{
         self, CompactBlock, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
     },
-    wallet::{Note, NoteId, OvkPolicy, ReceivedNote, WalletTransparentOutput},
+    wallet::{
+        LockOwner, Note, NoteId, OutputRef, OvkPolicy, ReceivedNote, WalletTransparentOutput,
+    },
 };
 
 #[cfg(feature = "transparent-inputs")]
@@ -1061,6 +1070,7 @@ where
             confirmations_policy,
             &SpendPolicy::default(),
             None,
+            None,
         )?;
 
         create_proposed_transactions(
@@ -1103,6 +1113,7 @@ where
             confirmations_policy,
             &SpendPolicy::default(),
             None,
+            None,
         )
     }
 
@@ -1141,6 +1152,7 @@ where
             confirmations_policy,
             spend_policy,
             None,
+            None,
         )
     }
 
@@ -1172,6 +1184,8 @@ where
             memo,
             mode,
             confirmations_policy,
+            &LockedInputPolicy::Exclude,
+            None,
         )
     }
 
@@ -1209,6 +1223,7 @@ where
             memo,
             change_memo,
             fallback_change_pool,
+            None,
             None,
         );
 
@@ -1256,6 +1271,7 @@ where
             to_account,
             confirmations_policy,
             output_filter,
+            None,
         )
     }
 
@@ -1296,6 +1312,7 @@ where
             to_address,
             memo,
             limit,
+            None,
         )
     }
 
@@ -1354,7 +1371,7 @@ where
             ovk_policy,
             proposal,
             expiry_height,
-            ::orchard::builder::BundleType::DEFAULT,
+            ::zcash_primitives::transaction::builder::BundlePadding::DEFAULT,
         )
     }
 
@@ -1439,6 +1456,13 @@ where
     /// Returns the total balance in the given account at this point in the test.
     pub fn get_total_balance(&self, account: AccountIdT) -> Zatoshis {
         self.with_account_balance(account, ConfirmationsPolicy::MIN, |balance| balance.total())
+    }
+
+    /// Returns the locked balance in the given account at this point in the test.
+    pub fn get_locked_balance(&self, account: AccountIdT) -> Zatoshis {
+        self.with_account_balance(account, ConfirmationsPolicy::MIN, |balance| {
+            balance.locked_value()
+        })
     }
 
     /// Returns the balance in the given account that is spendable with the given number
@@ -1608,6 +1632,7 @@ pub trait DataStoreFactory {
     fn new_data_store(
         &self,
         network: LocalNetwork,
+        anchor_retention_interval: Option<AnchorRetentionInterval>,
         #[cfg(feature = "transparent-inputs")] gap_limits: Option<GapLimits>,
     ) -> Result<Self::DataStore, Self::Error>;
 }
@@ -1621,6 +1646,7 @@ pub struct TestBuilder<Cache, DataStoreFactory> {
     initial_chain_state: Option<InitialChainState>,
     account_birthday: Option<AccountBirthday>,
     account_index: Option<zip32::AccountId>,
+    anchor_retention_interval: Option<AnchorRetentionInterval>,
     #[cfg(feature = "transparent-inputs")]
     gap_limits: Option<GapLimits>,
 }
@@ -1655,6 +1681,7 @@ impl TestBuilder<(), ()> {
             initial_chain_state: None,
             account_birthday: None,
             account_index: None,
+            anchor_retention_interval: None,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: None,
         }
@@ -1678,6 +1705,7 @@ impl<A> TestBuilder<(), A> {
             initial_chain_state: self.initial_chain_state,
             account_birthday: self.account_birthday,
             account_index: self.account_index,
+            anchor_retention_interval: self.anchor_retention_interval,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         }
@@ -1698,6 +1726,7 @@ impl<A> TestBuilder<A, ()> {
             initial_chain_state: self.initial_chain_state,
             account_birthday: self.account_birthday,
             account_index: self.account_index,
+            anchor_retention_interval: self.anchor_retention_interval,
             #[cfg(feature = "transparent-inputs")]
             gap_limits: self.gap_limits,
         }
@@ -1715,6 +1744,16 @@ impl<A, B> TestBuilder<A, B> {
         self
     }
 
+    /// Overrides the interval on which the wallet retains durable anchor checkpoints (the default
+    /// is [`AnchorRetentionInterval::ZIP_318`]).
+    ///
+    /// A test that must scan past a retained anchor otherwise has to generate 144 blocks per
+    /// boundary; a short interval makes the same coverage cheap.
+    pub fn with_anchor_retention_interval(mut self, interval: AnchorRetentionInterval) -> Self {
+        self.anchor_retention_interval = Some(interval);
+        self
+    }
+
     #[cfg(feature = "transparent-inputs")]
     pub fn with_gap_limits(self, gap_limits: GapLimits) -> TestBuilder<A, B> {
         TestBuilder {
@@ -1725,6 +1764,7 @@ impl<A, B> TestBuilder<A, B> {
             initial_chain_state: self.initial_chain_state,
             account_birthday: self.account_birthday,
             account_index: self.account_index,
+            anchor_retention_interval: self.anchor_retention_interval,
             gap_limits: Some(gap_limits),
         }
     }
@@ -1892,6 +1932,7 @@ impl<Cache, DsFactory: DataStoreFactory> TestBuilder<Cache, DsFactory> {
             .ds_factory
             .new_data_store(
                 self.network,
+                self.anchor_retention_interval,
                 #[cfg(feature = "transparent-inputs")]
                 self.gap_limits,
             )
@@ -3008,6 +3049,7 @@ impl InputSource for MockWalletDb {
         _protocol: ShieldedPool,
         _index: u32,
         _target_height: TargetHeight,
+        _lock_filter: LockFilter<'_>,
     ) -> Result<Option<ReceivedNote<Self::NoteRef, Note>>, Self::Error> {
         Ok(None)
     }
@@ -3020,6 +3062,7 @@ impl InputSource for MockWalletDb {
         _target_height: TargetHeight,
         _confirmations_policy: ConfirmationsPolicy,
         _exclude: &[Self::NoteRef],
+        _lock_filter: LockFilter<'_>,
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
         Ok(ReceivedNotes::empty())
     }
@@ -3030,6 +3073,7 @@ impl InputSource for MockWalletDb {
         _sources: &[ShieldedPool],
         _target_height: TargetHeight,
         _exclude: &[Self::NoteRef],
+        _lock_filter: LockFilter<'_>,
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
         Err(())
     }
@@ -3040,6 +3084,7 @@ impl InputSource for MockWalletDb {
         _selector: &NoteFilter,
         _target_height: TargetHeight,
         _exclude: &[Self::NoteRef],
+        _lock_filter: LockFilter<'_>,
     ) -> Result<AccountMeta, Self::Error> {
         Err(())
     }
@@ -3124,6 +3169,10 @@ impl WalletRead for MockWalletDb {
     }
 
     fn get_wallet_birthday(&self) -> Result<Option<BlockHeight>, Self::Error> {
+        Ok(None)
+    }
+
+    fn get_wallet_recover_until(&self) -> Result<Option<BlockHeight>, Self::Error> {
         Ok(None)
     }
 
@@ -3348,6 +3397,14 @@ impl WalletWrite for MockWalletDb {
         Ok(())
     }
 
+    fn prune_scan_queue_below(
+        &mut self,
+        _height: BlockHeight,
+        _retain_with_priority: Option<ScanPriority>,
+    ) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+
     fn store_decrypted_tx(
         &mut self,
         _received_tx: DecryptedTransaction<Transaction, Self::AccountId>,
@@ -3357,6 +3414,27 @@ impl WalletWrite for MockWalletDb {
 
     fn set_tx_trust(&mut self, _txid: TxId, _trusted: bool) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn lock_outputs(
+        &mut self,
+        _outputs: &[OutputRef],
+        _owner: LockOwner,
+        _lock_expiry_height: BlockHeight,
+    ) -> Result<usize, LockError<Self::Error>> {
+        Ok(0)
+    }
+
+    fn unlock_output(
+        &mut self,
+        _output: &OutputRef,
+        _owner: LockOwner,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    fn clear_locked_outputs(&mut self, _account: Self::AccountId) -> Result<usize, Self::Error> {
+        Ok(0)
     }
 
     fn store_transactions_to_be_sent(
@@ -3466,6 +3544,26 @@ impl WalletCommitmentTrees for MockWalletDb {
         Ok(())
     }
 
+    fn get_sapling_subtree_root(
+        &mut self,
+        index: u64,
+    ) -> Result<Option<::sapling::Node>, ShardTreeError<Self::Error>> {
+        use shardtree::store::ShardStore as _;
+        self.with_sapling_tree_mut(|t| {
+            let addr =
+                incrementalmerkletree::Address::from_parts(SAPLING_SHARD_HEIGHT.into(), index);
+            Ok::<_, ShardTreeError<Self::Error>>(
+                t.store()
+                    .get_shard(addr)
+                    .map_err(ShardTreeError::Storage)?
+                    .and_then(|shard| match shard.root() {
+                        tree if tree.is_leaf() => tree.leaf_value().copied(),
+                        tree => tree.annotation().and_then(|ann| ann.as_deref().copied()),
+                    }),
+            )
+        })
+    }
+
     #[cfg(feature = "orchard")]
     type OrchardShardStore<'a> = MemoryShardStore<::orchard::tree::MerkleHashOrchard, BlockHeight>;
 
@@ -3503,5 +3601,26 @@ impl WalletCommitmentTrees for MockWalletDb {
         })?;
 
         Ok(())
+    }
+
+    #[cfg(feature = "orchard")]
+    fn get_orchard_subtree_root(
+        &mut self,
+        index: u64,
+    ) -> Result<Option<::orchard::tree::MerkleHashOrchard>, ShardTreeError<Self::Error>> {
+        use shardtree::store::ShardStore as _;
+        self.with_orchard_tree_mut(|t| {
+            let addr =
+                incrementalmerkletree::Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), index);
+            Ok::<_, ShardTreeError<Self::Error>>(
+                t.store()
+                    .get_shard(addr)
+                    .map_err(ShardTreeError::Storage)?
+                    .and_then(|shard| match shard.root() {
+                        tree if tree.is_leaf() => tree.leaf_value().copied(),
+                        tree => tree.annotation().and_then(|ann| ann.as_deref().copied()),
+                    }),
+            )
+        })
     }
 }

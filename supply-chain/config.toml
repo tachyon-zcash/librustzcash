@@ -39,7 +39,7 @@ audit-as-crates-io = true
 [policy.incrementalmerkletree-testing]
 
 [policy.orchard]
-audit-as-crates-io = false
+audit-as-crates-io = true
 
 [policy.pczt]
 audit-as-crates-io = true
@@ -65,6 +65,9 @@ audit-as-crates-io = true
 audit-as-crates-io = true
 
 [policy.zcash_keys]
+audit-as-crates-io = true
+
+[policy.zcash_pool_migration]
 audit-as-crates-io = true
 
 [policy.zcash_primitives]

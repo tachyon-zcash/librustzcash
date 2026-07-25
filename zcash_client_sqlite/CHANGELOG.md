@@ -10,7 +10,14 @@ workspace.
 
 ## [Unreleased]
 
+## [0.22.0-rc.2] - 2026-07-24
+
 ### Added
+- `WalletDb` now implements the new `zcash_client_backend` storage-trait
+  methods `WalletRead::get_wallet_recover_until`,
+  `WalletWrite::prune_scan_queue_below`, and
+  `WalletCommitmentTrees::{get_sapling_subtree_root, get_orchard_subtree_root,
+  get_ironwood_subtree_root}`.
 - `WalletDb::get_unspent_ironwood_notes_at_historical_height` returns all Ironwood
   notes that existed and were unspent at a given height.
 - `WalletDb::transactionally_with_extension` performs wallet operations and writes to
@@ -26,15 +33,56 @@ workspace.
 - `zewif::ZewifImportReport::addresses_never_exposed` counts transparent
   addresses recorded in a ZeWIF document that are not known to have been
   exposed, and which are therefore deliberately left unexposed on import.
-- `zcash_client_sqlite::pool_migration` implements `zcash_pool_migration_backend`'s
+- `zcash_client_sqlite::pool_migration` implements `zcash_pool_migration`'s
   `PoolMigrationRead` / `PoolMigrationWrite` store traits over tables in the
   wallet database, persisting each account's in-progress Orchard -> Ironwood
   value-pool migration (ZIP 318) independently. The store is constructed via
   `PoolMigrations::for_account`, scoped to the account whose migration it
   tracks; the underlying `orchard_ironwood_migrations` table enforces at most
   one migration per account.
+- `zcash_client_sqlite::pool_migration::PoolMigrations::migration_lock_owners`
+  returns the set of `LockOwner`s under which an account's in-progress pool
+  migration has reserved notes. A proposal can pass this set to a
+  `LockedInputPolicy` override (`SpendPolicy::with_locked_input_policy`) so it
+  may draw on the migration's own locked notes without disturbing any other
+  flow's locks.
+- A database migration adds `lock_expiry_height` and `lock_owner` columns to the
+  `sapling_received_notes`, `orchard_received_notes`, `ironwood_received_notes`,
+  and `transparent_received_outputs` tables to support explicit note locking
+  during concurrent proposal creation: `lock_expiry_height` bounds how long a
+  lock lasts, and `lock_owner` records the flow that acquired it.
+- `zcash_client_sqlite::WalletDb::with_anchor_retention_interval` configures the
+  interval on which the wallet retains note commitment tree checkpoints as
+  durable anchors, for use on test networks where waiting out the ZIP 318
+  144-block interval makes exercising a pool migration impractical. The setting
+  governs what grid the next migration is planned against; the grid an in-flight
+  migration was committed under is recorded with it and keeps being retained
+  regardless, so reopening the wallet without reapplying the setting cannot
+  strand a migration.
+- `zcash_client_sqlite::WalletDb::set_anchor_retention_interval`, the
+  by-reference form of `with_anchor_retention_interval`.
+
+### Changed
+- Migrated to `zcash_primitives 0.30.0`, `zcash_transparent 0.10.0`,
+  `zcash_proofs 0.30.0`, `zcash_keys 0.16.0`, `zcash_client_backend 0.24.0-rc.2`.
+- The `zip-233` feature flag now also enables `zcash_client_backend/zip-233`,
+  keeping the two crates' feature-gated `zcash_primitives` call signatures in
+  agreement when this crate is built with ZIP 233 support.
+- `WalletWrite::truncate_to_height` now accepts a truncation height that a
+  pool's note commitment tree checkpoints do not cover whenever the truncation
+  leaves that pool's tree in a consistent state — the same per-pool tolerances
+  applied by `rewind_to_chain_state` (see under "Fixed" above). Callers that
+  relied on `RequestedRewindInvalid` being returned for such heights should
+  note that the truncation now succeeds, resetting any tree whose scanned
+  contents lie entirely above the truncation height to only the roots of
+  subtrees completed at or below it.
+
 
 ### Fixed
+- The coinbase branch of the transparent account-balance tally now classifies
+  locked value into `Balance::locked_value`: previously a mature coinbase UTXO
+  locked by an in-flight shielding proposal was still reported as spendable,
+  even though note selection (correctly) refused to select it.
 - The `zewif` importer no longer marks transparent addresses that have no
   recorded exposure height (`zewif::Address::exposed_at_height() == None`, e.g.
   zcashd keypool reserves) as exposed unconditionally. Previously every such
@@ -47,13 +95,28 @@ workspace.
   included), or if the document exposes an address at a higher child index under
   the same account and key scope, since transparent addresses are handed out in
   index order.
-
-### Changed
-- The `zip-233` feature flag now also enables `zcash_client_backend/zip-233`,
-  keeping the two crates' feature-gated `zcash_primitives` call signatures in
-  agreement when this crate is built with ZIP 233 support.
-
-### Fixed
+- `WalletWrite::rewind_to_chain_state` no longer reports `CorruptedData` for a
+  shielded pool whose note commitment tree checkpoints do not cover the rewind
+  target, provided the truncation leaves that pool's tree in a consistent
+  state. On an upgraded wallet, the `orchard_shardtree` or `ironwood_shardtree`
+  migration creates the pool's tree tables empty and requeues a rescan; until
+  that rescan catches up, the pool's checkpoints may be absent entirely, may
+  all lag the rewind target (a backfill in progress), or may all lie above it
+  (a rescan that has so far only reached tip-priority blocks near the chain
+  tip). All of these states are now tolerated: an empty or lagging tree is left
+  untouched, while a tree whose checkpoints all postdate the target is reset to
+  only the roots of subtrees completed at or below the target (preserving
+  subtree roots downloaded during fast sync, which are required to construct
+  witnesses spanning those subtrees), with the rescan re-creating the rest — in
+  either case without destroying any note witness that the rescan would not
+  re-create. This previously caused
+  account creation and import (which rewind via this method) to fail
+  deterministically on an upgraded, already-scanned wallet until its NU6.3
+  rescan had caught up. A rewind that cannot be executed because it would
+  destroy witness data that the rescan would not re-create is refused as
+  `RequestedRewindInvalid` (it reflects valid wallet state, not corruption); a
+  pool whose checkpoints lie both above and below the truncation height
+  without one at it is still reported as corruption.
 - Value in immature transparent coinbase outputs is now reported as pending
   spendability (in the `value_pending_spendability` field of the coinbase
   bucket) in wallet-summary account balances. Previously it was incorrectly

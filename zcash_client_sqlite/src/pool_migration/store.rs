@@ -4,8 +4,11 @@
 //! (the DDL builders and the [`Store`] type that carries the [`PoolMigrationRead`] /
 //! [`PoolMigrationWrite`] SQL logic), parameterized over the table names in [`Tables`]. The schema is
 //! fully NORMALIZED: every structured value is stored in typed columns and child-table rows, so the
-//! store maps the engine types to and from columns directly. The only `BLOB` column is the pre-signed
-//! transaction (`pczt`), which is genuinely unstructured, already-versioned bytes. All amounts are
+//! store maps the engine types to and from columns directly. The `BLOB` columns are the pre-signed
+//! transaction (`pczt`), which is genuinely unstructured, already-versioned bytes, and each
+//! transaction's `lock_owner`, an opaque fixed-size token read and written directly as
+//! `Option<[u8; 32]>` (no codec: `rusqlite`'s fixed-size-array `FromSql`/`ToSql` impls handle it,
+//! and reject a non-NULL blob that is not exactly 32 bytes). All amounts are
 //! zatoshi `INTEGER` columns; the broadcast `txid` is stored as hex `TEXT`.
 //!
 //! The preparation plan's layers/transactions grid has no tables of its own: each input and output
@@ -17,21 +20,23 @@
 //!
 //! The column set is the same for every pool; only the table and index names change.
 //!
-//! [`PoolMigrationRead`]: zcash_pool_migration_backend::engine::PoolMigrationRead
-//! [`PoolMigrationWrite`]: zcash_pool_migration_backend::engine::PoolMigrationWrite
+//! [`PoolMigrationRead`]: zcash_pool_migration::engine::PoolMigrationRead
+//! [`PoolMigrationWrite`]: zcash_pool_migration::engine::PoolMigrationWrite
 
 use std::borrow::{Borrow, BorrowMut};
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 
-use zcash_pool_migration_backend::engine::{
+use zcash_client_backend::wallet::LockOwner;
+use zcash_pool_migration::engine::{
     MigrationState, MigrationStatus, MigrationTransaction, MigrationTxId, MigrationTxKind,
     MigrationTxState,
 };
-use zcash_pool_migration_backend::note_splitting::NoteSplitPlan;
-use zcash_pool_migration_backend::preparation::{
-    PrepInput, PrepOutput, PrepTransaction, PreparationPlan,
-};
+use zcash_pool_migration::note_splitting::NoteSplitPlan;
+use zcash_pool_migration::preparation::{PrepInput, PrepOutput, PrepTransaction, PreparationPlan};
+use zcash_pool_migration::scheduling::AnchorBucketInterval;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
@@ -84,7 +89,8 @@ fn create_migrations_sql(t: &Tables) -> String {
             note_split_change INTEGER,
             note_split_prep_fees INTEGER NOT NULL,
             note_split_total_input INTEGER NOT NULL,
-            note_split_total_migratable INTEGER NOT NULL
+            note_split_total_migratable INTEGER NOT NULL,
+            anchor_bucket_interval INTEGER NOT NULL
         )",
         t.migrations
     )
@@ -165,6 +171,7 @@ fn create_transactions_sql(t: &Tables) -> String {
             state TEXT NOT NULL,
             txid TEXT,
             mined_height INTEGER,
+            lock_owner BLOB,
             PRIMARY KEY (migration_id, tx_id)
         )",
         t.transactions, t.migrations
@@ -228,8 +235,8 @@ pub(crate) fn init(conn: &Connection, t: &Tables) -> rusqlite::Result<()> {
 /// read-only access, `&mut Connection` to also write) plus the pool's table names and the account;
 /// a concrete facade wraps it so the generic type never appears in the public API.
 ///
-/// [`PoolMigrationRead`]: zcash_pool_migration_backend::engine::PoolMigrationRead
-/// [`PoolMigrationWrite`]: zcash_pool_migration_backend::engine::PoolMigrationWrite
+/// [`PoolMigrationRead`]: zcash_pool_migration::engine::PoolMigrationRead
+/// [`PoolMigrationWrite`]: zcash_pool_migration::engine::PoolMigrationWrite
 pub(crate) struct Store<C> {
     conn: C,
     tables: &'static Tables,
@@ -253,6 +260,13 @@ impl<C> Store<C> {
 impl<C: Borrow<Connection>> Store<C> {
     pub(crate) fn get_migration(&self) -> Result<Option<MigrationState>, Error> {
         read_migration(self.conn.borrow(), self.tables, self.account_id)
+    }
+
+    /// Returns the set of [`LockOwner`]s under which this account's in-progress migration has
+    /// locked notes (empty if the account has no migration, or none of its transactions hold a
+    /// lock).
+    pub(crate) fn migration_lock_owners(&self) -> Result<BTreeSet<LockOwner>, Error> {
+        read_lock_owners(self.conn.borrow(), self.tables, self.account_id)
     }
 }
 
@@ -319,6 +333,32 @@ fn resolve_migration_id(
         .optional()?)
 }
 
+/// The distinct anchor bucket intervals, in blocks, of every migration in `t.migrations` that is
+/// not yet complete — the grids the wallet still owes anchor-checkpoint retention to.
+///
+/// This is read from the database rather than from any in-memory configuration on purpose. A
+/// migration's transfers are anchored to boundaries of the grid it was COMMITTED under, and are
+/// provable only while those boundaries' checkpoints survive pruning. Were retention driven by a
+/// setting the application had to reapply on every open, forgetting to do so would let a scan pass
+/// a boundary the migration still needs without retaining it — unrecoverably, since the checkpoint
+/// is gone by the time anything notices.
+///
+/// A `complete` migration has no transfer left to prove, so its grid is dropped.
+pub(crate) fn active_anchor_bucket_intervals(
+    conn: &Connection,
+    t: &Tables,
+) -> Result<BTreeSet<NonZeroU32>, Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT anchor_bucket_interval FROM {} WHERE status <> ?",
+        t.migrations
+    ))?;
+    let rows = stmt.query_map(params![MigrationStatus::Complete.as_ref()], |row| {
+        row.get::<_, u32>(0)
+    })?;
+    rows.map(|blocks| NonZeroU32::new(blocks?).ok_or(Error::Corrupt("anchor_bucket_interval")))
+        .collect()
+}
+
 fn read_migration(
     conn: &Connection,
     t: &Tables,
@@ -328,7 +368,7 @@ fn read_migration(
         .query_row(
             &format!(
                 "SELECT id, status, note_split_fee_buffer, note_split_change, note_split_prep_fees,
-                        note_split_total_input, note_split_total_migratable
+                        note_split_total_input, note_split_total_migratable, anchor_bucket_interval
                    FROM {} WHERE account_id = ?",
                 t.migrations
             ),
@@ -342,16 +382,28 @@ fn read_migration(
                     row.get::<_, u64>(4)?,
                     row.get::<_, u64>(5)?,
                     row.get::<_, u64>(6)?,
+                    row.get::<_, u32>(7)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((migration_id, status, fee_buffer, change, prep_fees, total_input, total_migratable)) =
-        row
+    let Some((
+        migration_id,
+        status,
+        fee_buffer,
+        change,
+        prep_fees,
+        total_input,
+        total_migratable,
+        anchor_bucket_interval,
+    )) = row
     else {
         return Ok(None);
     };
+    let anchor_bucket_interval = NonZeroU32::new(anchor_bucket_interval)
+        .map(AnchorBucketInterval::custom)
+        .ok_or(Error::Corrupt("anchor_bucket_interval"))?;
 
     let crossing_values = read_zatoshi_list(conn, t.crossing_values, migration_id)?;
     let note_split = NoteSplitPlan::from_stored_parts(
@@ -374,6 +426,7 @@ fn read_migration(
         note_split,
         preparation,
         transactions,
+        anchor_bucket_interval,
     )))
 }
 
@@ -540,7 +593,8 @@ fn read_transactions(
     let rows: Vec<TxRow> = {
         let mut stmt = conn.prepare(&format!(
             "SELECT tx_id, kind, kind_layer, kind_index, kind_crossing, pczt,
-                    scheduled_height, expiry_height, anchor_boundary, state, txid, mined_height
+                    scheduled_height, expiry_height, anchor_boundary, state, txid, mined_height,
+                    lock_owner
                FROM {}
               WHERE migration_id = ?
               ORDER BY tx_id",
@@ -560,6 +614,7 @@ fn read_transactions(
                 state: row.get(9)?,
                 txid: row.get(10)?,
                 mined_height: row.get(11)?,
+                lock_owner: row.get(12)?,
             })
         })?;
         mapped.collect::<Result<_, _>>()?
@@ -601,7 +656,33 @@ fn read_transactions(
             BlockHeight::from_u32(r.expiry_height),
             r.anchor_boundary.map(BlockHeight::from_u32),
             state,
+            r.lock_owner,
         ));
+    }
+    Ok(out)
+}
+
+/// Returns the distinct [`LockOwner`]s recorded on `account`'s migration transactions (empty if
+/// the account has no migration, or none of its transactions hold a lock). A direct `DISTINCT`
+/// query over the transactions table, scoped by the account's resolved migration id, so this
+/// avoids reconstructing the whole migration (with its preparation plan and every transaction)
+/// just to inspect which locks it holds.
+fn read_lock_owners(
+    conn: &Connection,
+    t: &Tables,
+    account: AccountRef,
+) -> Result<BTreeSet<LockOwner>, Error> {
+    let Some(migration_id) = resolve_migration_id(conn, t, account)? else {
+        return Ok(BTreeSet::new());
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT lock_owner FROM {} WHERE migration_id = ? AND lock_owner IS NOT NULL",
+        t.transactions
+    ))?;
+    let rows = stmt.query_map(params![migration_id], |row| row.get::<_, [u8; 32]>(0))?;
+    let mut out = BTreeSet::new();
+    for r in rows {
+        out.insert(LockOwner::new(r?));
     }
     Ok(out)
 }
@@ -620,6 +701,10 @@ struct TxRow {
     state: String,
     txid: Option<String>,
     mined_height: Option<u32>,
+    /// The stored lock-owner token, read directly as a fixed-size blob: `rusqlite`'s `[u8; 32]`
+    /// `FromSql` impl errors cleanly (`InvalidBlobSize`) if a non-NULL blob is not exactly 32
+    /// bytes, so a corrupt row is rejected rather than silently truncated or panicking.
+    lock_owner: Option<[u8; 32]>,
 }
 
 fn read_deps(
@@ -698,8 +783,10 @@ fn replace_migration(
     tx.execute(
         &format!(
             "INSERT INTO {} (account_id, status, note_split_fee_buffer, note_split_change,
-                             note_split_prep_fees, note_split_total_input, note_split_total_migratable)
-             VALUES (:account_id, :status, :fee_buffer, :change, :prep_fees, :total_input, :total_migratable)",
+                             note_split_prep_fees, note_split_total_input, note_split_total_migratable,
+                             anchor_bucket_interval)
+             VALUES (:account_id, :status, :fee_buffer, :change, :prep_fees, :total_input, :total_migratable,
+                     :anchor_bucket_interval)",
             t.migrations
         ),
         named_params! {
@@ -710,6 +797,7 @@ fn replace_migration(
             ":prep_fees": ns.prep_fees().into_u64(),
             ":total_input": ns.total_input().into_u64(),
             ":total_migratable": ns.total_migratable().into_u64(),
+            ":anchor_bucket_interval": state.anchor_bucket_interval().block_count().get(),
         },
     )?;
     let migration_id = tx.last_insert_rowid();
@@ -806,10 +894,10 @@ fn replace_migration(
             &format!(
                 "INSERT INTO {} (migration_id, tx_id, kind, kind_layer, kind_index, kind_crossing,
                                  pczt, scheduled_height, expiry_height, anchor_boundary, state, txid,
-                                 mined_height)
+                                 mined_height, lock_owner)
                  VALUES (:migration_id, :tx_id, :kind, :kind_layer, :kind_index, :kind_crossing,
                          :pczt, :scheduled_height, :expiry_height, :anchor_boundary, :state, :txid,
-                         :mined_height)",
+                         :mined_height, :lock_owner)",
                 t.transactions
             ),
             named_params! {
@@ -826,6 +914,7 @@ fn replace_migration(
                 ":state": tx_state.as_ref(),
                 ":txid": tx_state.broadcast_txid().map(hex::encode),
                 ":mined_height": tx_state.mined_height().map(u32::from),
+                ":lock_owner": mtx.lock_owner(),
             },
         )?;
         for (ordinal, dep) in mtx.depends_on().iter().enumerate() {
