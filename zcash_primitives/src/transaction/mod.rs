@@ -202,6 +202,19 @@ impl TxVersion {
         }
     }
 
+    /// Returns `true` if this transaction version supports the tachyon protocol.
+    #[cfg(zcash_unstable = "nu7")]
+    pub fn has_tachyon(&self) -> bool {
+        match self {
+            TxVersion::Sprout(_)
+            | TxVersion::V3
+            | TxVersion::V4
+            | TxVersion::V5
+            | TxVersion::V6 => false,
+            TxVersion::V7 => true,
+        }
+    }
+
     #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     pub fn has_zip233(&self) -> bool {
         match self {
@@ -587,6 +600,8 @@ impl<A: Authorization> TransactionData<A> {
             digester.digest_sapling(self.version, self.sapling_bundle.as_ref()),
             digester.digest_orchard(self.version, self.orchard_bundle.as_ref()),
             digester.digest_ironwood(self.ironwood_bundle.as_ref()),
+            #[cfg(zcash_unstable = "nu7")]
+            digester.digest_tachyon(self.tachyon_bundle.as_ref()),
         )
     }
 
@@ -1253,6 +1268,13 @@ pub struct TxDigests<A> {
     /// ID is derived from these digests, `None` is combined as the empty Ironwood bundle digest
     /// using the Ironwood bundle personalization.
     pub ironwood_digest: Option<A>,
+    /// The digest of the tachyon bundle used by version 7 transactions.
+    ///
+    /// This is `None` when the transaction has no tachyon bundle. When a version 7 transaction
+    /// ID is derived from these digests, `None` is combined as tachyon's "no bundle" commitment
+    /// digest.
+    #[cfg(zcash_unstable = "nu7")]
+    pub tachyon_digest: Option<[u8; 32]>,
 }
 
 pub trait TransactionDigest<A: Authorization> {
@@ -1262,6 +1284,9 @@ pub trait TransactionDigest<A: Authorization> {
     type OrchardDigest;
     /// The digest type produced for the Ironwood bundle in version 6 transactions.
     type IronwoodDigest;
+    /// The digest type produced for the tachyon bundle in version 7 transactions.
+    #[cfg(zcash_unstable = "nu7")]
+    type TachyonDigest;
 
     type Digest;
 
@@ -1304,6 +1329,19 @@ pub trait TransactionDigest<A: Authorization> {
         ironwood_bundle: Option<&orchard::Bundle<A::OrchardAuth, ZatBalance>>,
     ) -> Self::IronwoodDigest;
 
+    /// Computes the digest for the tachyon bundle in version 7 transactions.
+    ///
+    /// The effecting (txid/sighash) digest commits to `hActionsTachyon` and
+    /// `valueBalanceTachyon` only ([`zcash_tachyon::TachyonBundle::commitment`]); the stamp is
+    /// excluded because it is authorizing data and is malleable during aggregation. Transaction
+    /// commitment digesters commit to the signatures and stamp instead
+    /// ([`zcash_tachyon::TachyonBundle::auth_digest`]).
+    #[cfg(zcash_unstable = "nu7")]
+    fn digest_tachyon(
+        &self,
+        tachyon_bundle: Option<&zcash_tachyon::TachyonBundle>,
+    ) -> Self::TachyonDigest;
+
     fn combine(
         &self,
         header_digest: Self::HeaderDigest,
@@ -1311,6 +1349,7 @@ pub trait TransactionDigest<A: Authorization> {
         sapling_digest: Self::SaplingDigest,
         orchard_digest: Self::OrchardDigest,
         ironwood_digest: Self::IronwoodDigest,
+        #[cfg(zcash_unstable = "nu7")] tachyon_digest: Self::TachyonDigest,
     ) -> Self::Digest;
 }
 
