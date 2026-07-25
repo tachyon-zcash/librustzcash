@@ -23,10 +23,10 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
-use std::sync::OnceLock;
+use core::num::NonZeroU32;
 
 use ::orchard::Anchor;
-use ::orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+use ::orchard::circuit::OrchardCircuitVersion;
 use ::orchard::keys::{FullViewingKey, SpendAuthorizingKey};
 use ::orchard::note::{Note as OrchardNote, Nullifier};
 use ::orchard::tree::MerklePath;
@@ -35,18 +35,23 @@ use shardtree::error::ShardTreeError;
 
 use ::pczt::roles::prover::Prover;
 use ::pczt::roles::updater::{AnchorUpdateError, SpendWitnessUpdateError, Updater};
-use zcash_client_backend::data_api::wallet::TargetHeight;
-use zcash_client_backend::data_api::{InputSource, WalletCommitmentTrees, WalletRead};
+use zcash_client_backend::data_api::{
+    InputSource, WalletCommitmentTrees, WalletRead,
+    wallet::{
+        TargetHeight,
+        input_selection::{LockFilter, LockedInputPolicy},
+    },
+};
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::ShieldedPool;
-use zcash_protocol::consensus::BlockHeight;
-use zcash_protocol::value::Zatoshis;
+use zcash_primitives::transaction::builder::cached_orchard_proving_key;
+use zcash_protocol::{ShieldedPool, consensus::BlockHeight, value::Zatoshis};
 
 use crate::build::sign_pczt;
 use crate::engine::{
     MigrationBackend, MigrationCrypto, MigrationProver, MigrationState, MigrationTxId,
     MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
 };
+use crate::scheduling::{AnchorBucketInterval, DelayDistribution, SchedulingParams};
 
 /// A failure of the wallet-backed migration adapter. Parameterized by the error types of the two
 /// wallet traits and the store, which for `zcash_client_sqlite`'s `WalletDb` are all one type but in
@@ -115,6 +120,9 @@ where
     account: <W as InputSource>::AccountId,
     usk: UnifiedSpendingKey,
     store: St,
+    /// The inter-arrival delays to schedule under, or `None` to derive them from the wallet's own
+    /// anchor bucket interval by the ZIP 318 ratios.
+    scheduling_delays: Option<(DelayDistribution, DelayDistribution)>,
 }
 
 impl<'a, W, St> WalletMigration<'a, W, St>
@@ -124,6 +132,13 @@ where
     St: PoolMigrationRead,
 {
     /// Wrap a wallet, an account, its spending key, and a store as a migration wallet.
+    ///
+    /// The migration is scheduled under the wallet's own anchor retention interval — not
+    /// configurable here; see [`MigrationBackend::scheduling_params`] — with inter-arrival delays
+    /// derived from that interval by the ZIP 318 ratios. A wallet on the standard grid therefore
+    /// gets exactly the ZIP 318 delays, and a wallet configured with a shortened grid gets the same
+    /// schedule shape compressed by the same factor, rather than a short grid crossed with
+    /// three-hour delays. Override the delays with [`Self::with_scheduling_delays`].
     pub fn new(
         wallet: &'a W,
         account: <W as InputSource>::AccountId,
@@ -135,7 +150,22 @@ where
             account,
             usk,
             store,
+            scheduling_delays: None,
         }
+    }
+
+    /// Sets the inter-arrival delay distributions between successive transfer and preparation
+    /// broadcasts, replacing the ones otherwise derived from the wallet's anchor bucket interval.
+    ///
+    /// Only the delays are settable. The anchor bucket interval is read from the wallet, because a
+    /// transfer can only be proved against a boundary whose checkpoint the wallet retained.
+    pub fn with_scheduling_delays(
+        mut self,
+        transfer_delay: DelayDistribution,
+        preparation_delay: DelayDistribution,
+    ) -> Self {
+        self.scheduling_delays = Some((transfer_delay, preparation_delay));
+        self
     }
 
     /// Recover the store.
@@ -160,7 +190,13 @@ where
         let target = self.selection_target()?;
         let received = self
             .wallet
-            .select_unspent_notes(self.account, &[ShieldedPool::Orchard], target, &[])
+            .select_unspent_notes(
+                self.account,
+                &[ShieldedPool::Orchard],
+                target,
+                &[],
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
+            )
             .map_err(Error::InputSource)?;
         let mut notes: Vec<SpendableNote> = received
             .orchard()
@@ -199,6 +235,20 @@ where
             .chain_height()
             .map_err(Error::WalletRead)?
             .ok_or(Error::ChainTipUnknown)
+    }
+
+    /// The anchor bucket interval is the wallet's own anchor retention interval, converted; the
+    /// delays are derived from it unless [`Self::with_scheduling_delays`] overrode them. Deriving
+    /// the grid from the wallet rather than accepting it here is what makes it impossible for a
+    /// migration to anchor to a boundary whose checkpoint the wallet has not retained.
+    fn scheduling_params(&self) -> SchedulingParams {
+        let interval = self.wallet.anchor_retention_interval().into();
+        match self.scheduling_delays {
+            Some((transfer_delay, preparation_delay)) => {
+                SchedulingParams::new(interval, transfer_delay, preparation_delay)
+            }
+            None => SchedulingParams::new_with_default_distributions(interval),
+        }
     }
 }
 
@@ -260,20 +310,12 @@ where
     }
 }
 
-/// The single Orchard proving key used for both the source (Orchard) and destination (Ironwood)
-/// bundles of a post-NU6.3 migration transfer. Building it is expensive (it materializes the halo2
-/// circuit parameters), so it is built once and cached for the process. Ironwood proofs reuse the
-/// same key as Orchard (both are the `PostNu6_3` circuit).
-fn post_nu6_3_orchard_proving_key() -> &'static ProvingKey {
-    static PROVING_KEY: OnceLock<ProvingKey> = OnceLock::new();
-    PROVING_KEY.get_or_init(|| ProvingKey::build(OrchardCircuitVersion::PostNu6_3))
-}
-
 /// Why proving a migration transaction through the wallet-backed prover failed. `TE` is the
 /// wallet's commitment-tree error type ([`WalletCommitmentTrees::Error`]); `NE` is its note-source
-/// error type ([`InputSource::Error`]).
+/// error type ([`InputSource::Error`]); `RE` is its chain-state error type
+/// ([`WalletRead::Error`]).
 #[derive(Debug)]
-pub enum WalletProveError<TE, NE> {
+pub enum WalletProveError<TE, NE, RE> {
     /// The PCZT has no real Orchard spend whose witness is still deferred. A migration transfer
     /// spends one funding note and a preparation transaction one or more, so the Orchard bundle
     /// carries at least one action with an absent witness (the fabricated dummy spends keep their
@@ -286,6 +328,11 @@ pub enum WalletProveError<TE, NE> {
     /// A deferred-witness Orchard spend's nullifier bytes are not a valid Orchard nullifier, so the
     /// PCZT is not a well-formed migration transaction awaiting proof.
     MalformedNullifier([u8; 32]),
+    /// Looking up the note-selection target height (the chain tip) through the wallet failed.
+    TargetHeight(RE),
+    /// The wallet knows of no block data, so the note-selection target height (the chain tip) is
+    /// unavailable.
+    ChainTipUnknown,
     /// Enumerating the account's spendable Orchard notes (to locate each spend by nullifier) failed.
     Notes(NE),
     /// A commitment tree (the Orchard source tree, or the Ironwood destination tree for a transfer)
@@ -311,13 +358,13 @@ pub enum WalletProveError<TE, NE> {
     Prove(alloc::string::String),
 }
 
-impl<TE, NE> From<ShardTreeError<TE>> for WalletProveError<TE, NE> {
+impl<TE, NE, RE> From<ShardTreeError<TE>> for WalletProveError<TE, NE, RE> {
     fn from(e: ShardTreeError<TE>) -> Self {
         WalletProveError::Tree(e)
     }
 }
 
-impl<TE: fmt::Debug, NE: fmt::Debug> fmt::Display for WalletProveError<TE, NE> {
+impl<TE: fmt::Debug, NE: fmt::Debug, RE: fmt::Debug> fmt::Display for WalletProveError<TE, NE, RE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WalletProveError::NoRealSpend => {
@@ -334,6 +381,15 @@ impl<TE: fmt::Debug, NE: fmt::Debug> fmt::Display for WalletProveError<TE, NE> {
                     f,
                     "a spend's nullifier bytes are not a valid nullifier: {bytes:?}"
                 )
+            }
+            WalletProveError::TargetHeight(e) => {
+                write!(
+                    f,
+                    "looking up the note-selection target height failed: {e:?}"
+                )
+            }
+            WalletProveError::ChainTipUnknown => {
+                f.write_str("the wallet knows of no block data, so the chain tip is unavailable")
             }
             WalletProveError::Notes(e) => {
                 write!(f, "enumerating spendable Orchard notes failed: {e:?}")
@@ -359,12 +415,18 @@ impl<TE: fmt::Debug, NE: fmt::Debug> fmt::Display for WalletProveError<TE, NE> {
     }
 }
 
-impl<TE: fmt::Debug, NE: fmt::Debug> core::error::Error for WalletProveError<TE, NE> {}
+impl<TE: fmt::Debug, NE: fmt::Debug, RE: fmt::Debug> core::error::Error
+    for WalletProveError<TE, NE, RE>
+{
+}
 
 /// The wallet-backed prover's error for a wallet `W`: a [`WalletProveError`] over the wallet's
-/// commitment-tree and note-source error types.
-type ProverError<W> =
-    WalletProveError<<W as WalletCommitmentTrees>::Error, <W as InputSource>::Error>;
+/// commitment-tree, note-source, and chain-state error types.
+type ProverError<W> = WalletProveError<
+    <W as WalletCommitmentTrees>::Error,
+    <W as InputSource>::Error,
+    <W as WalletRead>::Error,
+>;
 
 /// A wallet-backed prover for migration transactions: the mutable counterpart to [`WalletMigration`].
 ///
@@ -411,7 +473,7 @@ where
 
 impl<'a, W> WalletMigrationProver<'a, W>
 where
-    W: WalletCommitmentTrees + InputSource,
+    W: WalletCommitmentTrees + InputSource + WalletRead,
     <W as InputSource>::AccountId: Copy,
 {
     /// Prove one migration transaction's Orchard bundle (and its Ironwood bundle, when it has one)
@@ -420,6 +482,11 @@ where
     /// [`prove_transfer`](MigrationProver::prove_transfer) (a transfer: one Orchard spend plus an
     /// Ironwood output) and [`prove_preparation`](MigrationProver::prove_preparation) (a preparation:
     /// one or more Orchard spends, no Ironwood).
+    ///
+    /// The anchor and witnesses are resolved at `anchor_height`, but the spent notes are located at
+    /// the wallet's standard note-selection target height (the chain tip, from
+    /// [`WalletRead::get_target_and_anchor_heights`]), so a note already spent by a mined migration
+    /// transaction is excluded from the candidate set.
     fn prove_orchard(
         &mut self,
         pczt: ::pczt::Pczt,
@@ -446,10 +513,24 @@ where
 
         // Locate each spend in the wallet's note store: map every unspent Orchard note's nullifier
         // (recomputed under the account FVK) to its commitment-tree position, then look up each spend.
-        let target = TargetHeight::from(u32::from(anchor_height) + 1);
+        // Select notes at the wallet's standard note-selection target height (the chain tip), not the
+        // witness anchor, so a note already spent by a mined migration transaction is excluded from
+        // consideration. Only the target is needed here; `min_confirmations` bounds only the (unused)
+        // anchor height, so the minimum is passed to avoid a spurious absence near genesis.
+        let (target, _anchor) = self
+            .wallet
+            .get_target_and_anchor_heights(NonZeroU32::MIN)
+            .map_err(WalletProveError::TargetHeight)?
+            .ok_or(WalletProveError::ChainTipUnknown)?;
         let received = self
             .wallet
-            .select_unspent_notes(self.account, &[ShieldedPool::Orchard], target, &[])
+            .select_unspent_notes(
+                self.account,
+                &[ShieldedPool::Orchard],
+                target,
+                &[],
+                LockFilter::Unfiltered,
+            )
             .map_err(WalletProveError::Notes)?;
         let positions: BTreeMap<Nullifier, Position> = received
             .orchard()
@@ -531,7 +612,7 @@ where
 
         // Prove the Orchard bundle, and the Ironwood bundle too when present, with the single
         // post-NU6.3 Orchard proving key.
-        let pk = post_nu6_3_orchard_proving_key();
+        let pk = cached_orchard_proving_key(OrchardCircuitVersion::PostNu6_3);
         let orchard_proven = Prover::new(updated)
             .create_orchard_proof(pk)
             .map_err(|e| WalletProveError::Prove(alloc::format!("orchard proof: {e:?}")))?;
@@ -548,7 +629,7 @@ where
 
 impl<'a, W> MigrationProver for WalletMigrationProver<'a, W>
 where
-    W: WalletCommitmentTrees + InputSource,
+    W: WalletCommitmentTrees + InputSource + WalletRead,
     <W as InputSource>::AccountId: Copy,
 {
     type Error = ProverError<W>;
@@ -567,6 +648,13 @@ where
         anchor: BlockHeight,
     ) -> Result<::pczt::Pczt, Self::Error> {
         self.prove_orchard(pczt, anchor)
+    }
+
+    /// The grid the wallet this prover reads its commitment trees from currently retains anchor
+    /// checkpoints on, so a transfer committed against a different grid is rejected before its
+    /// (by then pruned) checkpoint is looked up.
+    fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
+        self.wallet.anchor_retention_interval().into()
     }
 }
 

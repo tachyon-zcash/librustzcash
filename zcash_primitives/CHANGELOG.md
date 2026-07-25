@@ -10,6 +10,8 @@ workspace.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-23
+
 ### Added
 - `zcash_primitives::transaction::components::orchard::ACTION_SIZE`, the size in
   bytes of an Orchard action description as encoded in a transaction. It excludes
@@ -26,13 +28,26 @@ workspace.
   note positions, so Sapling spends cannot be signed before their witnesses
   are final).
 - `zcash_primitives::transaction::builder::Error::AnchorDeferralUnsupported`
+- `zcash_primitives::transaction::builder::cached_orchard_proving_key`, the
+  process-wide, per-circuit-version Orchard proving-key cache, now public so
+  other proving code in the workspace (such as the pool-migration engine) can
+  share it instead of rebuilding the expensive proving key.
+- `zcash_primitives::transaction::builder::BundlePadding`, the transactional
+  bundle padding (`bundle_required` / `pad_to_minimum`) for an Orchard-family
+  pool, with `BundlePadding::{DEFAULT, UNPADDED}` matching the corresponding
+  `orchard::builder::BundleType` constants. Unlike `BundleType` it cannot
+  express a coinbase bundle.
 
 ### Changed
+- Migrated to `zcash_transparent 0.10.0`.
 - `zcash_primitives::transaction::builder::BuildConfig::Standard` now carries
-  separate `orchard_bundle_type` and `ironwood_bundle_type` fields in place of
-  `orchard_pool_bundle_type`, selecting the transactional bundle type
-  independently for each Orchard protocol value pool. Set both fields to the
-  same value to keep the previous behavior.
+  separate `orchard_padding` and `ironwood_padding` fields (of the new
+  `BundlePadding` type) in place of `orchard_pool_bundle_type`, selecting the
+  transactional bundle padding independently for each Orchard protocol value
+  pool. `BundlePadding`, unlike `orchard::builder::BundleType`, cannot select a
+  coinbase bundle: whether a transaction is coinbase is a property of the whole
+  transaction, chosen by the `BuildConfig` variant, so it can no longer be set
+  per pool. Set both fields to the same value to pad both pools alike.
 - `zcash_primitives::transaction::builder::Builder::build` no longer
   reconstructs the Orchard proving key on every call. When the `std` feature is
   enabled the key is now built lazily and cached process-wide (keyed by circuit

@@ -22,14 +22,15 @@ use shardtree::{ShardTree, error::ShardTreeError};
 use zcash_client_backend::{
     data_api::{
         TargetValue,
+        anchor_retention::AnchorRetentionInterval,
         chain::{ChainState, CommitmentTreeRoot},
-        error::RewindError,
-        scanning::ScanRange,
+        error::{LockError, RewindError},
+        scanning::{ScanPriority, ScanRange},
         testing::{DataStoreFactory, Reset, TestState},
-        wallet::{ConfirmationsPolicy, TargetHeight},
+        wallet::{ConfirmationsPolicy, TargetHeight, input_selection::LockFilter},
         *,
     },
-    wallet::{Note, NoteId, ReceivedNote, WalletTransparentOutput},
+    wallet::{LockOwner, Note, NoteId, OutputRef, ReceivedNote, WalletTransparentOutput},
 };
 use zcash_keys::{
     address::UnifiedAddress,
@@ -120,6 +121,11 @@ impl TestDb {
         self.data_file
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn data_file_path(&self) -> &std::path::Path {
+        self.data_file.path()
+    }
+
     /// Dump the schema and contents of the given database table, in
     /// sqlite3 ".dump" format. The name of the table must be a static
     /// string. This assumes that `sqlite3` is on your path and that it
@@ -200,11 +206,15 @@ impl DataStoreFactory for TestDbFactory {
     fn new_data_store(
         &self,
         network: LocalNetwork,
+        anchor_retention_interval: Option<AnchorRetentionInterval>,
         #[cfg(feature = "transparent-inputs")] gap_limits: Option<GapLimits>,
     ) -> Result<Self::DataStore, Self::Error> {
         let data_file = NamedTempFile::new().unwrap();
         let mut db_data =
             WalletDb::for_path(data_file.path(), network, test_clock(), test_rng()).unwrap();
+        if let Some(interval) = anchor_retention_interval {
+            db_data = db_data.with_anchor_retention_interval(interval);
+        }
         #[cfg(feature = "transparent-inputs")]
         if let Some(gap_limits) = gap_limits {
             db_data = db_data.with_gap_limits(gap_limits);
@@ -229,6 +239,7 @@ impl Reset for TestDb {
 
     fn reset<C>(st: &mut TestState<C, Self, LocalNetwork>) -> NamedTempFile {
         let network = *st.network();
+        let anchor_retention_interval = st.wallet().db().anchor_retention_interval;
         #[cfg(feature = "transparent-inputs")]
         let gap_limits = st.wallet().db().gap_limits;
         let old_db = std::mem::replace(
@@ -236,6 +247,7 @@ impl Reset for TestDb {
             TestDbFactory::default()
                 .new_data_store(
                     network,
+                    Some(anchor_retention_interval),
                     #[cfg(feature = "transparent-inputs")]
                     Some(gap_limits),
                 )

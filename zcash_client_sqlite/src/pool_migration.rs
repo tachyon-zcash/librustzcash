@@ -1,6 +1,6 @@
 //! SQLite persistence for value-pool migrations (ZIP 318).
 //!
-//! This module implements [`zcash_pool_migration_backend`]'s [`PoolMigrationRead`] /
+//! This module implements [`zcash_pool_migration`]'s [`PoolMigrationRead`] /
 //! [`PoolMigrationWrite`] store traits over a set of SQLite tables in the wallet database,
 //! mirroring how this crate implements `zcash_client_backend`'s `WalletRead` / `WalletWrite`. A
 //! committed migration is a set of pre-signed PCZTs plus their schedule and lifecycle state, so a
@@ -9,8 +9,9 @@
 //! The schema is fully NORMALIZED: every structured value (the note-split plan, the preparation
 //! plan's transaction inputs/outputs and direct-funding notes, the transaction kind, and the
 //! dependency graph) is stored in typed columns and child tables, so it can be queried directly.
-//! The only `BLOB` column is the pre-signed transaction (`pczt`), which is genuinely unstructured,
-//! already-versioned bytes; all amounts are zatoshi `INTEGER` columns and the broadcast `txid` is
+//! The `BLOB` columns are the pre-signed transaction (`pczt`), which is genuinely unstructured,
+//! already-versioned bytes, and the transaction's `lock_owner` (an opaque fixed-size token, not a
+//! structured value); all amounts are zatoshi `INTEGER` columns and the broadcast `txid` is
 //! hex `TEXT`. It is also MINIMAL: values derivable from other columns get no tables of their own
 //! (the funding-note values are the crossing values plus the fee buffer, and the preparation
 //! plan's layers/transactions grid is implied by the input and output rows' `(layer, tx_index)`
@@ -47,8 +48,8 @@
 //! (the same one [`WalletDb`](crate::WalletDb) uses) and the [`AccountUuid`](crate::AccountUuid)
 //! whose migration it tracks, which it resolves to that account's row up front.
 //!
-//! [`PoolMigrationRead`]: zcash_pool_migration_backend::engine::PoolMigrationRead
-//! [`PoolMigrationWrite`]: zcash_pool_migration_backend::engine::PoolMigrationWrite
+//! [`PoolMigrationRead`]: zcash_pool_migration::engine::PoolMigrationRead
+//! [`PoolMigrationWrite`]: zcash_pool_migration::engine::PoolMigrationWrite
 
 mod error;
 mod store;

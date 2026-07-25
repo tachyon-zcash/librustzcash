@@ -2,7 +2,7 @@
 //! from the `zcash_pool_migration_memory` test-support crate.
 //!
 //! These are integration tests rather than `#[cfg(test)]` unit tests because the mock implements the
-//! engine's traits from `zcash_pool_migration_backend`. A dev-dependency cycle cannot be consumed by
+//! engine's traits from `zcash_pool_migration`. A dev-dependency cycle cannot be consumed by
 //! the backend's own unit tests: the unit-test build recompiles the library as a distinct instance,
 //! so the mock's trait impls (built against the plain library) would not satisfy the trait as seen
 //! inside the test binary. An integration test links the same library instance the mock was built
@@ -13,15 +13,16 @@ use rand_core::SeedableRng;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::{COIN, Zatoshis};
 
-use zcash_pool_migration_backend::engine::{
+use zcash_pool_migration::engine::{
     MigrationBackend, MigrationError, MigrationState, MigrationStatus, MigrationTransaction,
     MigrationTxId, MigrationTxKind, MigrationTxState, PoolMigrationRead, PoolMigrationWrite,
     plan_migration,
 };
-use zcash_pool_migration_backend::note_splitting::{NoteSplitPlan, plan_note_split};
-use zcash_pool_migration_backend::preparation::{
+use zcash_pool_migration::note_splitting::{NoteSplitPlan, plan_note_split};
+use zcash_pool_migration::preparation::{
     FUNDING_OUTPUTS_PER_TX, PreparationPlan, plan_preparation,
 };
+use zcash_pool_migration::scheduling::AnchorBucketInterval;
 use zcash_pool_migration_memory::{MockBackend, regtest_network};
 
 /// Wrap a raw zatoshi amount as [`Zatoshis`] for the tests.
@@ -237,12 +238,14 @@ fn stores_loads_and_updates_a_migration() {
         BlockHeight::from_u32(2_069_220),
         None,
         MigrationTxState::Signed,
+        None,
     );
     let state = MigrationState::from_parts(
         MigrationStatus::Committed,
         note_split,
         PreparationPlan::from_parts(Vec::new(), Vec::new()),
         vec![tx],
+        AnchorBucketInterval::ZIP_318,
     );
     backend.replace_migration(&state).unwrap();
 
