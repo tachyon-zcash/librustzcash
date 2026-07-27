@@ -44,11 +44,12 @@ use std::{
 use shardtree::error::{QueryError, ShardTreeError};
 
 use super::InputSource;
+use super::locking::lock_proposal_inputs;
+pub use super::locking::{LockRequest, unlock_proposal_inputs};
 use crate::{
     data_api::{
         Account, MaxSpendMode, NoteCommitmentTree, SentTransaction, SentTransactionOutput,
-        WalletCommitmentTrees, WalletRead, WalletWrite,
-        error::{Error, LockError},
+        WalletCommitmentTrees, WalletRead, WalletWrite, error::Error,
         wallet::input_selection::propose_send_max,
     },
     decrypt_transaction,
@@ -56,7 +57,7 @@ use crate::{
         ChangeStrategy, DustOutputPolicy, StandardFeeRule, standard::SingleOutputChangeStrategy,
     },
     proposal::{Proposal, ProposalError, Step, StepOutputIndex},
-    wallet::{LockOwner, Note, OutputRef, OvkPolicy, Recipient},
+    wallet::{Note, OvkPolicy, Recipient},
 };
 use sapling::{
     note_encryption::{PreparedIncomingViewingKey, try_sapling_note_decryption},
@@ -247,7 +248,7 @@ pub fn decrypt_and_store_transaction<ParamsT, DbT>(
     data: &mut DbT,
     tx: &Transaction,
     mined_height: Option<BlockHeight>,
-) -> Result<(), DbT::Error>
+) -> Result<(), <DbT as WalletRead>::Error>
 where
     ParamsT: consensus::Parameters,
     DbT: WalletWrite,
@@ -668,125 +669,12 @@ impl ConfirmationsPolicy {
     }
 }
 
-/// Returns the [`OutputRef`] identifying each output that the given proposal consumes as an
-/// input.
-///
-/// Each note or UTXO selected for spending is an *input* to the proposal's transaction, but is at
-/// the same time an *output* of the earlier transaction that created it; an [`OutputRef`] names it
-/// by that creating transaction's id, which is the stable identity the lock tables are keyed on.
-fn proposal_input_refs<FeeRuleT, NoteRef>(
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-) -> Vec<OutputRef> {
-    proposal
-        .steps()
-        .iter()
-        .flat_map(|step| {
-            step.shielded_inputs()
-                .into_iter()
-                .flat_map(|shielded_inputs| {
-                    shielded_inputs.notes().iter().map(|note| {
-                        OutputRef::new(
-                            *note.txid(),
-                            PoolType::Shielded(note.note().pool()),
-                            u32::from(note.output_index()),
-                        )
-                    })
-                })
-                .chain(step.transparent_inputs().iter().map(|utxo| {
-                    let outpoint = utxo.outpoint();
-                    OutputRef::new(
-                        TxId::from_bytes(*outpoint.hash()),
-                        PoolType::TRANSPARENT,
-                        outpoint.n(),
-                    )
-                }))
-        })
-        .collect()
-}
-
-/// A request to lock the inputs selected by a proposal, made when calling one of the
-/// proposal-creation functions ([`propose_transfer`] and friends).
-///
-/// The caller supplies the [`LockOwner`] under which the locks are taken and must retain it: the
-/// owner token is what authorizes releasing the locks with [`unlock_proposal_inputs`], and what
-/// allows the same flow to re-lock its own inputs when retrying after a crash.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LockRequest {
-    owner: LockOwner,
-    for_blocks: u32,
-}
-
-impl LockRequest {
-    /// Constructs a request to lock the proposal's inputs on behalf of `owner` until
-    /// `for_blocks` blocks past the proposal's target height.
-    ///
-    /// Choose `for_blocks` conservatively with respect to the worst-case time between proposal
-    /// creation and transaction storage: once the lock expires, a concurrent proposal may
-    /// select the same inputs.
-    pub fn new(owner: LockOwner, for_blocks: u32) -> Self {
-        Self { owner, for_blocks }
-    }
-
-    /// Returns the owner under which the locks will be taken.
-    pub fn owner(&self) -> LockOwner {
-        self.owner
-    }
-
-    /// Returns the number of blocks past the proposal's target height at which the locks will
-    /// expire.
-    pub fn for_blocks(&self) -> u32 {
-        self.for_blocks
-    }
-}
-
-/// Locks all inputs selected by the given proposal, preventing them from being
-/// selected by subsequent proposals. The lock expires at the given height.
-#[allow(clippy::type_complexity)]
-fn lock_proposal_inputs<DbT, FeeRuleT, NoteRef, TE, SE, FE, CE>(
-    wallet_db: &mut DbT,
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-    owner: LockOwner,
-    lock_expiry_height: BlockHeight,
-) -> Result<(), Error<DbT::Error, TE, SE, FE, CE, NoteRef>>
-where
-    DbT: WalletWrite,
-{
-    match wallet_db.lock_outputs(&proposal_input_refs(proposal), owner, lock_expiry_height) {
-        Ok(_) => Ok(()),
-        Err(LockError::LockFailure(out_ref)) => {
-            Err(Error::Proposal(ProposalError::InputsLocked(out_ref)))
-        }
-        Err(LockError::Storage(e)) => Err(Error::DataSource(e)),
-    }
-}
-
-/// Unlocks all inputs selected by the given proposal, reversing the locks acquired when the
-/// proposal was created with a [`LockRequest`] under the same `owner`.
-///
-/// This is useful when a proposal is rejected or abandoned after its inputs were locked, so that
-/// the outputs become available for selection and balance computation once again. Because
-/// unlocking is scoped to `owner`, inputs that are not locked, or whose locks are held by a
-/// different owner (for example a concurrently-created proposal), are left unchanged.
-pub fn unlock_proposal_inputs<DbT, FeeRuleT, NoteRef>(
-    wallet_db: &mut DbT,
-    proposal: &Proposal<FeeRuleT, NoteRef>,
-    owner: LockOwner,
-) -> Result<(), DbT::Error>
-where
-    DbT: WalletWrite,
-{
-    for output_ref in proposal_input_refs(proposal) {
-        wallet_db.unlock_output(&output_ref, owner)?;
-    }
-    Ok(())
-}
-
 /// Select transaction inputs, compute fees, and construct a proposal for a transaction or series
 /// of transactions that can then be authorized and made ready for submission to the network with
 /// [`create_proposed_transactions`].
 ///
 /// When `lock_inputs` is `Some(request)`, every input selected by the returned proposal is
-/// locked via [`WalletWrite::lock_outputs`] on behalf of the request's [`LockOwner`], with an
+/// locked via [`OutputLockStore::lock_outputs`] on behalf of the request's [`LockOwner`], with an
 /// expiry height of `target_height + request.for_blocks()`, so that the inputs are excluded from
 /// selection by subsequent proposals until that height is reached (or until they are explicitly
 /// released; see below). When it is `None`, no locking is performed.
@@ -806,16 +694,17 @@ where
 /// whose inputs it locked should release them with [`unlock_proposal_inputs`] under the same
 /// owner; locks are otherwise cleared automatically when the inputs are recorded as spent by
 /// [`WalletWrite::store_transactions_to_be_sent`], when their expiry height is reached, or via
-/// [`WalletWrite::clear_locked_outputs`].
+/// [`OutputLockStore::clear_locked_outputs`].
 ///
 /// Note that expiry re-opens the race the lock exists to prevent: if building and proving the
 /// transaction takes longer than the requested lock window, the lock expires and a concurrent
 /// proposal may select and spend the same inputs. Choose the window conservatively with respect
 /// to the worst-case time between proposal creation and transaction storage.
 ///
-/// [`WalletWrite::lock_outputs`]: crate::data_api::WalletWrite::lock_outputs
+/// [`LockOwner`]: crate::wallet::LockOwner
+/// [`OutputLockStore::lock_outputs`]: crate::data_api::OutputLockStore::lock_outputs
 /// [`WalletWrite::store_transactions_to_be_sent`]: crate::data_api::WalletWrite::store_transactions_to_be_sent
-/// [`WalletWrite::clear_locked_outputs`]: crate::data_api::WalletWrite::clear_locked_outputs
+/// [`OutputLockStore::clear_locked_outputs`]: crate::data_api::OutputLockStore::clear_locked_outputs
 /// [zcash/librustzcash#2161]: https://github.com/zcash/librustzcash/issues/2161
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
@@ -929,10 +818,8 @@ pub fn propose_standard_transfer_to_address<DbT, ParamsT, CommitmentTreeErrT>(
 where
     ParamsT: consensus::Parameters + Clone,
     DbT: InputSource,
-    DbT: WalletWrite<
-            Error = <DbT as InputSource>::Error,
-            AccountId = <DbT as InputSource>::AccountId,
-        >,
+    DbT: WalletWrite,
+    DbT: WalletRead<Error = <DbT as InputSource>::Error, AccountId = <DbT as InputSource>::AccountId>,
     DbT::NoteRef: Copy + Eq + Ord,
 {
     let request = zip321::TransactionRequest::new(vec![
@@ -1573,7 +1460,10 @@ fn build_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>
     // Overrides the builder-derived expiry height, when set. Applied immediately after
     // `Builder::new` below, before any inputs are added or signatures/proofs are produced.
     expiry_height: Option<BlockHeight>,
-) -> Result<BuildState<ParamsT, DbT::AccountId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
+) -> Result<
+    BuildState<ParamsT, <DbT as WalletRead>::AccountId>,
+    CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
+>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
     ParamsT: consensus::Parameters + Clone,
@@ -2698,10 +2588,8 @@ where
     DbT: WalletWrite + WalletCommitmentTrees,
     ParamsT: consensus::Parameters + Clone,
     FeeRuleT: FeeRule,
-    DbT::AccountId: serde::Serialize,
+    <DbT as WalletRead>::AccountId: serde::Serialize,
 {
-    use std::collections::HashSet;
-
     let account = wallet_db
         .get_account(account_id)
         .map_err(Error::DataSource)?
@@ -2784,13 +2672,6 @@ where
         .collect::<HashMap<_, _>>();
 
     #[cfg(feature = "orchard")]
-    let orchard_spends = (0..)
-        .map(|i| build_result.orchard_meta.spend_action_index(i))
-        .take_while(|item| item.is_some())
-        .flatten()
-        .collect::<HashSet<_>>();
-
-    #[cfg(feature = "orchard")]
     let ironwood_outputs = build_state
         .ironwood_output_meta
         .into_iter()
@@ -2807,13 +2688,6 @@ where
             )
         })
         .collect::<HashMap<_, _>>();
-
-    #[cfg(feature = "orchard")]
-    let ironwood_spends = (0..)
-        .map(|i| build_result.ironwood_meta.spend_action_index(i))
-        .take_while(|item| item.is_some())
-        .flatten()
-        .collect::<HashSet<_>>();
 
     let sapling_outputs = build_state
         .sapling_output_meta
@@ -2836,7 +2710,7 @@ where
         .update_global_with(|mut updater| {
             updater.set_proprietary(
                 PROPRIETARY_PROPOSAL_INFO.into(),
-                postcard::to_allocvec(&ProposalInfo::<DbT::AccountId> {
+                postcard::to_allocvec(&ProposalInfo::<<DbT as WalletRead>::AccountId> {
                     from_account: account_id,
                     target_height: proposal.min_target_height(),
                 })
@@ -2844,13 +2718,26 @@ where
             )
         })
         .update_orchard_with(|mut updater| {
-            for index in 0..updater.bundle().actions().len() {
+            // An action still needs a spend authorization signature if and only if its spend
+            // requires one: this covers both the requested real spends and the wallet-controlled
+            // zero-value spends the builder pairs with change outputs in the vanilla-Orchard-pool
+            // bundle under the post-NU6.3 cross-address rule. Protocol padding dummies are
+            // pre-signed and cleared by the IO Finalizer, so they are excluded by this check.
+            let spend_needs_derivation = updater
+                .bundle()
+                .actions()
+                .iter()
+                .map(|action| action.spend().spend_auth_sig().is_none())
+                .collect::<Vec<_>>();
+
+            for (index, needs_derivation) in spend_needs_derivation.iter().enumerate() {
                 updater.update_action_with(index, |mut action_updater| {
-                    // If the account has a known derivation, add the Orchard key path to the PCZT.
+                    // If the account has a known derivation, add the Orchard key path to the PCZT
+                    // for every spend that still requires a signature (real spends and
+                    // wallet-controlled zero-value spends), so an external Signer can identify
+                    // and sign it.
                     if let Some(derivation) = account_derivation {
-                        // orchard_spends will only contain action indices for the real spends, and
-                        // not the dummy inputs
-                        if orchard_spends.contains(&index) {
+                        if *needs_derivation {
                             // All spent notes are from the same account.
                             action_updater.set_spend_zip32_derivation(
                                 orchard::pczt::Zip32Derivation::parse(
@@ -2890,14 +2777,27 @@ where
             Ok(())
         })?
         .update_ironwood_with(|mut updater| {
-            for index in 0..updater.bundle().actions().len() {
+            // An action still needs a spend authorization signature if and only if its spend
+            // requires one: this covers both the requested real spends and the wallet-controlled
+            // zero-value spends the builder pairs with change outputs in the vanilla-Orchard-pool
+            // bundle under the post-NU6.3 cross-address rule. Protocol padding dummies are
+            // pre-signed and cleared by the IO Finalizer, so they are excluded by this check.
+            let spend_needs_derivation = updater
+                .bundle()
+                .actions()
+                .iter()
+                .map(|action| action.spend().spend_auth_sig().is_none())
+                .collect::<Vec<_>>();
+
+            for (index, needs_derivation) in spend_needs_derivation.iter().enumerate() {
                 updater.update_action_with(index, |mut action_updater| {
                     // Ironwood notes are spent with the account's Orchard spending key, so the key
-                    // path added here is the Orchard one.
+                    // path added here is the Orchard one. If the account has a known derivation,
+                    // add it for every spend that still requires a signature (real spends and
+                    // wallet-controlled zero-value spends), so an external Signer can identify
+                    // and sign it.
                     if let Some(derivation) = account_derivation {
-                        // ironwood_spends contains action indices only for the real spends, not the
-                        // dummy inputs.
-                        if ironwood_spends.contains(&index) {
+                        if *needs_derivation {
                             // All spent notes are from the same account.
                             action_updater.set_spend_zip32_derivation(
                                 orchard::pczt::Zip32Derivation::parse(
@@ -3078,27 +2978,97 @@ where
     Ok(pczt)
 }
 
+/// Selects the view produced by [`redact_pczt_for_signer`], according to the
+/// capabilities of the receiving Signer.
+#[cfg(feature = "pczt")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerView {
+    /// The conservative signer view, for general-purpose Signers including
+    /// deployed hardware signers (e.g. the Keystone ordinary send flow), which
+    /// this view is validated against in the field.
+    ///
+    /// It removes wallet metadata, Orchard-protocol and Sapling spend
+    /// witnesses, and dummy signing keys (a defensive no-op for IO-finalized
+    /// PCZTs, whose dummy keys were consumed by the IO Finalizer; per the PCZT
+    /// specification, Signers MUST reject PCZTs that contain them). It retains
+    /// proofs, binding-signature keys, and anchors, and performs no field
+    /// compaction, so the view of a v5 transaction remains representable in
+    /// the v1 PCZT encoding (which [`pczt::Pczt::serialize`] selects for it).
+    Full,
+    /// The compact signer view, for receivers that support the v2 PCZT
+    /// encoding and can restore compacted fields with
+    /// [`pczt::Pczt::resolve_fields`].
+    ///
+    /// In addition to the `Full` redactions — except that Sapling spend
+    /// witnesses are retained so that the Signer may verify nullifiers —
+    /// this clears zk-proofs and binding-signature keys, compacts resolvable
+    /// Orchard-protocol fields, and removes v6 shielded anchors (v5 anchors
+    /// are retained because signatures commit to them).
+    Compact,
+}
+
 /// Creates a redacted copy of a wallet PCZT for an external Signer.
 ///
-/// This is intended for PCZTs returned by [`create_pczt_from_proposal`]. It removes
-/// wallet metadata, proof data, binding and dummy signing keys, and Orchard-protocol
-/// spend witnesses that a Signer does not need. Sapling spend witnesses are retained
-/// because a Signer may use them to verify nullifiers. It also compacts Orchard and
-/// Ironwood fields that the receiver can restore with [`pczt::Pczt::resolve_fields`].
-/// For v6 transactions, it removes shielded anchors; v5 anchors are retained because
-/// signatures commit to them. The compact signer view requires the v2 PCZT encoding
-/// whenever it contains Orchard or Ironwood actions whose fields could be compacted.
+/// This is intended for PCZTs returned by [`create_pczt_from_proposal`]. The
+/// `view` argument selects the redaction policy; see [`SignerView`] for the
+/// receiver capabilities each view requires. When in doubt — in particular for
+/// hardware signers whose firmware predates the compact view — use
+/// [`SignerView::Full`].
 ///
-/// The returned PCZT retains information that a general-purpose Signer may need,
-/// including full viewing keys, spend authorization randomizers, key derivation
-/// paths, output recovery keys, and user-facing addresses. Applications may apply
-/// additional redaction when they know their Signer's capabilities.
+/// The returned PCZT retains information that a general-purpose Signer may
+/// need, including full viewing keys, spend authorization randomizers, key
+/// derivation paths, output recovery keys, and user-facing addresses.
+/// Applications may apply additional redaction when they know their Signer's
+/// capabilities. A Signer that independently obtains the relevant full viewing
+/// keys and returns only Orchard-protocol signature contributions can instead
+/// use [`redact_pczt_for_batch_signer`].
 ///
-/// The caller must retain `pczt` and combine the Signer's contribution into that
-/// authoritative copy. The returned signer view omits wallet metadata and other
-/// fields that [`extract_and_store_transaction_from_pczt`] requires.
+/// The caller must retain `pczt` and combine the Signer's contribution into
+/// that authoritative copy. The returned signer view omits wallet metadata and
+/// other fields that [`extract_and_store_transaction_from_pczt`] requires.
 #[cfg(feature = "pczt")]
-pub fn redact_pczt_for_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
+pub fn redact_pczt_for_signer(pczt: &pczt::Pczt, view: SignerView) -> pczt::Pczt {
+    match view {
+        SignerView::Full => full_signer_view(pczt),
+        SignerView::Compact => compact_signer_view(pczt),
+    }
+}
+
+#[cfg(feature = "pczt")]
+fn full_signer_view(pczt: &pczt::Pczt) -> pczt::Pczt {
+    fn redact_orchard_bundle(mut redactor: pczt::roles::redactor::orchard::OrchardRedactor<'_>) {
+        redactor.redact_actions(|mut action| {
+            action.clear_spend_witness();
+            action.clear_spend_dummy_sk();
+            action.redact_output_proprietary(PROPRIETARY_OUTPUT_INFO);
+        });
+    }
+
+    Redactor::new(pczt.clone())
+        .redact_global_with(|mut redactor| {
+            redactor.redact_proprietary(PROPRIETARY_PROPOSAL_INFO);
+        })
+        .redact_transparent_with(|mut redactor| {
+            redactor.redact_outputs(|mut output| {
+                output.redact_proprietary(PROPRIETARY_OUTPUT_INFO);
+            });
+        })
+        .redact_sapling_with(|mut redactor| {
+            redactor.redact_spends(|mut spend| {
+                spend.clear_witness();
+                spend.clear_dummy_ask();
+            });
+            redactor.redact_outputs(|mut output| {
+                output.redact_proprietary(PROPRIETARY_OUTPUT_INFO);
+            });
+        })
+        .redact_orchard_with(redact_orchard_bundle)
+        .redact_ironwood_with(redact_orchard_bundle)
+        .finish()
+}
+
+#[cfg(feature = "pczt")]
+fn compact_signer_view(pczt: &pczt::Pczt) -> pczt::Pczt {
     let redact_v6_anchors = *pczt.global().tx_version() == zcash_protocol::constants::V6_TX_VERSION;
 
     fn redact_orchard_bundle(
@@ -3155,10 +3125,12 @@ pub fn redact_pczt_for_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
 /// Creates a compact wallet PCZT for a batch Signer that obtains its full viewing key
 /// independently and returns only new Orchard and Ironwood signatures.
 ///
-/// In addition to [`redact_pczt_for_signer`], this removes spend full viewing keys and
-/// existing signatures. It also removes the randomizer from actions already authorized
-/// in `pczt`, while unsigned actions such as wallet controlled zero value spends retain
-/// theirs. Sapling signatures require a separate signing path.
+/// In addition to the [`SignerView::Compact`] policy of [`redact_pczt_for_signer`],
+/// this removes spend full viewing keys, and removes the randomizer from actions already
+/// authorized in `pczt`, while unsigned actions such as wallet controlled zero value
+/// spends retain theirs. Existing signatures are retained, so every action in the
+/// returned view is either already authorized or still authorizable. Sapling signatures
+/// require a separate signing path.
 ///
 /// The caller must retain the authoritative PCZT and apply the returned signature
 /// contributions to it. This function must run before its existing signatures are
@@ -3183,10 +3155,12 @@ pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
         preauthorized_action_indices: &[usize],
     ) {
         // The batch Signer derives its FVK and returns only new signatures.
-        redactor.redact_actions(|mut action| {
-            action.clear_spend_fvk();
-            action.clear_spend_auth_sig();
-        });
+        redactor.redact_actions(|mut action| action.clear_spend_fvk());
+        // An action that already carries a signature needs nothing further, so it gives up its
+        // randomizer. Its signature is RETAINED: the only pre-signed actions in a wallet PCZT
+        // are the protocol padding dummies, which carry no ZIP 32 derivation and whose
+        // `dummy_sk` the compact view has already cleared, so stripping the signature would
+        // leave an action that neither the Signer nor the wallet could ever authorize.
         // Unsigned actions keep alpha, including wallet controlled zero value spends.
         for &index in preauthorized_action_indices {
             redactor.redact_action(index, |mut action| action.clear_spend_alpha());
@@ -3197,7 +3171,7 @@ pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
     let ironwood_preauthorized = preauthorized_action_indices(pczt.ironwood());
 
     // Apply the policy shared by every external Signer first.
-    Redactor::new(redact_pczt_for_signer(pczt))
+    Redactor::new(redact_pczt_for_signer(pczt, SignerView::Compact))
         .redact_orchard_with(|redactor| {
             redact_orchard_bundle(redactor, &orchard_preauthorized);
         })
@@ -3233,7 +3207,7 @@ pub fn extract_and_store_transaction_from_pczt<DbT, N>(
 ) -> Result<TxId, ExtractErrT<DbT, N>>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
-    DbT::AccountId: serde::de::DeserializeOwned,
+    <DbT as WalletRead>::AccountId: serde::de::DeserializeOwned,
 {
     use std::collections::BTreeMap;
     use zcash_note_encryption::{Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput};
@@ -3246,7 +3220,7 @@ where
         .get(PROPRIETARY_PROPOSAL_INFO)
         .ok_or_else(|| PcztError::Invalid("PCZT missing proprietary proposal info field".into()))
         .and_then(|v| {
-            postcard::from_bytes::<ProposalInfo<DbT::AccountId>>(v).map_err(|e| {
+            postcard::from_bytes::<ProposalInfo<<DbT as WalletRead>::AccountId>>(v).map_err(|e| {
                 PcztError::Invalid(format!(
                     "Postcard decoding of proprietary proposal info failed: {e}"
                 ))
@@ -3294,7 +3268,7 @@ where
                 .output()
                 .proprietary()
                 .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<DbT::AccountId>>(v))
+                .map(|v| postcard::from_bytes::<PcztRecipient<<DbT as WalletRead>::AccountId>>(v))
                 .transpose()
                 .map_err(|e: postcard::Error| {
                     PcztError::Invalid(format!(
@@ -3340,7 +3314,7 @@ where
             let pczt_recipient = out
                 .proprietary()
                 .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<DbT::AccountId>>(v))
+                .map(|v| postcard::from_bytes::<PcztRecipient<<DbT as WalletRead>::AccountId>>(v))
                 .transpose()
                 .map_err(|e: postcard::Error| {
                     PcztError::Invalid(format!(
@@ -3371,7 +3345,7 @@ where
             let pczt_recipient = out
                 .proprietary()
                 .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<DbT::AccountId>>(v))
+                .map(|v| postcard::from_bytes::<PcztRecipient<<DbT as WalletRead>::AccountId>>(v))
                 .transpose()
                 .map_err(|e: postcard::Error| {
                     PcztError::Invalid(format!(

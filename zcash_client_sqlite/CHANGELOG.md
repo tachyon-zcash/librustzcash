@@ -10,6 +10,36 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `zcash_client_sqlite::error::SqliteClientError::BackendError` and the
+  `zcash_client_sqlite::error::BackendError` it wraps, reported when a
+  `zcash_client_backend` error value carries a variant this crate has no
+  translation for; the wrapped value carries the originating error. Those error
+  types are `#[non_exhaustive]`, so this is unreachable with the
+  `zcash_client_backend` release this crate is built against; it exists so that
+  a variant added upstream degrades to a diagnosable error rather than a
+  compilation failure.
+
+### Changed
+- Every public error enum in this crate is now `#[non_exhaustive]`, so that
+  future variants can be added without a breaking release. A `match` over any
+  of them must now include a wildcard arm: `error::SqliteClientError`,
+  `FsBlockDbError`, `pool_migration::error::Error`,
+  `wallet::commitment_tree::Error`, `wallet::init::WalletMigrationError`, and
+  `zewif::ZewifImportError`.
+
+## [0.22.0-rc.4] - 2026-07-26
+
+### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.4`,
+  `zcash_pool_migration 0.1.0-rc.3`.
+
+## [0.22.0-rc.3] - 2026-07-26
+
+### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.3`,
+  `zcash_pool_migration 0.1.0-rc.2`.
+
 ## [0.22.0-rc.2] - 2026-07-24
 
 ### Added
