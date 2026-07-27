@@ -22,8 +22,11 @@ pub const MAX_NODE_DATA_SIZE: usize = 32 + // subtree commitment
     9 + // Orchard tx count (compact uint)
     32 + // start Ironwood tree root
     32 + // end Ironwood tree root
-    9; // Ironwood tx count (compact uint)
-// = total of 317
+    9 + // Ironwood tx count (compact uint)
+    32 + // start Tachyon anchor
+    32 + // end Tachyon anchor
+    9; // Tachyon tx count (compact uint)
+// = total of 390
 
 /// V1 node metadata.
 #[repr(C)]
@@ -287,6 +290,70 @@ impl V3 {
     }
 }
 
+/// V4 node metadata.
+///
+/// This extends the NU6.3 history node format with metadata for the Tachyon
+/// shielded pool. Tachyon has no note commitment tree; its pool state is a
+/// running anchor (a Poseidon hash sequence absorbing each proof stamp's
+/// tachygram-set commitment), so the anchor takes the place a tree root has
+/// for the other pools.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub struct V4 {
+    /// The V3 node data retained in V4.
+    pub v3: V3,
+    /// Tachyon anchor at the start of this node's interval.
+    ///
+    /// Leaf nodes represent a single block, so their start and end anchors are
+    /// both the Tachyon anchor after the corresponding block. Internal nodes
+    /// carry the start anchor from their leftmost leaf.
+    pub start_tachyon_anchor: [u8; 32],
+    /// Tachyon anchor at the end of this node's interval.
+    ///
+    /// Leaf nodes represent a single block, so their start and end anchors are
+    /// both the Tachyon anchor after the corresponding block. Internal nodes
+    /// carry the end anchor from their rightmost leaf.
+    pub end_tachyon_anchor: [u8; 32],
+    /// Number of transactions containing a Tachyon bundle.
+    pub tachyon_tx: u64,
+}
+
+impl V4 {
+    pub(crate) fn combine_inner(subtree_commitment: [u8; 32], left: &V4, right: &V4) -> V4 {
+        V4 {
+            v3: V3::combine_inner(subtree_commitment, &left.v3, &right.v3),
+            start_tachyon_anchor: left.start_tachyon_anchor,
+            end_tachyon_anchor: right.end_tachyon_anchor,
+            tachyon_tx: left.tachyon_tx + right.tachyon_tx,
+        }
+    }
+
+    /// Write to the byte representation.
+    pub fn write<W: corez::io::Write>(&self, w: &mut W) -> corez::io::Result<()> {
+        self.v3.write(w)?;
+        w.write_all(&self.start_tachyon_anchor)?;
+        w.write_all(&self.end_tachyon_anchor)?;
+        CompactSize::write_unbounded(&mut *w, self.tachyon_tx)?;
+        Ok(())
+    }
+
+    /// Read from the byte representation.
+    pub fn read<R: corez::io::Read>(
+        consensus_branch_id: u32,
+        r: &mut R,
+    ) -> corez::io::Result<Self> {
+        let mut data = V4 {
+            v3: V3::read(consensus_branch_id, r)?,
+            ..Default::default()
+        };
+        r.read_exact(&mut data.start_tachyon_anchor)?;
+        r.read_exact(&mut data.end_tachyon_anchor)?;
+        data.tachyon_tx = CompactSize::read_unbounded(&mut *r)?;
+
+        Ok(data)
+    }
+}
+
 #[cfg(any(test, feature = "test-dependencies"))]
 pub mod testing {
     use primitive_types::U256;
@@ -338,10 +405,10 @@ mod tests {
 
     use crate::{
         Entry, EntryLink, MAX_ENTRY_SIZE, V1 as HistoryV1, V2 as HistoryV2, V3 as HistoryV3,
-        Version,
+        V4 as HistoryV4, Version,
     };
 
-    use super::{MAX_NODE_DATA_SIZE, NodeData, V2, V3};
+    use super::{MAX_NODE_DATA_SIZE, NodeData, V2, V3, V4};
 
     fn node_data(start_height: u64, end_height: u64) -> NodeData {
         NodeData {
@@ -375,6 +442,15 @@ mod tests {
             start_ironwood_root: [13; 32],
             end_ironwood_root: [14; 32],
             ironwood_tx: 15,
+        }
+    }
+
+    fn node_data_v4(start_height: u64, end_height: u64) -> V4 {
+        V4 {
+            v3: node_data_v3(start_height, end_height),
+            start_tachyon_anchor: [16; 32],
+            end_tachyon_anchor: [17; 32],
+            tachyon_tx: 18,
         }
     }
 
@@ -413,6 +489,15 @@ mod tests {
         }
     }
 
+    fn max_node_data_v4() -> V4 {
+        V4 {
+            v3: max_node_data_v3(),
+            start_tachyon_anchor: [8; 32],
+            end_tachyon_anchor: [9; 32],
+            tachyon_tx: u64::MAX,
+        }
+    }
+
     fn v1_fixture_bytes() -> Vec<u8> {
         let mut expected = vec![];
         expected.extend_from_slice(&[1; 32]);
@@ -443,6 +528,14 @@ mod tests {
         expected.extend_from_slice(&[13; 32]);
         expected.extend_from_slice(&[14; 32]);
         expected.push(15);
+        expected
+    }
+
+    fn v4_fixture_bytes() -> Vec<u8> {
+        let mut expected = v3_fixture_bytes();
+        expected.extend_from_slice(&[16; 32]);
+        expected.extend_from_slice(&[17; 32]);
+        expected.push(18);
         expected
     }
 
@@ -546,28 +639,105 @@ mod tests {
     }
 
     #[test]
+    fn v4_serialization_round_trip() {
+        let node_data = node_data_v4(1, 2);
+
+        assert_eq!(
+            HistoryV4::from_bytes(1, v4_fixture_bytes()).unwrap(),
+            node_data
+        );
+        assert_eq!(HistoryV4::to_bytes(&node_data), v4_fixture_bytes());
+    }
+
+    #[test]
     fn max_serialized_sizes_cover_all_versions() {
         // ZIP 221 specifies that history nodes are at most 171 bytes before NU5
         // and 244 bytes after NU5; those bounds require the compact-encoded
         // fields to span the full `u64` range (a 9-byte compact encoding each).
         assert_eq!(HistoryV1::to_bytes(&max_node_data()).len(), 171);
         assert_eq!(HistoryV2::to_bytes(&max_node_data_v2()).len(), 244);
-        let max_v3_bytes = HistoryV3::to_bytes(&max_node_data_v3());
-        assert_eq!(max_v3_bytes.len(), MAX_NODE_DATA_SIZE);
+        assert_eq!(HistoryV3::to_bytes(&max_node_data_v3()).len(), 317);
+        let max_v4_bytes = HistoryV4::to_bytes(&max_node_data_v4());
+        assert_eq!(max_v4_bytes.len(), MAX_NODE_DATA_SIZE);
         assert_eq!(
-            HistoryV3::from_bytes(u32::MAX, &max_v3_bytes).unwrap(),
-            max_node_data_v3()
+            HistoryV4::from_bytes(u32::MAX, &max_v4_bytes).unwrap(),
+            max_node_data_v4()
         );
-        assert_eq!(MAX_NODE_DATA_SIZE, 317);
+        assert_eq!(MAX_NODE_DATA_SIZE, 390);
 
-        let entry = Entry::<HistoryV3>::new(
-            max_node_data_v3(),
+        let entry = Entry::<HistoryV4>::new(
+            max_node_data_v4(),
             EntryLink::Stored(u32::MAX),
             EntryLink::Stored(u32::MAX),
         );
         let mut encoded = vec![];
         entry.write(&mut encoded).unwrap();
         assert_eq!(encoded.len(), MAX_ENTRY_SIZE);
+    }
+
+    #[test]
+    fn v4_combine_tracks_tachyon_fields() {
+        let mut left = node_data_v4(1, 1);
+        left.start_tachyon_anchor = [22; 32];
+        left.end_tachyon_anchor = [23; 32];
+        left.tachyon_tx = 24;
+
+        let mut right = node_data_v4(2, 2);
+        right.start_tachyon_anchor = [25; 32];
+        right.end_tachyon_anchor = [26; 32];
+        right.tachyon_tx = 27;
+
+        let combined = HistoryV4::combine(&left, &right);
+
+        assert_eq!(combined.v3.v2.v1.start_height, 1);
+        assert_eq!(combined.v3.v2.v1.end_height, 2);
+        assert_eq!(combined.start_tachyon_anchor, [22; 32]);
+        assert_eq!(combined.end_tachyon_anchor, [26; 32]);
+        assert_eq!(combined.tachyon_tx, 51);
+    }
+
+    #[test]
+    fn v4_combine_hash_commits_to_tachyon_fields() {
+        let left = node_data_v4(1, 1);
+        let right = node_data_v4(2, 2);
+        let base_hash = HistoryV4::combine(&left, &right)
+            .v3
+            .v2
+            .v1
+            .subtree_commitment;
+
+        let mut changed_start_anchor = left.clone();
+        changed_start_anchor.start_tachyon_anchor[0] ^= 1;
+        assert_ne!(
+            HistoryV4::combine(&changed_start_anchor, &right)
+                .v3
+                .v2
+                .v1
+                .subtree_commitment,
+            base_hash
+        );
+
+        let mut changed_end_anchor = right.clone();
+        changed_end_anchor.end_tachyon_anchor[0] ^= 1;
+        assert_ne!(
+            HistoryV4::combine(&left, &changed_end_anchor)
+                .v3
+                .v2
+                .v1
+                .subtree_commitment,
+            base_hash
+        );
+
+        let mut changed_tx_count = left.clone();
+        changed_tx_count.tachyon_tx += 1;
+        assert_ne!(
+            HistoryV4::combine(&changed_tx_count, &right)
+                .v3
+                .v2
+                .v1
+                .subtree_commitment,
+            base_hash
+        );
     }
 
     #[test]
