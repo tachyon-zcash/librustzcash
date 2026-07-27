@@ -1,5 +1,5 @@
 //! End-to-end test of the migration pipeline for a typical wallet, using only the crate's public API.
-//! It doubles as a usage example: plan the note split, plan the preparation transactions, build and
+//! It doubles as a usage example: plan the denomination plan, plan the preparation transactions, build and
 //! pre-sign one, then build and pre-sign a pool-crossing transfer.
 
 use orchard::keys::{FullViewingKey, SpendAuthorizingKey};
@@ -7,19 +7,22 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use zcash_protocol::value::COIN;
 
-use super::test_util::{TARGET_HEIGHT, regtest_network, single_note_witness, spending_key};
+use super::test_util::{
+    TARGET_HEIGHT, account_derivation, assert_every_spend_is_identifiable, regtest_network,
+    single_note_witness, spending_key,
+};
 use super::{build_prep_tx, build_transfer_pczt, sign_pczt};
 use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
 use zcash_primitives::transaction::fees::{FeeRule as _, transparent, zip317};
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
-use crate::note_splitting::{
-    DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER, plan_note_split,
+use crate::denomination::{
+    DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER, plan_denominations,
 };
 use crate::preparation::{PREP_TX_ACTIONS, PrepInput, plan_preparation};
 
-/// note split -> preparation plan -> build + sign a preparation transaction -> build + sign a
+/// denomination plan -> preparation plan -> build + sign a preparation transaction -> build + sign a
 /// pool-crossing transfer, for a typical single-note wallet.
 #[test]
 fn migration_pipeline_end_to_end() {
@@ -32,7 +35,7 @@ fn migration_pipeline_end_to_end() {
     let ask = SpendAuthorizingKey::from(&sk);
     let balance = 78 * COIN;
 
-    // 1. Note split: decompose the balance into canonical self-funding denominations, accounting
+    // 1. Denomination planning: decompose the balance into canonical self-funding denominations, accounting
     //    the true preparation cost (via the real preparation planner) at each step.
     let prep_fee = Zatoshis::const_from_u64(PREP_TX_ACTIONS as u64 * MARGINAL_FEE.into_u64());
     let buffer = Zatoshis::const_from_u64(
@@ -47,7 +50,7 @@ fn migration_pipeline_end_to_end() {
     };
     let split = {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        plan_note_split(
+        plan_denominations(
             Zatoshis::const_from_u64(balance),
             buffer,
             prep_fee,
@@ -81,6 +84,7 @@ fn migration_pipeline_end_to_end() {
         &fvk,
         vec![note],
         tx.outputs(),
+        Some(&account_derivation(seed)),
         ChaCha8Rng::seed_from_u64(seed + 1),
     )
     .expect("the preparation transaction builds");
@@ -90,6 +94,12 @@ fn migration_pipeline_end_to_end() {
         "the preparation bundle is padded to exactly 16 actions"
     );
     assert_eq!(placed.len(), tx.outputs().len(), "every output is located");
+    // Every spend the preparation transaction needs authorized is identifiable to an external
+    // Signer: the real spend plus one wallet-controlled zero-value spend per change output.
+    assert_eq!(
+        assert_every_spend_is_identifiable(&prep_pczt),
+        1 + tx.outputs().len(),
+    );
 
     // The REAL constructed preparation transaction pays exactly the canonical ZIP-317 fee of its
     // padded shape: the value its spends bring in, minus the value its outputs (including change
@@ -136,9 +146,12 @@ fn migration_pipeline_end_to_end() {
         &fvk,
         fnote,
         crossing,
+        Some(&account_derivation(seed)),
         ChaCha8Rng::seed_from_u64(seed + 3),
     )
     .expect("the transfer builds");
+    // Likewise for the transfer's single real Orchard spend.
+    assert_eq!(assert_every_spend_is_identifiable(&transfer_pczt), 1);
 
     // The REAL constructed transfer pays exactly the canonical fee of the 2-Orchard +
     // 1-Ironwood-action transfer

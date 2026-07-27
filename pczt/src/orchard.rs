@@ -71,6 +71,7 @@ pub struct Bundle {
     /// The Orchard bundle proof.
     ///
     /// This is `None` until it is set by the Prover.
+    #[getset(get = "pub")]
     pub(crate) zkproof: Option<Vec<u8>>,
 
     /// The Orchard binding signature signing key.
@@ -589,6 +590,7 @@ pub struct Spend {
     /// - This is chosen by the Constructor.
     /// - This is required by the IO Finalizer, and is cleared by it once used.
     /// - Signers MUST reject PCZTs that contain `dummy_sk` values.
+    #[getset(get = "pub")]
     pub(crate) dummy_sk: Option<[u8; 32]>,
 
     /// Proprietary fields related to the note being spent.
@@ -750,6 +752,12 @@ pub mod v1 {
                 return Err(crate::EncodingError::UnsupportedOrchardNoteVersion);
             }
 
+            let anchor = match bundle.anchor {
+                Some(anchor) => anchor,
+                None if bundle.actions.is_empty() => super::DEFAULT_ANCHOR,
+                None => return Err(crate::EncodingError::RequiresV2),
+            };
+
             Ok(Self {
                 actions: bundle
                     .actions
@@ -758,7 +766,7 @@ pub mod v1 {
                     .collect::<Result<Vec<_>, _>>()?,
                 flags: bundle.flags,
                 value_sum: bundle.value_sum,
-                anchor: bundle.anchor.ok_or(crate::EncodingError::RequiresV2)?,
+                anchor,
                 zkproof: bundle.zkproof,
                 bsk: bundle.bsk,
             })
@@ -767,6 +775,18 @@ pub mod v1 {
 
     impl From<Bundle> for super::Bundle {
         fn from(bundle: Bundle) -> Self {
+            // The v1 encoding has no placeholder for a missing anchor, so an empty
+            // bundle's anchor is substituted with `DEFAULT_ANCHOR` on encode (see
+            // `TryFrom<super::Bundle> for Bundle` above). Undo that substitution here
+            // so that decoding an empty bundle reproduces `super::EMPTY_ORCHARD`
+            // exactly, mirroring the `is_default_empty` treatment the v2 encoder
+            // applies for the same case.
+            let anchor = if bundle.actions.is_empty() && bundle.anchor == super::DEFAULT_ANCHOR {
+                None
+            } else {
+                Some(bundle.anchor)
+            };
+
             Self {
                 actions: bundle
                     .actions
@@ -775,7 +795,7 @@ pub mod v1 {
                     .collect(),
                 flags: bundle.flags,
                 value_sum: bundle.value_sum,
-                anchor: Some(bundle.anchor),
+                anchor,
                 note_version: NoteVersion::V2,
                 zkproof: bundle.zkproof,
                 bsk: bundle.bsk,
@@ -1162,8 +1182,9 @@ pub(crate) mod v2 {
         use alloc::{collections::BTreeMap, vec::Vec};
 
         use super::super::{
-            Action as LogicalAction, Bundle as LogicalBundle, EncCiphertext, MEMO_SIZE,
-            MemoPlaintext, NoteVersion, ORCHARD_SPENDS_AND_OUTPUTS_ENABLED, Output, Spend,
+            Action as LogicalAction, Bundle as LogicalBundle, EMPTY_ORCHARD, EncCiphertext,
+            MEMO_SIZE, MemoPlaintext, NoteVersion, ORCHARD_SPENDS_AND_OUTPUTS_ENABLED, Output,
+            Spend,
         };
 
         fn logical_action(cv_net: Option<[u8; 32]>, cmx: Option<[u8; 32]>) -> LogicalAction {
@@ -1378,7 +1399,14 @@ pub(crate) mod v2 {
                 .actions
                 .push(decryptable_action_with_memo(memo));
 
-            let encrypted_size = pczt.clone().serialize().unwrap().len();
+            // Pin both sides to the v2 encoding explicitly: `Pczt::serialize` now
+            // picks the minimal encoding capable of representing its content, and
+            // this comparison is measuring the size effect of the memo-plaintext
+            // compaction, not of the encoding version chosen for either PCZT.
+            let encrypted_size = crate::v2::Pczt::try_from(pczt.clone())
+                .unwrap()
+                .serialize()
+                .len();
             let redacted = Redactor::new(pczt)
                 .redact_orchard_with(|mut orchard| {
                     orchard.redact_actions(|mut action| {
@@ -1387,7 +1415,10 @@ pub(crate) mod v2 {
                     });
                 })
                 .finish();
-            let redacted_size = redacted.clone().serialize().unwrap().len();
+            let redacted_size = crate::v2::Pczt::try_from(redacted.clone())
+                .unwrap()
+                .serialize()
+                .len();
 
             assert_eq!(
                 redacted.orchard.actions[0].output.enc_ciphertext,
@@ -1540,6 +1571,29 @@ pub(crate) mod v2 {
                 )),
                 Err(crate::EncodingError::RequiresV2)
             ));
+        }
+
+        #[test]
+        fn v1_empty_bundle_anchor_falls_back_to_default() {
+            // An empty bundle has no anchor to commit to, so the v1 encoding (whose
+            // anchor field is mandatory) falls back to `DEFAULT_ANCHOR`.
+            let bundle = LogicalBundle {
+                actions: Vec::new(),
+                flags: ORCHARD_SPENDS_AND_OUTPUTS_ENABLED,
+                value_sum: (0, false),
+                anchor: None,
+                note_version: NoteVersion::V2,
+                zkproof: None,
+                bsk: None,
+            };
+
+            let encoded = crate::orchard::v1::Bundle::try_from(bundle)
+                .expect("an empty bundle's anchor falls back to DEFAULT_ANCHOR");
+
+            // Decoding must undo the fallback substitution, reproducing the logical
+            // empty bundle exactly rather than materializing the placeholder anchor.
+            let decoded = super::super::Bundle::from(encoded);
+            assert_eq!(decoded, EMPTY_ORCHARD);
         }
     }
 }

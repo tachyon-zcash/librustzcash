@@ -10,6 +10,40 @@ workspace.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-26
+
+### Fixed
+- Parsing a v1-encoded PCZT with an empty Orchard bundle no longer
+  materializes the placeholder anchor substituted for it on encode. The
+  logical bundle now round-trips to its canonical empty form (with no
+  anchor), matching the invariant that the v1 decoder produces exactly the
+  same empty bundle as the Creator and the v2 decoder.
+
+## [0.9.0] - 2026-07-26
+
+### Added
+- `pczt::orchard::Bundle::zkproof`
+- `pczt::orchard::Spend::dummy_sk`
+- `pczt::sapling::Spend::witness`
+
+### Changed
+- `pczt::Pczt::serialize` now emits the minimal encoding version capable of
+  representing the PCZT's content: the v1 encoding whenever the content is
+  representable in it (a pre-v6 transaction with a canonical-empty Ironwood
+  bundle and no compact-only field state), and the v2 encoding otherwise.
+  Previously it always emitted the v2 encoding. This maximizes compatibility
+  with receivers that predate the v2 encoding, such as deployed hardware
+  signers. Callers that require a specific encoding version should use
+  `pczt::v1::Pczt` or `pczt::v2::Pczt` directly.
+
+### Fixed
+- `pczt::v1::Pczt::try_from` (and thus `pczt::Pczt::serialize`'s v1 encoding
+  selection) incorrectly required an Orchard anchor even for a PCZT with an
+  empty Orchard bundle, returning `EncodingError::RequiresV2` for such PCZTs
+  even though they carry no Orchard-protocol data. An empty Orchard bundle
+  now falls back to a placeholder anchor for the v1 encoding, matching the
+  existing behavior for an empty Sapling bundle.
+
 ## [0.8.0] - 2026-07-23
 
 ### Added

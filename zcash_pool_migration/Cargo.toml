@@ -1,7 +1,7 @@
 [package]
 name = "zcash_pool_migration"
 description = "Backend-agnostic value-pool migration engine for Zcash wallets"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.3"
 authors = [
     "Danny Willems <be.danny.willems@gmail.com>",
     "John Boyd <john@coldnoise.net>",
@@ -32,6 +32,7 @@ proptest = { workspace = true, optional = true }
 
 # Enabled by the `orchard` feature.
 orchard = { workspace = true, optional = true }
+zip32 = { workspace = true, optional = true }
 pczt = { workspace = true, optional = true, features = [
     "io-finalizer",
     "orchard",
@@ -50,15 +51,16 @@ incrementalmerkletree = { workspace = true, optional = true }
 [dev-dependencies]
 incrementalmerkletree.workspace = true
 pczt = { workspace = true, features = ["orchard", "tx-extractor"] }
-prost.workspace = true
 proptest.workspace = true
 rand_chacha.workspace = true
-rusqlite.workspace = true
 shardtree.workspace = true
-tempfile.workspace = true
-zcash_client_backend = { workspace = true, features = ["orchard", "test-dependencies"] }
-zcash_client_sqlite = { workspace = true, features = ["orchard", "test-dependencies"] }
-zcash_proofs.workspace = true
+# Solely for `test-dependencies`, which exposes the `AnchorRetentionInterval::custom` constructor
+# that the `wallet`-gated conversion test uses; the crate itself reaches this dependency through the
+# `wallet` feature. It deliberately does NOT ask for `orchard`: that would force
+# `zcash_client_backend/orchard` on in every workspace build that includes dev-dependencies, while
+# `zcash_client_sqlite`'s matching feature stayed off, leaving its storage-trait impls compiled out
+# of traits that had grown Orchard and Ironwood methods.
+zcash_client_backend = { workspace = true, features = ["test-dependencies"] }
 
 # The `local-consensus` feature exposes `LocalNetwork`, used to build the migration transactions
 # against regtest params with the relevant network upgrades (including NU6.3) active.
@@ -75,7 +77,7 @@ zcash_pool_migration_memory = { path = "../zcash_pool_migration_memory" }
 ## the cryptographic ingredients a wallet supplies into an unproven migration PCZT. Requires the
 ## Orchard pool; pulls in `orchard` and `pczt`. The caller supplies the RNG, so no `rand` dependency
 ## is added.
-orchard = ["dep:orchard", "dep:pczt"]
+orchard = ["dep:orchard", "dep:pczt", "dep:zip32"]
 ## Builds the wallet-backed adapter (`wallet` module): a `WalletMigration` that implements the
 ## engine's backend/crypto/store traits over a `zcash_client_backend` wallet, so any such wallet is a
 ## migration wallet with no hand-wired crypto. Implies `orchard`.
@@ -94,13 +96,6 @@ test-dependencies = [
     "zcash_primitives/test-dependencies",
     "zcash_protocol/test-dependencies",
 ]
-## A marker that tracks `zcash_client_backend`'s `transparent-inputs` feature so the funded-wallet
-## end-to-end test's `DataStoreFactory` implementation matches the trait, whose `new_data_store`
-## gains a `gap_limits` parameter under `transparent-inputs`. It intentionally enables nothing on its
-## own: under a `--workspace` build (all workspace members get `transparent-inputs` together) and
-## under `--all-features`, this is on exactly when the wallet crates' `transparent-inputs` is, which
-## is the only build that compiles that test (it needs `wallet` too).
-transparent-inputs = []
 
 [lints]
 workspace = true

@@ -10,6 +10,75 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `impl Debug for zcash_client_backend::data_api::ll::wallet::PutBlocksError`
+- `zcash_client_backend::tor::Timeouts`
+- `zcash_client_backend::tor::Client::create_with_timeouts`
+- `zcash_client_backend::tor::http::TimeoutPhase`
+- `zcash_client_backend::tor::http::HttpError::Timeout`
+
+### Changed
+- Every public error enum in this crate is now `#[non_exhaustive]` 
+  so that future variants can be added without a breaking release. A
+  `match` over any of them must now include a wildcard arm:
+  `data_api::chain::Error`, `data_api::error::{Error, RewindError, PcztError,
+  LockError}`, `data_api::ll::wallet::PutBlocksError`,
+  `data_api::wallet::input_selection::{InputSelectorError,
+  GreedyInputSelectorError}`, `data_api::BirthdayError`, `fees::ChangeError`,
+  `proto::{CompactFormatError, ProposalDecodingError}`, `scanning::ScanError`,
+  `sync::Error`, `sync::decryptor::TryQueueError`, `tor::Error`,
+  `tor::grpc::GrpcError`, and `tor::http::HttpError`.
+
+### Fixed
+- `zcash_client_backend::data_api::wallet::redact_pczt_for_batch_signer` no
+  longer removes existing spend authorization signatures. It previously
+  stripped the signatures of the pre-signed protocol padding dummies while
+  also removing their randomizers and (via the compact signer view) their
+  dummy signing keys, leaving actions that neither the batch Signer nor the
+  wallet could authorize. Every action in the returned view is now either
+  already authorized or still authorizable. A batch Signer's response
+  consequently carries the retained signatures back alongside the new ones;
+  re-applying them to the authoritative PCZT is a no-op.
+- The Tor HTTP and gRPC transports now bound how long each network operation may
+  take. Previously a server that accepted a connection and then never responded
+  would leave the request pending indefinitely, and could thereby stall any caller
+  that aggregates several servers (such as `tor::Client::get_latest_zec_to_usd_rate`).
+  `tor::Client::create` applies `tor::Timeouts::default`; use
+  `tor::Client::create_with_timeouts` if those deadlines are too aggressive for your
+  expected circuit latency. HTTP requests that exceed a deadline now fail with
+  `tor::http::HttpError::Timeout` instead of hanging.
+
+## [0.24.0-rc.4] - 2026-07-26
+
+### Changed
+- `zcash_client_backend::proposal::ProposalError` is now `#[non_exhaustive]`
+  and has added variant `OrchardPoolPayment`.
+
+### Fixed
+- PCZTs created by `create_pczt_from_proposal` for post-NU6.3 (v6) transactions
+  now carry ZIP 32 derivation metadata on wallet-controlled zero-value spends,
+  so external Signers can identify and sign them; previously such actions
+  were unsignable and transaction extraction failed with a missing
+  spend-auth signature.
+
+## [0.24.0-rc.3] - 2026-07-26
+
+### Added
+- `zcash_client_backend::data_api::wallet::SignerView`, selecting the signer
+  view produced by `redact_pczt_for_signer` according to the receiving
+  Signer's capabilities.
+
+### Changed
+- Migrated to `pczt 0.9.0`.
+- `zcash_client_backend::data_api::wallet::redact_pczt_for_signer` now takes a
+  `SignerView` argument. `SignerView::Compact` preserves the previous
+  behavior; the new `SignerView::Full` produces a conservative view for
+  Signers that predate the compact view (including deployed hardware
+  signers): it retains proofs, binding-signature keys, and anchors, clears
+  Orchard-protocol and Sapling spend witnesses and dummy signing keys, and
+  performs no field compaction, so its view of a v5 transaction remains
+  representable in the v1 PCZT encoding.
+
 ## [0.24.0-rc.2] - 2026-07-24
 
 ### Added
@@ -89,6 +158,19 @@ workspace.
   back through this method to decide which heights its transfers may anchor to.
 - `zcash_client_backend::data_api::testing::TestBuilder::with_anchor_retention_interval`
 
+- `zcash_client_backend::data_api::locking`, a new module that is the single
+  home for the note-locking vocabulary: `LockOwner`, `LockError`,
+  `LockRequest`, `unlock_proposal_inputs`, `LockedInputPolicy`, and
+  `LockFilter` now live here, together with the module-level documentation of
+  the locking semantics. All previous paths (`wallet::LockOwner`,
+  `data_api::error::LockError`, `data_api::wallet::{LockRequest,
+  unlock_proposal_inputs}`, and
+  `data_api::wallet::input_selection::{LockedInputPolicy, LockFilter}`) are
+  preserved as re-exports.
+- `zcash_client_backend::data_api::locking::OutputLockStore` (re-exported as
+  `zcash_client_backend::data_api::OutputLockStore`), the extracted storage
+  contract for output locks, with `AccountId` and `Error` associated types.
+
 ### Changed
 - Migrated to `zcash_primitives 0.30.0`, `zcash_transparent 0.10.0`,
   `zcash_proofs 0.30.0`, `pczt 0.8.0`, `zcash_keys 0.16.0`.
@@ -105,6 +187,21 @@ workspace.
   argument; pass `None` to keep the default grid.
 - `zcash_client_backend::data_api::testing::pool::anchor_checkpoints_retained_across_deep_scan`
   takes the `AnchorRetentionInterval` to exercise as an additional argument.
+- The output-lock storage methods have been extracted from `WalletWrite` into
+  the new `OutputLockStore` trait (a breaking change relative to the locking
+  API introduced earlier in this unreleased cycle):
+  - `WalletWrite` now has
+    `OutputLockStore<AccountId = <Self as WalletRead>::AccountId,
+    Error = <Self as WalletRead>::Error>` as a supertrait and no longer
+    declares `lock_outputs`, `unlock_output`, or `clear_locked_outputs`;
+    implementors must now provide these via an `OutputLockStore` impl.
+  - `WalletTest::get_locked_outputs` has moved to `OutputLockStore` (still
+    gated on the `test-dependencies` feature).
+  - Because `WalletWrite` now inherits same-named associated types from two
+    supertraits, generic code bounded on `WalletWrite` must qualify
+    `AccountId` and `Error` (e.g. `<DbT as WalletRead>::Error`), and bounds of
+    the form `WalletWrite<Error = E, AccountId = A>` should become
+    `WalletRead<Error = E, AccountId = A> + WalletWrite`.
 - `zcash_client_backend::data_api::wallet::create_proposed_transactions` now
   takes an `expiry_height: Option<BlockHeight>` parameter, mirroring the
   one already accepted by `create_pczt_from_proposal`. This lets callers

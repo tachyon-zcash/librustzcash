@@ -1,6 +1,6 @@
 //! The migration engine: orchestrating a pool migration end to end through a wallet backend.
 //!
-//! The crate's other modules are the individual planners and builders: [`note_splitting`] decides the
+//! The crate's other modules are the individual planners and builders: [`denomination`] decides the
 //! denominations, [`preparation`] plans the transactions that mint them, [`scheduling`] shuffles and
 //! times the phase-2 transfers, and the `build` module turns plans into PCZTs. This module ties
 //! them together behind a [`MigrationBackend`] trait, so the engine drives the whole flow
@@ -37,13 +37,13 @@
 //! wallet closed between planning and broadcast, or restarted partway through, resumes from the stored
 //! PCZTs.
 //!
-//! [`note_splitting`]: crate::note_splitting
+//! [`denomination`]: crate::denomination
 //! [`preparation`]: crate::preparation
 //! [`scheduling`]: crate::scheduling
 
 use alloc::vec::Vec;
 use core::fmt;
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU32, NonZeroUsize};
 
 use corez::io;
 
@@ -56,9 +56,15 @@ use zcash_protocol::value::{BalanceError, Zatoshis};
 use zcash_primitives::transaction::fees::FeeRule as _;
 use zcash_primitives::transaction::fees::{transparent, zip317};
 
-use crate::note_splitting::{NoteSplitPlan, plan_note_split};
+#[cfg(feature = "orchard")]
+use crate::build::AccountDerivation;
+use crate::denomination::{DenominationPlan, plan_denominations};
 use crate::preparation::{PrepError, PrepInput, PreparationPlan, plan_preparation};
 use crate::scheduling::{self, Schedule};
+use crate::signing_rounds::{
+    MinRounds, PlannedSigningRound, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
+    min_budget_for_rounds, min_signing_rounds,
+};
 
 /// The estimated number of blocks for a preparation layer's LAST scheduled transaction to mine and
 /// become spendable: mining latency plus the wallet's witness-sync and next-broadcast turnaround, a
@@ -128,7 +134,7 @@ pub trait PoolMigrationWrite: PoolMigrationRead {
     /// it, or the chain mines it).
     fn update_transaction(
         &mut self,
-        id: MigrationTxId,
+        id: MigrationTransferId,
         state: MigrationTxState,
     ) -> Result<(), Self::Error>;
 }
@@ -138,14 +144,20 @@ pub trait PoolMigrationWrite: PoolMigrationRead {
 /// deferred preparation layers and transfers are recorded as unbuilt placeholders); it is NOT a
 /// Zcash transaction id. The real [`TxId`] becomes available once a transaction is built and signed
 /// (it commits only effecting data), and is carried by [`MigrationTxState::Broadcast`].
+///
+/// The two identities are not interchangeable, and this one is the one to key on. A [`TxId`]
+/// identifies a single broadcast ATTEMPT: [`rebuild_expired_transfer`] keeps this id while
+/// producing a new transaction with a new [`TxId`], so a consumer that keyed its own records on
+/// the [`TxId`] loses track of the transfer exactly when it most needs to follow it. Use the
+/// [`TxId`] to talk to the network about a transaction, and this id to talk about the transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct MigrationTxId(pub(crate) u32);
+pub struct MigrationTransferId(pub(crate) u32);
 
-impl MigrationTxId {
+impl MigrationTransferId {
     /// Wrap a stored ordinal as a migration-transaction row key (for a store reading a persisted
     /// migration back).
     pub const fn new(index: u32) -> Self {
-        MigrationTxId(index)
+        MigrationTransferId(index)
     }
 
     /// Writes this id as an unsigned 32-bit little-endian integer.
@@ -157,12 +169,12 @@ impl MigrationTxId {
     pub fn read<R: io::Read>(mut reader: R) -> io::Result<Self> {
         let mut bytes = [0u8; 4];
         reader.read_exact(&mut bytes)?;
-        Ok(MigrationTxId::new(u32::from_le_bytes(bytes)))
+        Ok(MigrationTransferId::new(u32::from_le_bytes(bytes)))
     }
 }
 
-impl From<MigrationTxId> for u32 {
-    fn from(id: MigrationTxId) -> u32 {
+impl From<MigrationTransferId> for u32 {
+    fn from(id: MigrationTransferId) -> u32 {
         id.0
     }
 }
@@ -268,7 +280,7 @@ pub enum MigrationTxState {
 pub struct MigrationTransaction {
     /// This transaction's stable id.
     #[getset(get_copy = "pub")]
-    pub(crate) id: MigrationTxId,
+    pub(crate) id: MigrationTransferId,
     /// What it does (a preparation transaction or a transfer).
     #[getset(get_copy = "pub")]
     pub(crate) kind: MigrationTxKind,
@@ -284,7 +296,7 @@ pub struct MigrationTransaction {
     /// The transactions that must be mined before this one may be broadcast (the preparation layer
     /// dependency graph; empty for an independent transaction).
     #[getset(get = "pub")]
-    pub(crate) depends_on: Vec<MigrationTxId>,
+    pub(crate) depends_on: Vec<MigrationTransferId>,
     /// The height at which to broadcast (for a transfer; a preparation transaction waits for its
     /// dependencies to mine and a boundary to pass rather than a fixed height).
     #[getset(get_copy = "pub")]
@@ -324,10 +336,10 @@ impl MigrationTransaction {
     /// consistent row.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
-        id: MigrationTxId,
+        id: MigrationTransferId,
         kind: MigrationTxKind,
         pczt: Vec<u8>,
-        depends_on: Vec<MigrationTxId>,
+        depends_on: Vec<MigrationTransferId>,
         scheduled_height: BlockHeight,
         expiry_height: BlockHeight,
         anchor_boundary: Option<BlockHeight>,
@@ -474,7 +486,7 @@ impl MigrationTxState {
     }
 }
 
-/// The persisted state of a migration: the note split (for the preview and residual accounting) and
+/// The persisted state of a migration: the denomination plan (for the preview and residual accounting) and
 /// every transaction, each as its pre-signed PCZT and metadata. A wallet resumes a migration entirely
 /// from this state after being closed or restarted; this is what a [`MigrationBackend`] stores.
 #[derive(Clone, Debug, PartialEq, Eq, Getters, CopyGetters)]
@@ -482,9 +494,9 @@ pub struct MigrationState {
     /// The overall status.
     #[getset(get_copy = "pub")]
     pub(crate) status: MigrationStatus,
-    /// The note-split decomposition (the denominations and residual).
+    /// The denomination decomposition (the denominations and residual).
     #[getset(get = "pub")]
-    pub(crate) note_split: NoteSplitPlan,
+    pub(crate) denominations: DenominationPlan,
     /// The preparation plan (its layers and direct-funding notes), retained for auditability and
     /// for rebuilding expired PREPARATION transactions (a follow-on slice). A
     /// `Preparation { layer, index }` transaction's spends resolve against
@@ -511,14 +523,14 @@ impl MigrationState {
     /// (the inverse of the accessors).
     pub fn from_parts(
         status: MigrationStatus,
-        note_split: NoteSplitPlan,
+        denominations: DenominationPlan,
         preparation: PreparationPlan,
         transactions: Vec<MigrationTransaction>,
         anchor_bucket_interval: crate::scheduling::AnchorBucketInterval,
     ) -> Self {
         Self {
             status,
-            note_split,
+            denominations,
             preparation,
             transactions,
             anchor_bucket_interval,
@@ -526,11 +538,41 @@ impl MigrationState {
     }
 
     /// The self-funding note values (in zatoshi), one per crossing: a `Transfer { crossing }`
-    /// transaction spends `funding_notes()[crossing]` and crosses that value minus the fee buffer
-    /// into the destination pool. Derived from the note split (each crossing value plus the fee
-    /// buffer), so a store persists only the note split.
+    /// transaction SPENDS `funding_notes()[crossing]`, of which the fee buffer pays that
+    /// transaction's own fee and the remainder crosses into the destination pool. Derived from the
+    /// denomination plan (each crossing value plus the fee buffer), so a store persists only that
+    /// plan.
+    ///
+    /// This is a SPEND-side value: it is neither what arrives in the destination pool nor the round
+    /// denomination the user consented to. To report what a transfer moves, use
+    /// [`crossing_values`](Self::crossing_values), or
+    /// [`transfer_crossing_value`](Self::transfer_crossing_value) for a single transaction.
     pub fn funding_notes(&self) -> Vec<Zatoshis> {
-        self.note_split.migration_outputs()
+        self.denominations.migration_outputs()
+    }
+
+    /// The values (in zatoshi) that cross into the destination pool, one per crossing and
+    /// index-aligned with [`funding_notes`](Self::funding_notes): each is its funding note less the
+    /// fee buffer that funds the transfer's own fee, and so is one of the round denominations the
+    /// user was shown at proposal time.
+    ///
+    /// This is the value to display for a transfer, and the one the receiving wallet's own
+    /// accounting will agree with once the transfer mines.
+    pub fn crossing_values(&self) -> &[Zatoshis] {
+        self.denominations.crossing_values()
+    }
+
+    /// The value transaction `tx` crosses into the destination pool, or `None` when `tx` is not a
+    /// transfer (a preparation transaction crosses nothing).
+    ///
+    /// Equivalent to indexing [`crossing_values`](Self::crossing_values) by the transaction's
+    /// [`transfer_crossing`](MigrationTxKind::transfer_crossing) — the accessor to reach for when
+    /// marshaling one stored transaction into a user-facing amount, so consumers do not re-derive
+    /// the funding-note-minus-buffer arithmetic and get it wrong by a fee.
+    pub fn transfer_crossing_value(&self, tx: &MigrationTransaction) -> Option<Zatoshis> {
+        tx.kind()
+            .transfer_crossing()
+            .and_then(|crossing| self.crossing_values().get(crossing).copied())
     }
 
     /// Replace transfer `id`'s stored PCZT with its proven bytes and move it to
@@ -538,7 +580,7 @@ impl MigrationState {
     /// anchor and witnesses and proves the transaction, so the durable artifact becomes the proven,
     /// ready-to-broadcast PCZT.
     #[cfg(feature = "orchard")]
-    pub fn set_transaction_proved(&mut self, id: MigrationTxId, proven_pczt: Vec<u8>) {
+    pub fn set_transaction_proved(&mut self, id: MigrationTransferId, proven_pczt: Vec<u8>) {
         for tx in &mut self.transactions {
             if tx.id() == id {
                 tx.pczt = proven_pczt;
@@ -554,24 +596,35 @@ impl MigrationState {
 /// preview a wallet shows the user for consent (ZIP 318) to the pool-crossing amounts.
 #[derive(Clone, Debug)]
 pub struct MigrationPlan {
-    note_split: NoteSplitPlan,
+    denominations: DenominationPlan,
     preparation: PreparationPlan,
     prep_schedule: Vec<Vec<BlockHeight>>,
     schedule: Vec<Schedule>,
 }
 
 impl MigrationPlan {
-    /// The note-split decomposition (the denominations and residual). The split already reflects
+    /// The denomination decomposition (the denominations and residual). It already reflects
     /// reconciliation against the preparation fees: when the fees did not fit the balance, the
     /// smallest denominations were dropped (left in the source pool) during the decomposition.
-    pub fn note_split(&self) -> &NoteSplitPlan {
-        &self.note_split
+    pub fn denominations(&self) -> &DenominationPlan {
+        &self.denominations
     }
 
     /// The funding-note values this migration will mint, one per phase-2 crossing. Derived from the
-    /// note split (each crossing value plus the fee buffer).
+    /// denomination plan (each crossing value plus the fee buffer).
+    ///
+    /// A SPEND-side value, as on [`MigrationState::funding_notes`]: to display what a transfer
+    /// moves, use [`crossing_values`](Self::crossing_values).
     pub fn funding_notes(&self) -> Vec<Zatoshis> {
-        self.note_split.migration_outputs()
+        self.denominations.migration_outputs()
+    }
+
+    /// The values that cross into the destination pool, one per phase-2 crossing, index-aligned
+    /// with both [`funding_notes`](Self::funding_notes) and [`schedule`](Self::schedule): each is
+    /// its funding note less the fee buffer, and so is one of the round denominations to show the
+    /// user for consent.
+    pub fn crossing_values(&self) -> &[Zatoshis] {
+        self.denominations.crossing_values()
     }
 
     /// The preparation transactions (in dependency layers) that mint the funding notes.
@@ -596,6 +649,115 @@ impl MigrationPlan {
     /// the balance.
     pub fn schedule(&self) -> &[Schedule] {
         &self.schedule
+    }
+
+    /// Every transaction this plan will build, enumerated BEFORE building in the exact order the
+    /// commit assigns [`MigrationTransferId`]s (each preparation layer in order, then each transfer by
+    /// crossing), so a [`PlannedTx`]'s id equals the id the built transaction will carry. Each
+    /// carries its [`action_weight`](crate::signing_rounds::action_weight). This is a pure function
+    /// of the plan, recomputed on demand, so planning stays unchanged.
+    pub fn planned_transactions(&self) -> Vec<PlannedTx> {
+        let mut txs = Vec::with_capacity(self.total_transactions());
+        let mut next = 0u32;
+        for (layer, layer_txs) in self.preparation.layers().iter().enumerate() {
+            for index in 0..layer_txs.len() {
+                txs.push(PlannedTx::new(
+                    MigrationTransferId::new(next),
+                    MigrationTxKind::Preparation { layer, index },
+                ));
+                next += 1;
+            }
+        }
+        for crossing in 0..self.transfer_tx_count() {
+            txs.push(PlannedTx::new(
+                MigrationTransferId::new(next),
+                MigrationTxKind::Transfer { crossing },
+            ));
+            next += 1;
+        }
+        txs
+    }
+
+    /// The total number of transactions this plan builds and signs: its preparation transactions
+    /// plus one pool-crossing transfer per funding note.
+    pub fn total_transactions(&self) -> usize {
+        self.preparation_tx_count() + self.transfer_tx_count()
+    }
+
+    /// The number of preparation transactions across all layers.
+    pub fn preparation_tx_count(&self) -> usize {
+        self.preparation.transaction_count()
+    }
+
+    /// The number of pool-crossing transfers (one per funding note).
+    pub fn transfer_tx_count(&self) -> usize {
+        self.denominations.migration_outputs().len()
+    }
+
+    /// The number of sequential preparation layers (the phase's wall-clock depth).
+    pub fn preparation_layer_count(&self) -> usize {
+        self.preparation.layer_count()
+    }
+
+    /// The total Orchard-family actions across every transaction this plan builds.
+    pub fn total_actions(&self) -> u32 {
+        let prep = (self.preparation_tx_count() as u64)
+            .saturating_mul(u64::from(crate::signing_rounds::PREPARATION_ACTIONS));
+        let xfer = (self.transfer_tx_count() as u64)
+            .saturating_mul(u64::from(crate::signing_rounds::TRANSFER_ACTIONS));
+        u32::try_from(prep.saturating_add(xfer)).unwrap_or(u32::MAX)
+    }
+
+    /// The total value that migrates to the destination pool (the sum of the crossing values).
+    pub fn value_migrated(&self) -> Zatoshis {
+        self.denominations.total_migratable()
+    }
+
+    /// The source-pool value left untouched by this plan (change plus dust below a self-funding
+    /// note); zero when the balance decomposed exactly.
+    pub fn residual(&self) -> Zatoshis {
+        self.denominations.change().unwrap_or(Zatoshis::ZERO)
+    }
+
+    /// Group this plan's transactions into signing ROUNDS for a signer bounded by `budget` total
+    /// Orchard actions per interaction, using the optimal [`MinRounds`] packing (fewest signer
+    /// interactions). The `budget` is the caller's per-round capacity (for example
+    /// [`SigningRoundBudget::KEYSTONE`]); it is a QUERY parameter, so a plan can be evaluated for any
+    /// signer without re-planning. See [`signing_rounds_with`](Self::signing_rounds_with) to choose
+    /// a different [`SigningRoundStrategy`].
+    pub fn signing_rounds(&self, budget: SigningRoundBudget) -> Vec<PlannedSigningRound> {
+        self.signing_rounds_with(&MinRounds, budget)
+    }
+
+    /// Like [`signing_rounds`](Self::signing_rounds) but with an explicit packing `strategy` (the
+    /// named solution of the round-packing problem).
+    pub fn signing_rounds_with<S: SigningRoundStrategy>(
+        &self,
+        strategy: &S,
+        budget: SigningRoundBudget,
+    ) -> Vec<PlannedSigningRound> {
+        strategy.pack(&self.planned_transactions(), budget)
+    }
+
+    /// The number of signing rounds this plan needs for a signer bounded by `budget` (the optimal
+    /// [`MinRounds`] count), without materializing the packing.
+    pub fn signing_round_count(&self, budget: SigningRoundBudget) -> usize {
+        min_signing_rounds(
+            self.preparation_tx_count(),
+            self.transfer_tx_count(),
+            budget,
+        )
+    }
+
+    /// The smallest per-round budget that signs this whole plan in ONE round: the plan's total
+    /// actions (never below [`SigningRoundBudget::minimum_feasible`]). For the signer-selection UX
+    /// ("a signer supporting at least this many actions per round signs this in one interaction").
+    pub fn min_budget_for_single_round(&self) -> NonZeroU32 {
+        min_budget_for_rounds(
+            self.preparation_tx_count(),
+            self.transfer_tx_count(),
+            NonZeroUsize::MIN,
+        )
     }
 }
 
@@ -654,7 +816,7 @@ fn canonical_fees<P: zcash_protocol::consensus::Parameters>(
     params: &P,
     height: BlockHeight,
 ) -> Result<(Zatoshis, Zatoshis), zip317::FeeError> {
-    use crate::note_splitting::{DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER};
+    use crate::denomination::{DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER};
     use crate::preparation::PREP_TX_ACTIONS;
 
     let fee_rule = zip317::FeeRule::standard();
@@ -689,9 +851,9 @@ fn canonical_fees<P: zcash_protocol::consensus::Parameters>(
 /// the canonical fee, since a nonstandard fee would partition the anonymity set), so it is not a
 /// parameter. The decomposition reserves the TRUE preparation cost at each step, consulting the
 /// preparation planner as it grows the split. `rng` must be a cryptographically secure RNG (the
-/// schedule's shuffle, delays, and the note split's optional randomization draw from it).
+/// schedule's shuffle, delays, and the denomination plan's optional randomization draw from it).
 ///
-/// This is pure orchestration of the note-split, preparation, and scheduling planners: no cryptography,
+/// This is pure orchestration of the denomination, preparation, and scheduling planners: no cryptography,
 /// and nothing is built, signed, or persisted. The result is the [`MigrationPlan`] preview to present
 /// for user consent before committing the migration.
 pub fn plan_migration<P, B, R>(
@@ -736,14 +898,14 @@ where
             .ok()
             .map(|plan| plan.transaction_count())
     };
-    let note_split = plan_note_split(
+    let denominations = plan_denominations(
         balance,
         transfer_fee_buffer,
         prep_tx_fee,
         &prep_tx_count,
         rng,
     );
-    let funding_notes = note_split.migration_outputs();
+    let funding_notes = denominations.migration_outputs();
     if funding_notes.is_empty() {
         return Err(MigrationError::NothingToMigrate);
     }
@@ -804,14 +966,14 @@ where
     }
 
     Ok(MigrationPlan {
-        note_split,
+        denominations,
         preparation,
         prep_schedule,
         schedule,
     })
 }
 
-/// A per-run entry of a [`MigrationRunEstimate`]: what one migration run migrates (the note-split
+/// A per-run entry of a [`MigrationRunEstimate`]: what one migration run migrates (the denomination
 /// side) and what preparing it costs (the note-preparation side), so the two can be compared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunEstimate {
@@ -827,7 +989,7 @@ impl RunEstimate {
         self.migratable
     }
 
-    /// The number of pool-crossing transfers this run makes: one per self-funding note the note split
+    /// The number of pool-crossing transfers this run makes: one per self-funding note the denomination plan
     /// produced for it.
     pub fn crossings(&self) -> usize {
         self.crossings
@@ -850,15 +1012,29 @@ impl RunEstimate {
         self.prep_transactions + self.crossings
     }
 
-    /// The number of signing sessions this run needs when an external signer (for example a Keystone
-    /// hardware wallet) can sign at most `max_per_session` transactions in one interaction:
-    /// `ceil(transactions / max_per_session)`. All of a run's transactions are built and signed
-    /// together (anchors and witnesses are deferred to proving time, [ZIP 374]), so they pool into
-    /// sessions bounded only by the signer's capacity.
+    /// The total Orchard-family ACTIONS a signer processes for this run: 16 per preparation
+    /// transaction and 3 per transfer. This is the signing WORKLOAD (a proxy for signing time),
+    /// distinct from the number of interactions ([`signing_rounds`](Self::signing_rounds)): combine
+    /// it with the device's per-action time to estimate how long signing this run will take.
+    pub fn actions(&self) -> u32 {
+        let prep = (self.prep_transactions as u64)
+            .saturating_mul(u64::from(crate::signing_rounds::PREPARATION_ACTIONS));
+        let xfer = (self.crossings as u64)
+            .saturating_mul(u64::from(crate::signing_rounds::TRANSFER_ACTIONS));
+        u32::try_from(prep.saturating_add(xfer)).unwrap_or(u32::MAX)
+    }
+
+    /// The number of signing ROUNDS this run needs when an external signer is bounded by `budget`
+    /// total Orchard ACTIONS per interaction (for example a Keystone,
+    /// [`SigningRoundBudget::KEYSTONE`]). This is the per-round-total-action model, NOT a
+    /// per-transaction cap: a round holds any mix of preparation (16-action) and transfer (3-action)
+    /// transactions summing to at most the budget. Computed as the optimal (minimum) packing, since
+    /// all of a run's transactions are built and signed together (anchors and witnesses deferred to
+    /// proving, [ZIP 374]) and are free to be grouped in any order.
     ///
     /// [ZIP 374]: https://zips.z.cash/zip-0374
-    pub fn signing_sessions(&self, max_per_session: NonZeroUsize) -> usize {
-        self.transactions().div_ceil(max_per_session.get())
+    pub fn signing_rounds(&self, budget: SigningRoundBudget) -> usize {
+        min_signing_rounds(self.prep_transactions, self.crossings, budget)
     }
 }
 
@@ -868,14 +1044,13 @@ impl RunEstimate {
 /// A balance beyond one run's capacity (the note cap times the maximum denomination) migrates over
 /// several runs, each run's spent notes and preparation residuals forming the next run's note
 /// structure (see [`estimate_migration_runs`]). Each run carries BOTH sides so an application can
-/// compare them: the note-split crossings it migrates and the note-preparation layers and
+/// compare them: the denomination crossings it migrates and the note-preparation layers and
 /// transactions it costs.
 ///
-/// A capacity-limited external signer adds a third dimension: given how many transactions such a
-/// signer can sign in one interaction, [`total_signing_sessions`](Self::total_signing_sessions) gives
-/// the number of signing interactions the whole migration requires. That limit is a query parameter,
-/// not part of the estimate, so an SDK can evaluate it for any signer capacity without re-running the
-/// planners.
+/// A capacity-limited external signer adds a third dimension: given the signer's per-interaction
+/// action budget, [`total_signing_rounds`](Self::total_signing_rounds) gives the number of signing
+/// interactions the whole migration requires. That budget is a query parameter, not part of the
+/// estimate, so an SDK can evaluate it for any signer capacity without re-running the planners.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MigrationRunEstimate {
     runs: Vec<RunEstimate>,
@@ -936,25 +1111,34 @@ impl MigrationRunEstimate {
         self.runs.iter().map(RunEstimate::transactions).sum()
     }
 
-    /// The total number of signing sessions the whole migration needs when an external signer can sign
-    /// at most `max_per_session` transactions in one interaction — the number of times the user must
+    /// The total Orchard-family ACTIONS the whole migration asks the user to sign, across all runs
+    /// (the sum of each run's [`actions`](RunEstimate::actions)). This is the total signing WORKLOAD,
+    /// a proxy for how long the user will spend signing: multiply it by the device's per-action time
+    /// to show a time estimate. Distinct from [`total_signing_rounds`](Self::total_signing_rounds),
+    /// which counts the number of separate interactions.
+    pub fn total_actions(&self) -> u32 {
+        self.runs
+            .iter()
+            .map(RunEstimate::actions)
+            .fold(0u32, |acc, a| acc.saturating_add(a))
+    }
+
+    /// The total number of signing ROUNDS the whole migration needs when an external signer is
+    /// bounded by `budget` total Orchard actions per interaction — the number of times the user must
     /// interact with a capacity-limited hardware signer (for example a Keystone, whose limit the SDK
     /// passes in here).
     ///
-    /// This is the SUM of each run's [`signing_sessions`](RunEstimate::signing_sessions), NOT
-    /// `ceil(total_transactions / max_per_session)`, because signing sessions cannot span runs: a later
-    /// run's transactions spend notes an earlier run must mine first, so each run is signed on its own.
-    pub fn total_signing_sessions(&self, max_per_session: NonZeroUsize) -> usize {
-        self.runs
-            .iter()
-            .map(|run| run.signing_sessions(max_per_session))
-            .sum()
+    /// This is the SUM of each run's [`signing_rounds`](RunEstimate::signing_rounds), NOT the packing
+    /// of `total_transactions` at once, because rounds cannot span runs: a later run's transactions
+    /// spend notes an earlier run must mine first, so each run is signed on its own.
+    pub fn total_signing_rounds(&self, budget: SigningRoundBudget) -> usize {
+        self.runs.iter().map(|run| run.signing_rounds(budget)).sum()
     }
 }
 
 /// Estimate how the account the `backend` represents will migrate its whole spendable balance: the
 /// number of migration RUNS ("rounds") it takes, and for each run BOTH what it migrates (the
-/// note-split crossings) and what preparing it costs (the note-preparation layers and transactions),
+/// denomination crossings) and what preparing it costs (the note-preparation layers and transactions),
 /// so an application can preview and compare the two before anything is planned or committed.
 ///
 /// A run prepares a bounded number of capped self-funding notes, so a balance beyond one run's
@@ -963,16 +1147,16 @@ impl MigrationRunEstimate {
 /// (so its feasibility and fees are exact, exactly as [`plan_migration`] plans one run), and the notes
 /// that run spends and the residuals it leaves form the next run's structure.
 ///
-/// The note-split run count itself does NOT depend on an external signer's capacity. When a
-/// capacity-limited hardware signer (for example a Keystone) can sign only so many transactions in one
-/// interaction, pass that user-configured limit to
-/// [`MigrationRunEstimate::total_signing_sessions`] to get the number of signing interactions the
+/// The denomination run count itself does NOT depend on an external signer's capacity. When a
+/// capacity-limited hardware signer (for example a Keystone) is bounded by a per-interaction action
+/// budget, pass that user-configured [`SigningRoundBudget`] to
+/// [`MigrationRunEstimate::total_signing_rounds`] to get the number of signing interactions the
 /// migration requires (each run is signed on its own; see that method). Because this iterates the
-/// note-split and preparation planners once per run, its cost is roughly one [`plan_migration`] per
+/// denomination and preparation planners once per run, its cost is roughly one [`plan_migration`] per
 /// run.
 ///
 /// A zero (or fully sub-quantum) balance yields a zero-run estimate rather than an error, since this
-/// is a preview. `rng` is drawn from only by a randomized note-split strategy; the recommended
+/// is a preview. `rng` is drawn from only by a randomized denomination strategy; the recommended
 /// canonical strategy ignores it.
 pub fn estimate_migration_runs<P, B, R>(
     params: &P,
@@ -1003,18 +1187,18 @@ where
             .sum::<Option<Zatoshis>>()
             .ok_or(MigrationError::InvalidBalance(BalanceError::Overflow))?;
 
-        // This run's note split, decomposing the CURRENT note set. Its per-step preparation cost and
+        // This run's denomination plan, decomposing the CURRENT note set. Its per-step preparation cost and
         // feasibility are backed by the real preparation planner over the current notes, so the split
         // — and hence the whole run count — depends on the wallet's note structure, not just its
         // total value. The closure's borrow of `notes` is released with the block, before `notes` is
         // reassigned below.
-        let note_split = {
+        let denominations = {
             let prep_tx_count = |funding: &[Zatoshis]| {
                 plan_preparation(&notes, funding, prep_tx_fee)
                     .ok()
                     .map(|plan| plan.transaction_count())
             };
-            plan_note_split(
+            plan_denominations(
                 balance,
                 transfer_fee_buffer,
                 prep_tx_fee,
@@ -1023,7 +1207,7 @@ where
             )
         };
 
-        let funding = note_split.migration_outputs();
+        let funding = denominations.migration_outputs();
         if funding.is_empty() {
             // Nothing more migrates from this note set: the remaining balance is the final residual
             // and the migration is complete.
@@ -1035,12 +1219,12 @@ where
 
         // The preparation that mints this run's funding notes: its layer and transaction counts are
         // the note-preparation side of the estimate, and which notes it spends and which residuals it
-        // leaves give the next run's note structure. The note split only ever proposes a funding
+        // leaves give the next run's note structure. The denomination plan only ever proposes a funding
         // multiset the preparation planner accepted, so this plan succeeds by construction.
         let preparation =
             plan_preparation(&notes, &funding, prep_tx_fee).map_err(MigrationError::Preparation)?;
         runs.push(RunEstimate {
-            migratable: note_split.total_migratable(),
+            migratable: denominations.total_migratable(),
             crossings: funding.len(),
             prep_layers: preparation.layer_count(),
             prep_transactions: preparation.transaction_count(),
@@ -1103,6 +1287,16 @@ pub trait MigrationCrypto {
 
     /// The account's Orchard full viewing key.
     fn orchard_fvk(&self) -> Result<orchard::keys::FullViewingKey, Self::Error>;
+
+    /// The ZIP 32 account the migration's notes belong to, or `None` if the account has no known
+    /// derivation (an imported viewing key, say).
+    ///
+    /// The builders stamp this onto every spend a migration transaction still needs a signature
+    /// for, which is how an EXTERNAL Signer recognizes those spends as the account's. A backend
+    /// that returns `None` while signing is delegated (see [`Signing::External`]) produces
+    /// transactions no derivation-matching Signer can authorize, so return the derivation whenever
+    /// the wallet knows it, even if it currently signs in process.
+    fn account_derivation(&self) -> Result<Option<AccountDerivation>, Self::Error>;
 
     /// The plaintext of the spendable wallet note at `index` (into
     /// `spendable_orchard_note_values`).
@@ -1247,19 +1441,19 @@ impl<E: core::error::Error> core::error::Error for CommitError<E> {}
 #[derive(Debug)]
 pub enum ProveError<E> {
     /// No transaction with the given id belongs to the migration.
-    UnknownTransaction(MigrationTxId),
+    UnknownTransaction(MigrationTransferId),
     /// The transaction is a preparation transaction, not a transfer; only transfers are proved
     /// against a drawn anchor boundary (a preparation transaction carries no boundary).
-    NotATransfer(MigrationTxId),
+    NotATransfer(MigrationTransferId),
     /// The transaction is a transfer, not a preparation transaction; only preparation transactions
     /// are proved against a caller-supplied anchor (a transfer proves against its drawn boundary).
-    NotAPreparation(MigrationTxId),
+    NotAPreparation(MigrationTransferId),
     /// The transaction is not in the [`Signed`](MigrationTxState::Signed) state, so it is not ready
     /// to prove (it is unsigned, already proved, or already broadcast).
-    NotReady(MigrationTxId),
+    NotReady(MigrationTransferId),
     /// A transfer carries no anchor boundary. Every transfer draws one at scheduling time, so this
     /// indicates a corrupt stored state rather than a normal condition.
-    NoAnchorBoundary(MigrationTxId),
+    NoAnchorBoundary(MigrationTransferId),
     /// The wallet's anchor retention grid has changed since this migration was committed, so the
     /// boundaries its transfers anchored to are no longer retained and their checkpoints will have
     /// been pruned. The migration cannot be proved and must be re-planned under the current grid
@@ -1347,7 +1541,7 @@ impl<E: core::error::Error> core::error::Error for ProveError<E> {}
 pub fn prove_transfer<P>(
     prover: &mut P,
     state: &mut MigrationState,
-    id: MigrationTxId,
+    id: MigrationTransferId,
 ) -> Result<(), ProveError<P::Error>>
 where
     P: MigrationProver,
@@ -1408,7 +1602,7 @@ where
 pub fn prove_preparation<P>(
     prover: &mut P,
     state: &mut MigrationState,
-    id: MigrationTxId,
+    id: MigrationTransferId,
     anchor: BlockHeight,
 ) -> Result<(), ProveError<P::Error>>
 where
@@ -1441,18 +1635,18 @@ where
 #[derive(Debug)]
 pub enum RebuildError<E> {
     /// No transaction with the given id belongs to the migration.
-    UnknownTransaction(MigrationTxId),
+    UnknownTransaction(MigrationTransferId),
     /// The transaction is a preparation transaction, not a transfer. Only a transfer — a leaf of
     /// the dependency graph — is rebuilt this way (with a fresh boundary anchor and canonical
     /// expiry). An expired preparation has no single-transaction rebuild: its dependents'
     /// pre-signatures commit to the notes it would have minted, so its remediation (re-signing the
     /// affected subtree) is a follow-on slice.
-    NotATransfer(MigrationTxId),
+    NotATransfer(MigrationTransferId),
     /// The transaction has not expired at the current chain tip, so there is nothing to rebuild: it is
     /// still valid, or it has already mined. Guards against reissuing a live transaction as a second,
     /// double-spending copy.
-    NotExpired(MigrationTxId),
-    /// The stored migration state is internally inconsistent: the note split carries no crossing or
+    NotExpired(MigrationTransferId),
+    /// The stored migration state is internally inconsistent: the denomination plan carries no crossing or
     /// funding value for this transfer's crossing index, or the transfer's stored PCZT is
     /// malformed.
     InconsistentPlan(alloc::string::String),
@@ -1581,7 +1775,7 @@ pub fn rebuild_expired_transfer<P, B, R>(
     params: &P,
     backend: &B,
     state: &mut MigrationState,
-    id: MigrationTxId,
+    id: MigrationTransferId,
     rng: &mut R,
 ) -> Result<(), RebuildError<<B as MigrationBackend>::Error>>
 where
@@ -1610,7 +1804,7 @@ pub fn rebuild_expired_transfer_unsigned<P, B, R>(
     params: &P,
     backend: &B,
     state: &mut MigrationState,
-    id: MigrationTxId,
+    id: MigrationTransferId,
     rng: &mut R,
 ) -> Result<UnsignedMigrationTx, RebuildError<<B as MigrationBackend>::Error>>
 where
@@ -1630,7 +1824,7 @@ fn rebuild_expired_transfer_inner<P, B, R>(
     params: &P,
     backend: &B,
     state: &mut MigrationState,
-    id: MigrationTxId,
+    id: MigrationTransferId,
     rng: &mut R,
     signing: Signing,
 ) -> Result<Option<UnsignedMigrationTx>, RebuildError<<B as MigrationBackend>::Error>>
@@ -1694,14 +1888,14 @@ where
         .unwrap_or(nu63_activation);
 
     let crossing_value = *state
-        .note_split
+        .denominations
         .crossing_values()
         .get(crossing)
         .ok_or_else(|| {
             RebuildError::InconsistentPlan(format!("no crossing value for transfer {crossing}"))
         })?;
     let funding_value = *state
-        .note_split
+        .denominations
         .migration_outputs()
         .get(crossing)
         .ok_or_else(|| {
@@ -1737,6 +1931,9 @@ where
     // outside the migration), the remaining balance must be re-planned rather than this part
     // rebuilt, so a different note of coincidentally equal value is deliberately NOT substituted.
     let fvk = backend.orchard_fvk().map_err(RebuildError::Backend)?;
+    let account_derivation = backend
+        .account_derivation()
+        .map_err(RebuildError::Backend)?;
     let spendable_values = backend
         .spendable_orchard_note_values()
         .map_err(RebuildError::Backend)?;
@@ -1779,6 +1976,7 @@ where
         &fvk,
         note,
         crossing_value,
+        account_derivation.as_ref(),
         &mut *rng,
     )
     .map_err(RebuildError::Build)?;
@@ -1793,8 +1991,8 @@ where
             let unsigned = UnsignedMigrationTx {
                 id,
                 pczt: bytes.clone(),
-                actions: crate::note_splitting::SOURCE_ACTIONS_PER_TRANSFER
-                    + crate::note_splitting::DESTINATION_ACTIONS_PER_TRANSFER,
+                actions: crate::denomination::SOURCE_ACTIONS_PER_TRANSFER
+                    + crate::denomination::DESTINATION_ACTIONS_PER_TRANSFER,
             };
             (bytes, MigrationTxState::AwaitingSignature, Some(unsigned))
         }
@@ -1837,7 +2035,7 @@ enum Signing {
 pub struct UnsignedMigrationTx {
     /// The transaction's id in the committed migration.
     #[getset(get_copy = "pub")]
-    pub(crate) id: MigrationTxId,
+    pub(crate) id: MigrationTransferId,
     /// The serialized UNSIGNED PCZT to sign out of band.
     #[getset(get = "pub")]
     pub(crate) pczt: Vec<u8>,
@@ -1853,41 +2051,86 @@ impl UnsignedMigrationTx {
     /// Take the id and the unsigned PCZT bytes (to route the bytes to the external signer while
     /// keeping the id to match the signed result back; see
     /// [`MigrationState::apply_signature`](crate::engine::MigrationState)).
-    pub fn into_parts(self) -> (MigrationTxId, Vec<u8>) {
+    pub fn into_parts(self) -> (MigrationTransferId, Vec<u8>) {
         (self.id, self.pczt)
     }
 }
 
-/// Split unsigned migration transactions into SIGNING SESSIONS: consecutive batches, preserving
-/// the given order (the commit functions emit topological order), each holding at most
-/// `action_budget` total [`actions`](UnsignedMigrationTx::actions) — except that a batch always
-/// holds at least one transaction, so a single transaction larger than the budget still gets a
-/// session of its own.
+/// Split unsigned migration transactions into SIGNING ROUNDS: consecutive batches, preserving the
+/// given order (the commit functions emit topological order), each holding at most `budget` total
+/// [`actions`](UnsignedMigrationTx::actions) — except that a batch always holds at least one
+/// transaction, so a single transaction larger than the budget still gets a round of its own. This
+/// is the order-preserving [`NextFit`](crate::signing_rounds::NextFit) packing; for the fewest
+/// signer interactions, use [`MigrationPlan::group_unsigned`], which packs optimally with the plan's
+/// transaction kinds.
 ///
 /// Every transaction is fully built and independent at signing time (anchors and witnesses are
-/// deferred to proving; nothing waits on the chain), so a session boundary reflects only the
-/// signer's per-interaction capacity — a hardware device's action budget — and each session's
-/// results are applied back with [`MigrationState::apply_signature`] in any order.
+/// deferred to proving; nothing waits on the chain), so a round boundary reflects only the signer's
+/// per-interaction capacity — a hardware device's action budget — and each round's results are
+/// applied back with [`MigrationState::apply_signature`] in any order.
 #[cfg(feature = "orchard")]
 pub fn batch_unsigned_by_action_budget(
     unsigned: Vec<UnsignedMigrationTx>,
-    action_budget: usize,
+    budget: SigningRoundBudget,
 ) -> Vec<Vec<UnsignedMigrationTx>> {
-    let mut sessions: Vec<Vec<UnsignedMigrationTx>> = Vec::new();
+    let cap = budget.max_actions() as usize;
+    let mut rounds: Vec<Vec<UnsignedMigrationTx>> = Vec::new();
     let mut current: Vec<UnsignedMigrationTx> = Vec::new();
     let mut current_actions = 0usize;
     for tx in unsigned {
-        if !current.is_empty() && current_actions.saturating_add(tx.actions) > action_budget {
-            sessions.push(core::mem::take(&mut current));
+        if !current.is_empty() && current_actions.saturating_add(tx.actions) > cap {
+            rounds.push(core::mem::take(&mut current));
             current_actions = 0;
         }
         current_actions = current_actions.saturating_add(tx.actions);
         current.push(tx);
     }
     if !current.is_empty() {
-        sessions.push(current);
+        rounds.push(current);
     }
-    sessions
+    rounds
+}
+
+#[cfg(feature = "orchard")]
+impl MigrationPlan {
+    /// Group this plan's built UNSIGNED transactions into signing rounds bounded by `budget`, using
+    /// the optimal [`MinRounds`] packing (fewest signer interactions). The `unsigned` come from
+    /// [`build_preparation_unsigned`] in commit order; each is matched back to its round by
+    /// [`UnsignedMigrationTx::id`], so the rounds reflect the SAME grouping the plan's
+    /// [`signing_rounds`](Self::signing_rounds) preview showed the user. Prefer this to
+    /// [`batch_unsigned_by_action_budget`] (which packs order-preserving, not optimally) when driving
+    /// a real signer.
+    pub fn group_unsigned(
+        &self,
+        unsigned: Vec<UnsignedMigrationTx>,
+        budget: SigningRoundBudget,
+    ) -> Vec<Vec<UnsignedMigrationTx>> {
+        use alloc::collections::BTreeMap;
+
+        let rounds = self.signing_rounds(budget);
+        let mut round_of: BTreeMap<u32, usize> = BTreeMap::new();
+        for (i, round) in rounds.iter().enumerate() {
+            for tx in round.transactions() {
+                round_of.insert(u32::from(tx.id()), i);
+            }
+        }
+        let mut buckets: Vec<Vec<UnsignedMigrationTx>> =
+            (0..rounds.len()).map(|_| Vec::new()).collect();
+        // Any unsigned transaction the plan did not enumerate (never expected) becomes its own
+        // trailing round rather than being dropped.
+        let mut leftover: Vec<UnsignedMigrationTx> = Vec::new();
+        for tx in unsigned {
+            match round_of.get(&u32::from(tx.id())) {
+                Some(&i) => buckets[i].push(tx),
+                None => leftover.push(tx),
+            }
+        }
+        if !leftover.is_empty() {
+            buckets.push(leftover);
+        }
+        buckets.retain(|b| !b.is_empty());
+        buckets
+    }
 }
 
 /// Serialize a freshly built PCZT for storage. For [`Signing::InProcess`], sign it with the backend and
@@ -1928,7 +2171,7 @@ struct MintedNote {
     value: Zatoshis,
     note: orchard::note::Note,
     consumed: bool,
-    producer: Option<MigrationTxId>,
+    producer: Option<MigrationTransferId>,
 }
 
 /// Commit a planned migration: build and pre-sign EVERY transaction — each preparation layer, in
@@ -2095,10 +2338,13 @@ struct Committer<'a, P, B, R> {
     rng: &'a mut R,
     signing: Signing,
     fvk: orchard::keys::FullViewingKey,
+    /// The ZIP 32 account every built transaction's spends are stamped with, so an external Signer
+    /// can identify them. Resolved once in [`Committer::start`], alongside `fvk`.
+    account_derivation: Option<AccountDerivation>,
     transactions: Vec<MigrationTransaction>,
     unsigned: Vec<UnsignedMigrationTx>,
     next_id: u32,
-    layer_ids: Vec<Vec<MigrationTxId>>,
+    layer_ids: Vec<Vec<MigrationTransferId>>,
     minted: Vec<MintedNote>,
     /// Each transfer paired with the funding note it spends, captured as the transfer is built.
     /// The commit path already recovers every funding note's plaintext to build the transfer; a
@@ -2139,6 +2385,7 @@ where
         }
 
         let fvk = backend.orchard_fvk().map_err(CommitError::Backend)?;
+        let account_derivation = backend.account_derivation().map_err(CommitError::Backend)?;
 
         Ok(Self {
             params,
@@ -2147,6 +2394,7 @@ where
             rng,
             signing,
             fvk,
+            account_derivation,
             transactions: Vec::new(),
             unsigned: Vec::new(),
             next_id: 0,
@@ -2157,8 +2405,8 @@ where
     }
 
     /// Assign and consume the next sequential transaction id.
-    fn next_id(&mut self) -> MigrationTxId {
-        let id = MigrationTxId(self.next_id);
+    fn next_id(&mut self) -> MigrationTransferId {
+        let id = MigrationTransferId(self.next_id);
         self.next_id += 1;
         id
     }
@@ -2224,7 +2472,7 @@ where
         use crate::preparation::PrepOutput;
 
         for (layer, prep_layer) in plan.preparation().layers().iter().enumerate() {
-            let mut this_layer_ids: Vec<MigrationTxId> = Vec::with_capacity(prep_layer.len());
+            let mut this_layer_ids: Vec<MigrationTransferId> = Vec::with_capacity(prep_layer.len());
             for (index, prep_tx) in prep_layer.iter().enumerate() {
                 let id = self.next_id();
                 this_layer_ids.push(id);
@@ -2253,9 +2501,10 @@ where
                         ))
                     })?;
                 let expiry_height = crate::scheduling::expiry_height(scheduled_height);
-                // The field accesses `self.params`/`self.fvk`/`self.rng` are DISJOINT, so the
-                // borrow checker accepts them together here — as long as no whole-`self` method
-                // call (like `next_id`/`resolve_prep_spends` above) is interleaved.
+                // The field accesses `self.params`/`self.fvk`/`self.account_derivation`/`self.rng`
+                // are DISJOINT, so the borrow checker accepts them together here — as long as no
+                // whole-`self` method call (like `next_id`/`resolve_prep_spends` above) is
+                // interleaved.
                 let (pczt, placed) = build_prep_tx(
                     self.params,
                     u32::from(self.target_height),
@@ -2263,6 +2512,7 @@ where
                     &self.fvk,
                     spends,
                     prep_tx.outputs(),
+                    self.account_derivation.as_ref(),
                     &mut *self.rng,
                 )
                 .map_err(CommitError::Build)?;
@@ -2411,9 +2661,9 @@ where
             // Depend only on the preparation transaction that mints this funding note (or nothing,
             // for a direct-funding wallet note), so this crossing releases as soon as its own note
             // is mined.
-            let depends_on: Vec<MigrationTxId> = producer.into_iter().collect();
+            let depends_on: Vec<MigrationTransferId> = producer.into_iter().collect();
             let crossing_value = *plan
-                .note_split()
+                .denominations()
                 .crossing_values()
                 .get(crossing)
                 .ok_or_else(|| {
@@ -2429,6 +2679,7 @@ where
                 &self.fvk,
                 note,
                 crossing_value,
+                self.account_derivation.as_ref(),
                 &mut *self.rng,
             )
             .map_err(CommitError::Build)?;
@@ -2445,8 +2696,8 @@ where
                 self.unsigned.push(UnsignedMigrationTx {
                     id,
                     pczt: bytes.clone(),
-                    actions: crate::note_splitting::SOURCE_ACTIONS_PER_TRANSFER
-                        + crate::note_splitting::DESTINATION_ACTIONS_PER_TRANSFER,
+                    actions: crate::denomination::SOURCE_ACTIONS_PER_TRANSFER
+                        + crate::denomination::DESTINATION_ACTIONS_PER_TRANSFER,
                 });
             }
             self.transactions.push(MigrationTransaction {
@@ -2473,7 +2724,7 @@ where
     fn into_state(self, plan: &MigrationPlan) -> CommitOutput {
         let state = MigrationState {
             status: MigrationStatus::Committed,
-            note_split: plan.note_split().clone(),
+            denominations: plan.denominations().clone(),
             preparation: plan.preparation().clone(),
             transactions: self.transactions,
             // Stamp the grid the transfers were anchored to, so a later reconfiguration of the
@@ -2492,7 +2743,7 @@ where
 /// bundles during a commit pass. A prover needs it to locate each transfer's spend in the wallet's
 /// commitment tree at proving time.
 #[cfg(feature = "orchard")]
-type TransferFunding = Vec<(MigrationTxId, orchard::note::Note)>;
+type TransferFunding = Vec<(MigrationTransferId, orchard::note::Note)>;
 
 /// What one commit pass produces. The public commit entry points drop the parts they do not
 /// surface.
@@ -2500,6 +2751,7 @@ type TransferFunding = Vec<(MigrationTxId, orchard::note::Note)>;
 struct CommitOutput {
     state: MigrationState,
     unsigned: Vec<UnsignedMigrationTx>,
+    #[cfg_attr(not(any(test, feature = "test-dependencies")), allow(dead_code))]
     transfer_funding: TransferFunding,
 }
 
@@ -2599,7 +2851,7 @@ mod tests {
 
         fn update_transaction(
             &mut self,
-            id: MigrationTxId,
+            id: MigrationTransferId,
             state: MigrationTxState,
         ) -> Result<(), Self::Error> {
             if let Some(stored) = &mut self.stored
@@ -2702,7 +2954,7 @@ mod tests {
         ));
     }
 
-    /// A typical balance migrates in a single run, whose entry carries BOTH the note-split side
+    /// A typical balance migrates in a single run, whose entry carries BOTH the denomination side
     /// (migratable value and crossing count) and the note-preparation side (layers and transactions),
     /// and the aggregates match the single run.
     #[test]
@@ -2714,7 +2966,7 @@ mod tests {
 
         assert_eq!(est.run_count(), 1);
         let run = est.runs()[0];
-        // Note-split side: it crosses value in one or more canonical denominations.
+        // Denomination side: it crosses value in one or more canonical denominations.
         assert!(u64::from(run.migratable()) > 0);
         assert!(run.crossings() >= 1);
         // Note-preparation side: minting those notes costs at least one layer and one transaction.
@@ -2744,7 +2996,7 @@ mod tests {
     /// cap of 50 * 10,000 ZEC in 50 notes, and the aggregate crossings sum the per-run counts.
     #[test]
     fn whale_migrates_over_several_runs() {
-        use crate::note_splitting::{
+        use crate::denomination::{
             MIGRATION_MAX_DENOMINATION_ZEC, MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
         };
         let mut rng = ChaCha8Rng::seed_from_u64(1);
@@ -2791,12 +3043,15 @@ mod tests {
         );
     }
 
-    /// The number of signing sessions follows a capacity-limited signer's per-interaction transaction
-    /// limit (a Keystone-style hard limit): one session per transaction at capacity one, one session
-    /// per run when the capacity exceeds every run, and monotonically more sessions as the limit
-    /// tightens. Sessions are summed per run (they cannot span runs).
+    /// The number of signing ROUNDS follows a capacity-limited signer's per-interaction ACTION budget
+    /// (a Keystone-style hard limit, not a per-transaction cap): one round per run when the budget
+    /// exceeds a whole run, monotonically more rounds as the budget tightens, and each run's rounds
+    /// match the optimal packer. Rounds are summed per run (they cannot span runs).
     #[test]
-    fn signing_sessions_follow_the_signer_capacity() {
+    fn signing_rounds_follow_the_signer_budget() {
+        use crate::signing_rounds::{SigningRoundBudget, min_signing_rounds};
+        use core::num::NonZeroU32;
+
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         // A whale, so there are several runs, each with several transactions.
         let whale = MockBackend::new(vec![1_200_000 * COIN], 2_000_000);
@@ -2808,28 +3063,28 @@ mod tests {
             est.total_prep_transactions() + est.total_crossings()
         );
 
-        let one = NonZeroUsize::new(1).unwrap();
-        let big = NonZeroUsize::new(10_000).unwrap();
-        let mid = NonZeroUsize::new(8).unwrap();
+        let huge = SigningRoundBudget::new(NonZeroU32::new(1_000_000).unwrap());
+        let keystone = SigningRoundBudget::KEYSTONE;
+        let tiny = SigningRoundBudget::new(SigningRoundBudget::minimum_feasible());
 
-        // Capacity of one transaction per session: one session per transaction.
-        assert_eq!(est.total_signing_sessions(one), est.total_transactions());
-        // Capacity larger than any single run's transaction count: one session per run.
-        assert_eq!(est.total_signing_sessions(big), est.run_count());
-        // A tighter limit never needs fewer sessions than a looser one.
-        assert!(est.total_signing_sessions(mid) >= est.total_signing_sessions(big));
-        assert!(est.total_signing_sessions(one) >= est.total_signing_sessions(mid));
+        // A budget larger than any run's total actions: one round per run.
+        assert_eq!(est.total_signing_rounds(huge), est.run_count());
+        // A tighter budget never needs fewer rounds than a looser one.
+        assert!(est.total_signing_rounds(keystone) >= est.total_signing_rounds(huge));
+        assert!(est.total_signing_rounds(tiny) >= est.total_signing_rounds(keystone));
 
-        // Per-run consistency: a run's sessions are the ceiling of its transaction count, and the
-        // total is the per-run sum (sessions do not span runs).
-        let summed: usize = est.runs().iter().map(|r| r.signing_sessions(mid)).sum();
-        assert_eq!(est.total_signing_sessions(mid), summed);
+        // Per-run consistency: the total is the per-run sum, and each run matches the packer.
+        let summed: usize = est.runs().iter().map(|r| r.signing_rounds(keystone)).sum();
+        assert_eq!(est.total_signing_rounds(keystone), summed);
         for run in est.runs() {
             assert_eq!(
                 run.transactions(),
                 run.prep_transactions() + run.crossings()
             );
-            assert_eq!(run.signing_sessions(mid), run.transactions().div_ceil(8));
+            assert_eq!(
+                run.signing_rounds(keystone),
+                min_signing_rounds(run.prep_transactions(), run.crossings(), keystone)
+            );
         }
     }
 
@@ -2840,7 +3095,7 @@ mod tests {
 
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let (prep_tx_fee, transfer_buffer) = test_fees();
-        let note_split = crate::note_splitting::plan_note_split(
+        let denominations = crate::denomination::plan_denominations(
             Zatoshis::from_u64(100 * COIN).expect("test balance is valid"),
             transfer_buffer,
             prep_tx_fee,
@@ -2848,7 +3103,7 @@ mod tests {
             &mut rng,
         );
         let tx = MigrationTransaction {
-            id: MigrationTxId(0),
+            id: MigrationTransferId(0),
             kind: MigrationTxKind::Transfer { crossing: 0 },
             pczt: vec![1, 2, 3], // a stand-in for the serialized pre-signed PCZT
             depends_on: Vec::new(),
@@ -2860,7 +3115,7 @@ mod tests {
         };
         let state = MigrationState {
             status: MigrationStatus::Committed,
-            note_split,
+            denominations,
             preparation: crate::preparation::PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions: vec![tx],
             anchor_bucket_interval: crate::scheduling::AnchorBucketInterval::ZIP_318,
@@ -2877,7 +3132,7 @@ mod tests {
 
         backend
             .update_transaction(
-                MigrationTxId(0),
+                MigrationTransferId(0),
                 MigrationTxState::Mined {
                     height: BlockHeight::from_u32(2_000_105),
                 },
@@ -2904,10 +3159,11 @@ mod commit_tests {
 
     use crate::build::sign_pczt;
     use crate::build::test_util::{
-        TARGET_HEIGHT, regtest_network, single_note_witness, spending_key,
+        TARGET_HEIGHT, account_derivation, assert_every_spend_is_identifiable, regtest_network,
+        single_note_witness, spend_signability, spending_key,
     };
-    use crate::note_splitting::{
-        DESTINATION_ACTIONS_PER_TRANSFER, NoteSplitPlan, SOURCE_ACTIONS_PER_TRANSFER,
+    use crate::denomination::{
+        DESTINATION_ACTIONS_PER_TRANSFER, DenominationPlan, SOURCE_ACTIONS_PER_TRANSFER,
     };
     use crate::preparation::{PREP_TX_ACTIONS, plan_preparation};
 
@@ -2930,6 +3186,7 @@ mod commit_tests {
         wallet_notes: Vec<orchard::note::Note>,
         fvk: FullViewingKey,
         ask: SpendAuthorizingKey,
+        account_derivation: Option<AccountDerivation>,
         stored: Option<MigrationState>,
         tip: BlockHeight,
         sched_params: crate::scheduling::SchedulingParams,
@@ -2949,6 +3206,7 @@ mod commit_tests {
                 wallet_notes,
                 fvk,
                 ask: SpendAuthorizingKey::from(&sk),
+                account_derivation: Some(account_derivation(seed)),
                 stored: None,
                 tip: BlockHeight::from_u32(2_000_000),
                 sched_params: crate::scheduling::SchedulingParams::ZIP_318,
@@ -2992,7 +3250,7 @@ mod commit_tests {
 
         fn update_transaction(
             &mut self,
-            id: MigrationTxId,
+            id: MigrationTransferId,
             state: MigrationTxState,
         ) -> Result<(), Self::Error> {
             if let Some(stored) = &mut self.stored
@@ -3009,6 +3267,10 @@ mod commit_tests {
 
         fn orchard_fvk(&self) -> Result<FullViewingKey, Self::Error> {
             Ok(self.fvk.clone())
+        }
+
+        fn account_derivation(&self) -> Result<Option<AccountDerivation>, Self::Error> {
+            Ok(self.account_derivation.clone())
         }
 
         fn resolve_wallet_note(&self, index: usize) -> Result<orchard::note::Note, Self::Error> {
@@ -3157,6 +3419,79 @@ mod commit_tests {
             }
         }
         assert!(backend.get_migration().unwrap().is_some());
+    }
+
+    /// Every transaction a commit hands to an EXTERNAL signer is identifiable to it: each spend
+    /// still awaiting a signature carries the account's ZIP 32 derivation, and the only actions
+    /// without it are the padding dummies the IO Finalizer already signed. A signer that matches
+    /// spends by derivation path skips what it cannot recognize, so an unstamped spend is one no
+    /// signature ever arrives for and the transaction can never be extracted.
+    ///
+    /// Covers the whole commit path — preparation layers and transfers alike — and its converse:
+    /// a backend that reports no derivation produces transactions only an in-process signer, which
+    /// matches by key, can authorize.
+    #[test]
+    fn externally_signed_migrations_identify_every_spend_to_the_signer() {
+        let seed = 77u64;
+        let params = regtest_network(true);
+        // A balance large enough to need preparation, so both builders are exercised.
+        let mut backend = CommitMock::new(seed, &[400 * COIN]);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
+        assert!(
+            plan.preparation().transaction_count() > 0,
+            "the balance needs preparation, so preparation transactions are built",
+        );
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let (state, unsigned) = build_preparation_unsigned(
+            &params,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut backend,
+            &plan,
+            &mut rng,
+        )
+        .expect("commits the migration for external signing");
+        assert!(
+            !unsigned.is_empty(),
+            "there is work for the external signer"
+        );
+
+        let mut spends_awaiting_signature = 0;
+        for tx in &state.transactions {
+            let pczt = pczt::Pczt::parse(&tx.pczt).expect("a stored PCZT parses");
+            spends_awaiting_signature += assert_every_spend_is_identifiable(&pczt);
+        }
+        assert!(
+            spends_awaiting_signature > 0,
+            "the external signer has spends to authorize",
+        );
+
+        // Without a known derivation nothing is stamped, so the same spends are left unidentifiable.
+        let mut anonymous = CommitMock::new(seed, &[400 * COIN]);
+        anonymous.account_derivation = None;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let (anonymous_state, _) = build_preparation_unsigned(
+            &params,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut anonymous,
+            &plan,
+            &mut rng,
+        )
+        .expect("commits the migration for external signing");
+        let unidentifiable = anonymous_state
+            .transactions
+            .iter()
+            .map(|tx| {
+                let pczt = pczt::Pczt::parse(&tx.pczt).expect("a stored PCZT parses");
+                spend_signability(&pczt).1
+            })
+            .sum::<usize>();
+        assert_eq!(
+            unidentifiable, spends_awaiting_signature,
+            "a backend with no derivation leaves every awaiting spend unidentifiable",
+        );
     }
 
     /// An expired transfer is rebuilt in place: rescheduled forward with a fresh boundary anchor and
@@ -3441,6 +3776,10 @@ mod commit_tests {
                 .all(|a| a.spend().spend_auth_sig().is_none()),
             "the account's spend authorization was not attached in-process"
         );
+        // Awaiting an external signer is only useful if that signer can RECOGNIZE the spend as
+        // the account's: the rebuild stamps the account's ZIP 32 derivation on the one spend it
+        // leaves unsigned.
+        assert_eq!(assert_every_spend_is_identifiable(&parsed), 1);
         assert_eq!(
             real_spend_nullifier(&rebuilt.pczt),
             real_spend_nullifier(&old.pczt),
@@ -3481,7 +3820,7 @@ mod commit_tests {
             Err(RebuildError::NotExpired(rejected)) if rejected == id
         ));
         // An unknown id: rejected.
-        let unknown = MigrationTxId::new(9999);
+        let unknown = MigrationTransferId::new(9999);
         assert!(matches!(
             rebuild_expired_transfer(&params, &backend, &mut state, unknown, &mut rng),
             Err(RebuildError::UnknownTransaction(rejected)) if rejected == unknown
@@ -3533,10 +3872,10 @@ mod commit_tests {
             "15 funding notes fan out across two layers"
         );
 
-        // A note split whose outputs are the funding notes and whose crossings are those less
+        // A denomination plan whose outputs are the funding notes and whose crossings are those less
         // the buffer, so each transfer crosses one ZEC.
         let crossings: Vec<u64> = funding.iter().map(|&f| f - buffer).collect();
-        let note_split = NoteSplitPlan::from_stored_parts(
+        let denominations = DenominationPlan::from_stored_parts(
             crossings
                 .iter()
                 .map(|&v| Zatoshis::from_u64(v).expect("test crossings are valid"))
@@ -3585,7 +3924,7 @@ mod commit_tests {
             &mut rng,
         );
         let plan = MigrationPlan {
-            note_split,
+            denominations,
             preparation,
             prep_schedule,
             schedule,
@@ -3595,6 +3934,7 @@ mod commit_tests {
             wallet_notes: vec![single_note_witness(&fvk, whale, seed).0],
             fvk,
             ask: SpendAuthorizingKey::from(&sk),
+            account_derivation: Some(account_derivation(seed)),
             stored: None,
             tip: BlockHeight::from_u32(2_000_000),
             sched_params: crate::scheduling::SchedulingParams::ZIP_318,
@@ -3618,7 +3958,7 @@ mod commit_tests {
             assert_eq!(tx.state, MigrationTxState::Signed, "signed at commit");
             assert!(!tx.pczt.is_empty());
         }
-        let layer0_ids: Vec<MigrationTxId> = state
+        let layer0_ids: Vec<MigrationTransferId> = state
             .transactions
             .iter()
             .filter(|t| matches!(t.kind, MigrationTxKind::Preparation { layer: 0, .. }))
@@ -3660,7 +4000,7 @@ mod commit_tests {
         for id in &layer0_ids {
             state.mark_mined(*id, BlockHeight::from_u32(2_000_010));
         }
-        let layer1_ids: Vec<MigrationTxId> = state
+        let layer1_ids: Vec<MigrationTransferId> = state
             .transactions
             .iter()
             .filter(|t| matches!(t.kind, MigrationTxKind::Preparation { layer: 1, .. }))
@@ -3722,7 +4062,7 @@ mod commit_tests {
 
         // The crossings are funded by more than one preparation transaction (each transfer depends
         // on exactly its own producer).
-        let mut producers: Vec<MigrationTxId> = state
+        let mut producers: Vec<MigrationTransferId> = state
             .transactions
             .iter()
             .filter(|t| matches!(t.kind, MigrationTxKind::Transfer { .. }))
@@ -3793,7 +4133,7 @@ mod commit_tests {
         )
         .expect("commits the migration");
 
-        let layer_ids = |s: &MigrationState, layer: usize| -> Vec<MigrationTxId> {
+        let layer_ids = |s: &MigrationState, layer: usize| -> Vec<MigrationTransferId> {
             s.transactions
                 .iter()
                 .filter(|t| {
@@ -3899,19 +4239,22 @@ mod commit_tests {
             assert_eq!(tx.state, MigrationTxState::AwaitingSignature);
         }
 
-        // Sessions are consecutive prefixes bounded by the action budget; a preparation is
+        // Rounds are consecutive prefixes bounded by the action budget; a preparation is
         // PREP_TX_ACTIONS actions, so a budget of one preparation plus one transfer splits the
-        // list without ever exceeding the budget (every batch is non-empty and within budget).
-        let budget = PREP_TX_ACTIONS
-            + crate::note_splitting::SOURCE_ACTIONS_PER_TRANSFER
-            + crate::note_splitting::DESTINATION_ACTIONS_PER_TRANSFER;
+        // list without ever exceeding the budget (every round is non-empty and within budget).
+        let budget_actions = PREP_TX_ACTIONS
+            + crate::denomination::SOURCE_ACTIONS_PER_TRANSFER
+            + crate::denomination::DESTINATION_ACTIONS_PER_TRANSFER;
+        let budget = crate::signing_rounds::SigningRoundBudget::new(
+            core::num::NonZeroU32::new(budget_actions as u32).unwrap(),
+        );
         let total = unsigned.len();
         let sessions = batch_unsigned_by_action_budget(unsigned, budget);
-        assert!(sessions.len() > 1, "several sessions: {}", sessions.len());
+        assert!(sessions.len() > 1, "several rounds: {}", sessions.len());
         assert_eq!(sessions.iter().map(|s| s.len()).sum::<usize>(), total);
         for session in &sessions {
             assert!(!session.is_empty());
-            assert!(session.iter().map(|tx| tx.actions()).sum::<usize>() <= budget);
+            assert!(session.iter().map(|tx| tx.actions()).sum::<usize>() <= budget_actions);
         }
 
         // Sign every session out of band and apply the signatures back; the whole migration is
@@ -3931,6 +4274,81 @@ mod commit_tests {
         backend.replace_migration(&state).unwrap();
         for tx in &state.transactions {
             assert_eq!(tx.state, MigrationTxState::Signed);
+        }
+    }
+
+    /// The plan exposes its transactions and signing rounds as a QUERY (no re-planning): the
+    /// enumerated `PlannedTx` ids match the ids the build assigns, `signing_rounds(budget)` is a
+    /// valid partition within the budget, and `group_unsigned` buckets the built PCZTs into that
+    /// same grouping.
+    #[test]
+    fn plan_exposes_signing_rounds_and_groups_unsigned() {
+        let seed = 23u64;
+        let (mut backend, plan) = single_note_setup(seed, 78 * COIN);
+        let params = regtest_network(true);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let (_state, unsigned) = build_preparation_unsigned(
+            &params,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut backend,
+            &plan,
+            &mut rng,
+        )
+        .expect("builds the migration unsigned");
+
+        // The planned enumeration matches the built transactions one-for-one, in id order.
+        let planned = plan.planned_transactions();
+        assert_eq!(planned.len(), plan.total_transactions());
+        assert_eq!(planned.len(), unsigned.len());
+        let planned_ids: Vec<u32> = planned.iter().map(|t| u32::from(t.id())).collect();
+        let mut built_ids: Vec<u32> = unsigned.iter().map(|u| u32::from(u.id())).collect();
+        built_ids.sort_unstable();
+        assert_eq!(planned_ids, (0..planned.len() as u32).collect::<Vec<_>>());
+        assert_eq!(built_ids, planned_ids);
+
+        // A tight budget (one preparation + one transfer) forces several rounds.
+        let budget = SigningRoundBudget::new(
+            NonZeroU32::new(
+                crate::preparation::PREP_TX_ACTIONS as u32
+                    + crate::signing_rounds::TRANSFER_ACTIONS,
+            )
+            .unwrap(),
+        );
+        let rounds = plan.signing_rounds(budget);
+        assert_eq!(rounds.len(), plan.signing_round_count(budget));
+
+        // The rounds are a valid partition of every planned transaction, within the budget.
+        let mut round_ids: Vec<u32> = rounds
+            .iter()
+            .flat_map(|r| r.transactions().iter().map(|t| u32::from(t.id())))
+            .collect();
+        round_ids.sort_unstable();
+        assert_eq!(round_ids, planned_ids);
+        for r in &rounds {
+            assert!(!r.is_empty());
+            if r.len() > 1 {
+                assert!(r.total_actions() <= budget.max_actions());
+            }
+        }
+
+        // group_unsigned buckets the built PCZTs into the SAME rounds (same ids per round).
+        let grouped = plan.group_unsigned(unsigned, budget);
+        assert_eq!(grouped.len(), rounds.len());
+        for (bucket, round) in grouped.iter().zip(rounds.iter()) {
+            let bucket_ids: Vec<u32> = bucket.iter().map(|u| u32::from(u.id())).collect();
+            let round_ids: Vec<u32> = round
+                .transactions()
+                .iter()
+                .map(|t| u32::from(t.id()))
+                .collect();
+            assert_eq!(
+                bucket_ids, round_ids,
+                "each unsigned round matches the planned round"
+            );
+            assert!(
+                bucket.iter().map(|u| u.actions()).sum::<usize>() <= budget.max_actions() as usize
+            );
         }
     }
 

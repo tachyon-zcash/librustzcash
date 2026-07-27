@@ -1,8 +1,8 @@
 //! End-to-end, real-proving chain simulation of a whole migration over a genuine wallet.
 //!
-//! This drives a real (in-memory) `zcash_client_sqlite` `WalletDb` through the
-//! `zcash_client_backend` testing framework, exercising the migration engine's proving path against
-//! the wallet's OWN Orchard commitment tree instead of a hand-built one:
+//! This drives a real (in-memory) [`WalletDb`] through the `zcash_client_backend` testing
+//! framework, exercising the `zcash_pool_migration` engine's proving path against the wallet's OWN
+//! Orchard commitment tree instead of a hand-built one:
 //!
 //! 1. fund an account with a spendable Orchard note and commit a migration over the
 //!    [`WalletMigration`] adapter (so the plan, the prep transactions, and the transfers all come
@@ -16,10 +16,16 @@
 //!
 //! [`WalletMigrationProver`] resolves every spend's tree position from the wallet's own note store
 //! (no hand-supplied map), so this test also covers that production lookup path. It keeps each
-//! transfer's boundary within `zcash_client_sqlite`'s checkpoint pruning window (100 blocks of the
-//! tip), so it needs no migration anchor-checkpoint retention, which is a wallet backend concern
-//! out of the migration crate's control.
-#![cfg(all(feature = "wallet", feature = "test-dependencies"))]
+//! transfer's boundary within this crate's checkpoint pruning window (100 blocks of the tip), so it
+//! needs no migration anchor-checkpoint retention, which is a wallet backend concern out of the
+//! migration crate's control.
+//!
+//! [`WalletDb`]: zcash_client_sqlite::WalletDb
+#![cfg(all(
+    feature = "orchard",
+    feature = "pczt-tests",
+    feature = "test-dependencies"
+))]
 
 use std::convert::Infallible;
 
@@ -32,8 +38,8 @@ use zcash_client_backend::data_api::testing::{
     AddressType, TestBuilder, TestState, orchard::OrchardPoolTester, pool::ShieldedPoolTester,
 };
 use zcash_client_backend::data_api::{Account, WalletRead};
-// The wallet, block cache, DB factory, and Orchard-checkpoint helper come from
-// `zcash_client_sqlite`'s own test harness, exposed under its `test-dependencies` feature.
+// The wallet, block cache, DB factory, and Orchard-checkpoint helper come from this crate's own
+// test harness, exposed under its `test-dependencies` feature.
 use zcash_client_sqlite::testing::db::{TestDb, TestDbFactory};
 use zcash_client_sqlite::testing::{BlockCache, highest_rooted_orchard_checkpoint};
 use zcash_keys::keys::UnifiedSpendingKey;
@@ -45,8 +51,8 @@ use zcash_protocol::value::testing::zats;
 use zcash_protocol::value::{COIN, Zatoshis};
 
 use zcash_pool_migration::engine::{
-    self, MigrationState, MigrationTxId, MigrationTxKind, MigrationTxState, PoolMigrationRead,
-    PoolMigrationWrite,
+    self, MigrationState, MigrationTransferId, MigrationTxKind, MigrationTxState,
+    PoolMigrationRead, PoolMigrationWrite,
 };
 use zcash_pool_migration::wallet::{WalletMigration, WalletMigrationProver};
 
@@ -93,7 +99,7 @@ impl PoolMigrationWrite for MigrationTestStore {
 
     fn update_transaction(
         &mut self,
-        _id: MigrationTxId,
+        _id: MigrationTransferId,
         _state: MigrationTxState,
     ) -> Result<(), Self::Error> {
         // Not exercised: the chain simulation advances proving state through the engine's
@@ -116,13 +122,7 @@ struct Scenario {
 }
 
 impl Scenario {
-    /// Starts a scenario whose account is funded with a single Orchard note worth `funding`.
-    fn funded(label: &'static str, funding: Zatoshis) -> Self {
-        Self::funded_notes(label, vec![funding])
-    }
-
-    /// Starts a scenario whose account is funded with several source Orchard notes (the "exchange" /
-    /// dusty shapes whose consolidation drives multi-layer preparation).
+    /// Starts a scenario whose account is funded with the given source Orchard notes.
     fn funded_notes(label: &'static str, funding: Vec<Zatoshis>) -> Self {
         Self {
             label,
@@ -249,8 +249,8 @@ impl Run {
             let plan = engine::plan_migration(&self.network, &adapter, &mut rng)
                 .expect("plans the migration");
             let funding_notes = plan.funding_notes();
-            let migrated = plan.note_split().total_migratable();
-            let change = plan.note_split().change().map(u64::from).unwrap_or(0);
+            let migrated = plan.denominations().total_migratable();
+            let change = plan.denominations().change().map(u64::from).unwrap_or(0);
             let mut adapter = adapter;
             let (state, _) = engine::commit_preparation_with_funding(
                 &self.network,
@@ -291,7 +291,7 @@ impl Run {
     /// (asserting it is Orchard-only), then mines and scans it so its minted funding notes become
     /// spendable; finally checks the wallet balance is the funding less the reserved preparation fees.
     fn prove_preparations(&mut self, committed: &mut Committed, scenario: &Scenario) {
-        let prep_ids: Vec<MigrationTxId> = committed
+        let prep_ids: Vec<MigrationTransferId> = committed
             .state
             .transactions()
             .iter()
@@ -364,7 +364,7 @@ impl Run {
     /// checks the destination pool: the migration created exactly one Ironwood note per transfer,
     /// together holding the whole migrated value.
     fn prove_transfers(&mut self, committed: &mut Committed, scenario: &Scenario) {
-        let mut transfers: Vec<(MigrationTxId, BlockHeight)> = committed
+        let mut transfers: Vec<(MigrationTransferId, BlockHeight)> = committed
             .state
             .transactions()
             .iter()
@@ -464,86 +464,41 @@ impl Run {
 }
 
 /// Every proving scenario, spanning the migration personas exercised across the codebase (the Python
-/// integration-test suite and the note-split golden vectors): single small / medium / large
+/// integration-test suite and the denomination golden vectors): single small / medium / large
 /// balances, the minimum-denomination and buffer-pruned edges, and the many-note "exchange" / dust /
 /// whale shapes whose consolidation drives multi-layer preparation.
 fn scenarios() -> Vec<Scenario> {
-    // 0.02 ZEC dust notes.
-    let dust = zats(COIN / 50);
-    let dust_heavy: Vec<Zatoshis> = std::iter::once(zats(COIN))
-        .chain(std::iter::repeat_n(dust, 12))
-        .collect();
-    // The migrated total is the balance less the reserved transfer buffers and preparation fees, so
-    // it is a multiple of the 0.01-ZEC minimum denomination; expressed here in hundredths of a ZEC.
-    let hundredths = COIN / 100;
-    vec![
-        // Single-note balances.
-        Scenario::funded("small holder, 2 ZEC", zats(2 * COIN))
-            .expect_preparations(1)
-            .expect_transfers(7)
-            .expect_migrated(zats(199 * hundredths)),
-        Scenario::funded("retail, 15 ZEC", zats(15 * COIN))
-            .expect_preparations(1)
-            .expect_transfers(9)
-            .expect_migrated(zats(1_499 * hundredths)),
-        Scenario::funded("denominations, 60 ZEC", zats(60 * COIN))
-            .expect_preparations(1)
-            .expect_transfers(10)
-            .expect_migrated(zats(5_999 * hundredths)),
-        Scenario::funded("78 ZEC in a single note", zats(78 * COIN))
-            .expect_preparations(1)
-            .expect_transfers(10)
-            .expect_migrated(zats(7_799 * hundredths)),
-        Scenario::funded(
-            "Gwen, 0.0152 ZEC (a single minimum-denomination note)",
-            zats(1_520_000),
-        )
-        .expect_preparations(1)
-        .expect_transfers(1)
-        .expect_migrated(zats(hundredths)),
-        Scenario::funded(
-            "Priya, 7.1101 ZEC (the buffer prunes the trailing crossing)",
-            zats(711_010_000),
-        )
-        .expect_preparations(1)
-        .expect_transfers(3)
-        .expect_migrated(zats(710 * hundredths)),
-        // Many-note shapes, consolidated across preparation layers.
-        Scenario::funded_notes("exchange, ten 5 ZEC notes", vec![zats(5 * COIN); 10])
-            .expect_preparations(2)
-            .expect_transfers(3)
-            .expect_migrated(zats(4_500 * hundredths)),
-        Scenario::funded_notes("monotonic, ten 12 ZEC notes", vec![zats(12 * COIN); 10])
-            .expect_preparations(5)
-            .expect_transfers(11)
-            .expect_migrated(zats(11_999 * hundredths)),
-        Scenario::funded_notes("dust-heavy, 1 ZEC and twelve 0.02 ZEC notes", dust_heavy)
-            .expect_preparations(4)
-            .expect_transfers(4)
-            .expect_migrated(zats(123 * hundredths)),
-        Scenario::funded_notes(
-            "whale plus dust, 40 ZEC and a six-note dust tail",
-            vec![
-                zats(40 * COIN),
-                zats(COIN / 50),
-                zats(COIN / 50),
-                zats(COIN / 20),
-                zats(COIN / 20),
-                zats(COIN / 10),
-                zats(COIN / 10),
-            ],
-        )
-        .expect_preparations(4)
-        .expect_transfers(6)
-        .expect_migrated(zats(4_033 * hundredths)),
-    ]
+    // The source balances and their fee-aware expected outputs are defined ONCE in the reusable
+    // `testing::MIGRATION_SCENARIOS` (shared with the signing-round end-to-end test); this builds a
+    // proving `Scenario` from each.
+    zcash_pool_migration::testing::MIGRATION_SCENARIOS
+        .iter()
+        .map(|sc| {
+            Scenario::funded_notes(sc.label, sc.source_notes.iter().map(|&z| zats(z)).collect())
+                .expect_preparations(sc.expected_preparations)
+                .expect_transfers(sc.expected_transfers)
+                .expect_migrated(zats(sc.expected_migrated))
+        })
+        .collect()
 }
 
 #[test]
 fn migration_proves_end_to_end_against_a_funded_wallet() {
-    for scenario in scenarios() {
-        scenario.prove_end_to_end();
-    }
+    // Proving dominates this test's cost: each preparation proves an Orchard bundle, and each
+    // transfer proves both an Orchard AND an Ironwood bundle, so proving every scenario in
+    // `MIGRATION_SCENARIOS` is ~149 real Halo2 proofs in a single test. The per-scenario
+    // accounting (preparations, transfers, migrated value, signing rounds) is already asserted for
+    // ALL scenarios without any proving by `migration_scenarios_end_to_end` in
+    // `signing_rounds_e2e.rs`; the only thing this test adds is exercising the real proving path.
+    // We therefore prove ONE representative scenario end to end. The "exchange" shape is the
+    // cheapest that still spans multi-layer preparation (2 preparations) and multiple transfers
+    // (3), so every proving code path runs exactly as it would for the larger shapes.
+    const REPRESENTATIVE: &str = "exchange, ten 5 ZEC notes";
+    let scenario = scenarios()
+        .into_iter()
+        .find(|scenario| scenario.label == REPRESENTATIVE)
+        .expect("the representative proving scenario exists");
+    scenario.prove_end_to_end();
 }
 
 /// The adapter reports the WALLET's anchor retention interval as its anchor bucket interval, and
@@ -556,7 +511,7 @@ fn migration_proves_end_to_end_against_a_funded_wallet() {
 fn migration_anchors_to_the_wallets_configured_retention_grid() {
     use core::num::NonZeroU32;
     use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
-    use zcash_pool_migration::engine::{MigrationBackend, MigrationTxId, MigrationTxKind};
+    use zcash_pool_migration::engine::{MigrationBackend, MigrationTransferId, MigrationTxKind};
     use zcash_pool_migration::scheduling::{AnchorBucketInterval, SchedulingParams};
 
     // A short grid, so a migration reaches anchor viability without waiting out 144-block buckets.
@@ -636,7 +591,7 @@ fn migration_anchors_to_the_wallets_configured_retention_grid() {
     // checkpoint survives only because the wallet RETAINED it, and prove against it. Without
     // retention on the wallet's configured grid this fails with `AnchorNotFound`.
     let mut state = state;
-    let prep_ids: Vec<MigrationTxId> = state
+    let prep_ids: Vec<MigrationTransferId> = state
         .transactions()
         .iter()
         .filter(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }))

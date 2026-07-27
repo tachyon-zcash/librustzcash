@@ -1,7 +1,7 @@
 //! Building a migration transfer transaction: spending one self-funding note and crossing its value
 //! into the Ironwood pool.
 //!
-//! [`build_transfer_pczt`] spends a single self-funding note (one the note split minted, worth its
+//! [`build_transfer_pczt`] spends a single self-funding note (one the denomination plan minted, worth its
 //! crossing value plus a fee buffer) and outputs that crossing value into the destination Ironwood
 //! pool, to the account's own internal (change) address as ZIP 318 requires. It has no change output:
 //! the self-funding note's buffer funds the transfer's fee exactly. The Orchard spend pads to the
@@ -32,7 +32,7 @@ use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
 
-use super::{BuildError, finalize_pczt};
+use super::{AccountDerivation, BuildError, finalize_pczt};
 
 /// The transfer's destination-pool bundle padding: a SINGLE unpadded Ironwood action. The canonical
 /// transfer carries exactly one Ironwood output, and since every migration transfer shares this
@@ -54,9 +54,16 @@ const IRONWOOD_TRANSFER_PADDING: BundlePadding = BundlePadding {
 /// destination: per ZIP 318 the crossing is sent to the account's own internal Ironwood change
 /// address. `target_height` and `expiry_height` bound the transaction; the pre-signature commits to
 /// the expiry, so the caller passes the canonical expiry for the transfer's drawn broadcast
-/// schedule. It mirrors the note split's
-/// [`crossing_values`](crate::note_splitting::NoteSplitPlan::crossing_values): one transfer per
+/// schedule. It mirrors the denomination plan's
+/// [`crossing_values`](crate::denomination::DenominationPlan::crossing_values): one transfer per
 /// self-funding note.
+///
+/// `account_derivation` is the ZIP 32 account the funding note belongs to. When supplied, every
+/// spend the transfer still needs a signature for is stamped with the account's Orchard key path,
+/// so an EXTERNAL Signer can identify it as the account's. Pass `None` only when the account has
+/// no known derivation; a PCZT built without it can be signed in process (see
+/// [`sign_pczt`](super::sign_pczt), which matches by key rather than by path) but not by a
+/// derivation-matching Signer.
 ///
 /// The caller supplies `rng` (a cryptographically secure RNG in production, e.g. `OsRng`; tests can
 /// pass a seeded one), keeping this builder pure.
@@ -66,6 +73,7 @@ const IRONWOOD_TRANSFER_PADDING: BundlePadding = BundlePadding {
 /// Returns [`BuildError::Build`] if the builder or PCZT pipeline fails (including when the note's
 /// buffer does not cover the transfer fee, which unbalances the transaction, and when
 /// `target_height` precedes NU6.3, whose V6 format is what permits deferring the anchors).
+#[allow(clippy::too_many_arguments)]
 pub fn build_transfer_pczt<P, R>(
     params: &P,
     target_height: u32,
@@ -73,6 +81,7 @@ pub fn build_transfer_pczt<P, R>(
     orchard_fvk: &FullViewingKey,
     note: orchard::note::Note,
     crossing_value: Zatoshis,
+    account_derivation: Option<&AccountDerivation>,
     rng: R,
 ) -> Result<pczt::Pczt, BuildError>
 where
@@ -110,7 +119,7 @@ where
         .build_for_pczt(rng, &Zip317FeeRule::standard())
         .map_err(|e| BuildError::Build(format!("transfer: build: {e}")))?;
 
-    finalize_pczt(build_result.pczt_parts)
+    finalize_pczt(params, build_result.pczt_parts, account_derivation)
 }
 
 #[cfg(test)]
@@ -121,10 +130,13 @@ mod tests {
     use rand_core::SeedableRng;
     use zcash_protocol::value::COIN;
 
-    use crate::build::test_util::{account, regtest_network, single_note_witness};
+    use crate::build::test_util::{
+        account, account_derivation, assert_every_spend_is_identifiable, regtest_network,
+        single_note_witness,
+    };
     use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
 
-    use crate::note_splitting::{
+    use crate::denomination::{
         DESTINATION_ACTIONS_PER_TRANSFER, RESIDUAL_MIGRATION_MIN, SOURCE_ACTIONS_PER_TRANSFER, zat,
     };
 
@@ -161,6 +173,7 @@ mod tests {
                 &fvk,
                 note,
                 zat(crossing_value),
+                None,
                 rng,
             );
 
@@ -179,5 +192,34 @@ mod tests {
                 .count();
             prop_assert_eq!(unwitnessed, 1);
         }
+    }
+
+    /// Given the account's derivation, the transfer's real Orchard spend carries ZIP 32
+    /// derivation metadata, so an external Signer can identify and sign it. The Orchard padding
+    /// dummy and the Ironwood bundle's own dummy spend are pre-signed by the IO Finalizer and are
+    /// correctly left without it.
+    #[test]
+    fn stamps_derivation_on_the_spend_needing_a_signature() {
+        let fvk = account(13);
+        let derivation = account_derivation(13);
+        let buffer = (SOURCE_ACTIONS_PER_TRANSFER + DESTINATION_ACTIONS_PER_TRANSFER) as u64
+            * MARGINAL_FEE.into_u64();
+        let crossing_value = 5 * COIN;
+        let (note, _path, _anchor) = single_note_witness(&fvk, crossing_value + buffer, 13);
+
+        let pczt = build_transfer_pczt(
+            &regtest_network(true),
+            100,
+            140,
+            &fvk,
+            note,
+            zat(crossing_value),
+            Some(&derivation),
+            ChaCha8Rng::seed_from_u64(13),
+        )
+        .expect("a self-funding note builds a balanced transfer");
+
+        // Exactly the one real Orchard spend still needs a signature.
+        assert_eq!(assert_every_spend_is_identifiable(&pczt), 1);
     }
 }
