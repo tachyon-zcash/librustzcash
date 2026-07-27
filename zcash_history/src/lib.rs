@@ -18,9 +18,11 @@ mod version;
 mod test_vectors;
 
 pub use entry::{Entry, MAX_ENTRY_SIZE};
-pub use node_data::{MAX_NODE_DATA_SIZE, NodeData, V2 as NodeDataV2, V3 as NodeDataV3};
+pub use node_data::{
+    MAX_NODE_DATA_SIZE, NodeData, V2 as NodeDataV2, V3 as NodeDataV3, V4 as NodeDataV4,
+};
 pub use tree::Tree;
-pub use version::{V1, V2, V3, Version};
+pub use version::{V1, V2, V3, V4, Version};
 
 /// Crate-level error type
 #[derive(Debug)]
