@@ -82,7 +82,7 @@ use crate::{
 };
 // Used only by the value-target transparent selection, which is gated on transparent inputs.
 #[cfg(feature = "transparent-inputs")]
-use crate::wallet::locking::locked_tier_order_key;
+use crate::wallet::locking::locked_tier_expr;
 
 pub(crate) mod ephemeral;
 
@@ -823,11 +823,23 @@ pub(crate) fn store_address_range<P: consensus::Parameters>(
 
             // If the import was recorded under a different account, the outputs received at
             // the address follow the (derivation-proven) attribution to this account.
+            //
+            // Only the transparent update can match today: a `Foreign` row is a transparent-only
+            // import, so no shielded note can be attached to it. A shielded note's `address_id`
+            // is only ever produced by `upsert_address`, which always writes the external key
+            // scope and a non-null diversifier index, whereas the `addresses` check constraint
+            // requires a `Foreign` row to have a null diversifier index; and no code path demotes
+            // an existing row to the `Foreign` scope. The shielded pools are nonetheless updated
+            // here so that this reattribution stays complete if that invariant is ever relaxed:
+            // mis-attributing a shielded note to the wrong account is silent and permanent,
+            // whereas these statements cost nothing on a path that only runs when an import is
+            // upgraded across accounts.
             if foreign_account != account_id.0 {
                 for table in [
                     "transparent_received_outputs",
                     "sapling_received_notes",
                     "orchard_received_notes",
+                    "ironwood_received_notes",
                 ] {
                     conn.execute(
                         &format!(
@@ -1055,6 +1067,16 @@ pub(crate) fn utxo_query_height(
 /// are ordered by total contributed value descending; ties are broken in favor of
 /// the account whose oldest contributed input has the lowest mined height (with
 /// unmined inputs sorting last), then by `accounts.id`.
+///
+/// The inner `UNION ALL` must carry one branch per pool in which the wallet can record a
+/// received output: transparent, Sapling, Orchard, and Ironwood. A missing branch does not
+/// produce an error, it silently under-counts the accounts that funded the transaction, so
+/// a pool added to the schema without a branch here changes which account this reports.
+///
+/// The pools are enumerated here rather than read from the cross-pool `v_received_outputs`
+/// view because that view has to be materialized in full to be joined by output id, which
+/// scans every received-note table. This query is run once per candidate output, so it is
+/// written to be satisfied from the spend tables' `transaction_id` indexes instead.
 fn list_funding_accounts(
     conn: &rusqlite::Connection,
     creating_tx_id: i64,
@@ -1087,6 +1109,13 @@ fn list_funding_accounts(
                    ON orns.orchard_received_note_id = orn.id
                  JOIN transactions t ON t.id_tx = orn.transaction_id
                  WHERE orns.transaction_id = :creating_tx_id
+                 UNION ALL
+                 SELECT irn.account_id, irn.value, t.mined_height
+                 FROM ironwood_received_notes irn
+                 JOIN ironwood_received_note_spends irns
+                   ON irns.ironwood_received_note_id = irn.id
+                 JOIN transactions t ON t.id_tx = irn.transaction_id
+                 WHERE irns.transaction_id = :creating_tx_id
              )
              GROUP BY account_id
          ) contribs ON contribs.account_id = a.id
@@ -1568,8 +1597,10 @@ pub(crate) fn select_spendable_transparent_outputs<P: consensus::Parameters>(
     // `LockFilter::Policy` that prefers one lock tier prefixes the value ordering with a lock-tier
     // key (Part B): the preferred tier is drawn upon first, with value-descending order retained as
     // a secondary key within each tier. For `Exclude`/`Unfiltered` the ordering is unchanged.
-    let order_by_sql = match locked_tier_order_key(lock_filter, "u") {
-        Some(tier_key) => format!("{tier_key}, u.value_zat DESC, u.output_index"),
+    let order_by_sql = match locked_tier_expr(lock_filter, "u") {
+        Some((expr, direction)) => {
+            format!("{expr} {direction}, u.value_zat DESC, u.output_index")
+        }
         None => "u.value_zat DESC, u.output_index".to_string(),
     };
 
@@ -2973,6 +3004,122 @@ mod tests {
         assert_eq!(mined_height, Some(u32::from(mined_at)));
     }
 
+    /// `v_tx_outputs.to_address` must report the transparent receiver at which a transparent
+    /// output was received — not the unified address that contains that receiver — and for an
+    /// output the wallet itself created, the recipient address recorded at transaction
+    /// construction time is authoritative.
+    ///
+    /// Both properties regressed when the view began resolving received outputs through
+    /// `addresses.address`, which holds the unified encoding for external-scope rows: a
+    /// payment to one of the wallet's own transparent addresses was reported with the
+    /// receiving account's unified address as its recipient, because the received-output row
+    /// carried the unified encoding and the `MAX(to_address)` merge preferred it to the
+    /// transparent encoding recorded in `sent_notes` (`'u' > 't'` in byte order). See
+    /// zcash/librustzcash#2845.
+    #[test]
+    fn v_tx_outputs_reports_transparent_receiver_for_transparent_outputs() {
+        use transparent::bundle::{OutPoint, TxOut};
+        use zcash_client_backend::{
+            data_api::WalletRead as _,
+            wallet::{Recipient, WalletTransparentOutput},
+        };
+        use zcash_keys::{encoding::AddressCodec as _, keys::UnifiedAddressRequest};
+        use zcash_protocol::value::Zatoshis;
+
+        use crate::{TxRef, wallet::put_sent_output};
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account_id = st.test_account().unwrap().id();
+        let birthday = st.test_account().unwrap().birthday().height();
+        let params = st.wallet().db().params;
+        let taddr = *st
+            .wallet()
+            .get_last_generated_address_matching(
+                account_id,
+                UnifiedAddressRequest::AllAvailableKeys,
+            )
+            .unwrap()
+            .unwrap()
+            .transparent()
+            .unwrap();
+        let taddr_str = taddr.encode(&params);
+
+        let mined_at = birthday + 100;
+        st.wallet_mut().update_chain_tip(mined_at + 10).unwrap();
+
+        // Receive an output at the transparent receiver of the account's unified address.
+        let outpoint = OutPoint::fake();
+        let value = Zatoshis::const_from_u64(100_000);
+        let utxo = WalletTransparentOutput::from_parts(
+            outpoint.clone(),
+            TxOut::new(value, taddr.script().into()),
+            Some(mined_at),
+            Some(account_id),
+            Some(TransparentKeyScope::EXTERNAL),
+            None,
+        )
+        .unwrap();
+        st.wallet_mut()
+            .put_received_transparent_utxo(&utxo)
+            .unwrap();
+
+        let to_address = |conn: &rusqlite::Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT to_address FROM v_tx_outputs WHERE txid = :txid",
+                rusqlite::named_params! { ":txid": outpoint.hash().to_vec() },
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            to_address(st.wallet().conn()).as_deref(),
+            Some(taddr_str.as_str()),
+            "a received transparent output must be reported at its transparent receiver, \
+             not at the unified address containing it",
+        );
+
+        // Record the send side of the same output, as transaction-data processing does when
+        // the wallet discovers that it funded a transaction paying its own transparent
+        // address.
+        let id_tx: i64 = st
+            .wallet()
+            .conn()
+            .query_row(
+                "SELECT id_tx FROM transactions WHERE txid = :txid",
+                rusqlite::named_params! { ":txid": outpoint.hash().to_vec() },
+                |row| row.get(0),
+            )
+            .unwrap();
+        let conn_tx = st.wallet_mut().conn_mut().transaction().unwrap();
+        put_sent_output(
+            &conn_tx,
+            &params,
+            account_id,
+            TxRef(id_tx),
+            outpoint.n() as usize,
+            &Recipient::InternalTransparent {
+                receiving_account: account_id,
+                recipient_address: taddr,
+            },
+            value,
+            None,
+        )
+        .unwrap();
+        conn_tx.commit().unwrap();
+
+        assert_eq!(
+            to_address(st.wallet().conn()).as_deref(),
+            Some(taddr_str.as_str()),
+            "the transparent address the wallet paid must not be shadowed by the unified \
+             address of the receiving account",
+        );
+    }
+
     #[test]
     fn transparent_balance_across_shielding() {
         zcash_client_backend::data_api::testing::transparent::transparent_balance_across_shielding(
@@ -3353,6 +3500,284 @@ mod tests {
             )
             .unwrap();
         assert_eq!((utxo_addr_id, utxo_account_id), (foreign_id, account_a.0));
+
+        tx.commit().unwrap();
+    }
+
+    /// When the upgrade of a standalone (`Foreign`) import moves the address record to the
+    /// deriving account, notes attached to that record follow it for *every* shielded pool that
+    /// has a received-note table, not just some of them.
+    ///
+    /// The rows this seeds are ones the current code does not produce: a `Foreign` record is a
+    /// transparent-only import, and a shielded note's `address_id` only ever comes from
+    /// `upsert_address`, which writes the external key scope and a non-null diversifier index
+    /// (see `foreign_addresses_cannot_carry_a_diversifier_index`). They are written directly so
+    /// that the reattribution is covered pool-by-pool even though nothing can reach this state
+    /// today; a pool omitted here would mis-attribute funds silently and permanently if that
+    /// invariant were ever relaxed.
+    #[test]
+    #[cfg(feature = "transparent-key-import")]
+    fn store_address_range_reattributes_shielded_notes_of_imported_receiver() {
+        use rusqlite::named_params;
+        use transparent::address::TransparentAddress;
+        use zcash_client_backend::data_api::{AccountBirthday, chain::ChainState};
+        use zcash_keys::{address::Address, encoding::AddressCodec};
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+        use crate::wallet::encoding::{KeyScope, ReceiverFlags};
+
+        /// The transparent receiver imported under account B and derived by account A. Its
+        /// bytes are arbitrary; nothing derives from or validates them.
+        const IMPORTED_RECEIVER_HASH: [u8; 20] = [0x33; 20];
+        /// The compressed pubkey recorded against the import. Only its presence matters: the
+        /// `addresses` check constraint requires exactly one import column to be set, and
+        /// nothing here parses it as a key.
+        const IMPORTED_PUBKEY: [u8; 33] = [0x02; 33];
+        /// Above the account's default external gap limit, so no derived record already occupies
+        /// this index and the derivation below reaches the import-upgrade path.
+        const DERIVED_CHILD_INDEX: u32 = 100;
+        /// The height at which the import was recorded as exposed.
+        const IMPORT_EXPOSURE_HEIGHT: u32 = 55;
+        /// The single transaction that all of the seeded notes belong to, and the columns it
+        /// needs; the reattribution does not read any of them.
+        const TX_ROW_ID: i64 = 1;
+        const TXID: [u8; 32] = [7; 32];
+        const OBSERVED_HEIGHT: u32 = 1;
+        /// Placeholders for the note columns that these assertions never read back; they exist
+        /// only to satisfy the received-note tables' NOT NULL constraints.
+        const NOTE_INDEX: i64 = 0;
+        const DIVERSIFIER: [u8; 11] = [0; 11];
+        const NOTE_VALUE_ZATS: i64 = 100_000;
+        const NOTE_COMPONENT: [u8; 32] = [0; 32];
+        /// The note plaintext version recorded for the seeded Orchard and Ironwood notes. Only
+        /// the Ironwood table requires it, and its value is immaterial here.
+        const NOTE_VERSION: i64 = 2;
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account_a_uuid = st.test_account().unwrap().id();
+        let network = *st.network();
+
+        // A second account, under which the address will be imported.
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(
+                network.activation_height(NetworkUpgrade::Sapling).unwrap() - 1,
+                BlockHash([0; 32]),
+            ),
+            None,
+        );
+        let seed_b = Secret::new(vec![42u8; 32]);
+        let (account_b_uuid, _) = st
+            .wallet_mut()
+            .create_account("b", &seed_b, &birthday, None)
+            .unwrap();
+
+        let taddr = TransparentAddress::PublicKeyHash(IMPORTED_RECEIVER_HASH);
+        let taddr_enc = taddr.encode(&network);
+        let child_index = NonHardenedChildIndex::from_index(DERIVED_CHILD_INDEX).unwrap();
+
+        let tx = st.wallet().db().conn.unchecked_transaction().unwrap();
+        let account_a = get_account_ref(&tx, account_a_uuid).unwrap();
+        let account_b = get_account_ref(&tx, account_b_uuid).unwrap();
+
+        // The standalone (`Foreign`) row under account B.
+        tx.execute(
+            "INSERT INTO addresses
+                 (account_id, key_scope, address, cached_transparent_receiver_address,
+                  imported_transparent_receiver_pubkey, receiver_flags, exposed_at_height)
+             VALUES (:account_id, :foreign, :address, :taddr, :pubkey, :receiver_flags,
+                  :exposed_at_height)",
+            named_params! {
+                ":account_id": account_b.0,
+                ":foreign": KeyScope::Foreign.encode(),
+                ":address": &taddr_enc,
+                ":taddr": &taddr_enc,
+                ":pubkey": &IMPORTED_PUBKEY[..],
+                ":receiver_flags": ReceiverFlags::P2PKH.bits(),
+                ":exposed_at_height": IMPORT_EXPOSURE_HEIGHT,
+            },
+        )
+        .unwrap();
+        let foreign_id = tx.last_insert_rowid();
+
+        tx.execute(
+            "INSERT INTO transactions (id_tx, txid, min_observed_height)
+             VALUES (:id_tx, :txid, :min_observed_height)",
+            named_params! {
+                ":id_tx": TX_ROW_ID,
+                ":txid": &TXID[..],
+                ":min_observed_height": OBSERVED_HEIGHT,
+            },
+        )
+        .unwrap();
+
+        // One note in each shielded pool, attached to the imported record and attributed to
+        // account B.
+        tx.execute(
+            "INSERT INTO sapling_received_notes
+                 (transaction_id, output_index, account_id, address_id, diversifier, value,
+                  rcm, is_change)
+             VALUES (:tx, :note_index, :account_id, :address_id, :diversifier, :value,
+                  :note_component, :is_change)",
+            named_params! {
+                ":tx": TX_ROW_ID,
+                ":note_index": NOTE_INDEX,
+                ":account_id": account_b.0,
+                ":address_id": foreign_id,
+                ":diversifier": &DIVERSIFIER[..],
+                ":value": NOTE_VALUE_ZATS,
+                ":note_component": &NOTE_COMPONENT[..],
+                ":is_change": false,
+            },
+        )
+        .unwrap();
+
+        for table in ["orchard_received_notes", "ironwood_received_notes"] {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table}
+                         (transaction_id, action_index, account_id, address_id, diversifier,
+                          value, rho, rseed, is_change, note_version)
+                     VALUES (:tx, :note_index, :account_id, :address_id, :diversifier,
+                          :value, :note_component, :note_component, :is_change, :note_version)"
+                ),
+                named_params! {
+                    ":tx": TX_ROW_ID,
+                    ":note_index": NOTE_INDEX,
+                    ":account_id": account_b.0,
+                    ":address_id": foreign_id,
+                    ":diversifier": &DIVERSIFIER[..],
+                    ":value": NOTE_VALUE_ZATS,
+                    ":note_component": &NOTE_COMPONENT[..],
+                    ":is_change": false,
+                    ":note_version": NOTE_VERSION,
+                },
+            )
+            .unwrap();
+        }
+
+        // Account A derives the same address.
+        super::store_address_range(
+            &tx,
+            &network,
+            account_a,
+            TransparentKeyScope::EXTERNAL,
+            vec![(Address::from(taddr), taddr, child_index)],
+        )
+        .unwrap();
+
+        // Every seeded note followed the record to the deriving account.
+        for table in [
+            "sapling_received_notes",
+            "orchard_received_notes",
+            "ironwood_received_notes",
+        ] {
+            let note_account_id: i64 = tx
+                .query_row(
+                    &format!("SELECT account_id FROM {table} WHERE address_id = :address_id"),
+                    named_params! { ":address_id": foreign_id },
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                note_account_id, account_a.0,
+                "{table} was not reattributed to the deriving account"
+            );
+        }
+
+        tx.commit().unwrap();
+    }
+
+    /// Pins the invariant that makes the shielded arms of the reattribution above unreachable in
+    /// practice, so that they stay provably redundant rather than quietly becoming load-bearing.
+    ///
+    /// A shielded note's `address_id` is only ever produced by `upsert_address`, which writes the
+    /// external key scope and a non-null diversifier index. The `addresses` check constraint
+    /// makes a null diversifier index and the `Foreign` key scope equivalent, so a `Foreign`
+    /// record can be neither inserted nor matched by that function, and no shielded note can
+    /// resolve to one.
+    #[test]
+    fn foreign_addresses_cannot_carry_a_diversifier_index() {
+        use rusqlite::named_params;
+        use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
+
+        use crate::wallet::{
+            encoding::{KeyScope, ReceiverFlags, encode_diversifier_index_be},
+            upsert_address,
+        };
+
+        /// An address string for the rejected insert. It is never decoded, only stored.
+        const UNUSED_ADDRESS: &str = "placeholder-address";
+
+        let st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account = st.test_account().unwrap();
+        let account_uuid = account.id();
+        let uivk = account.uivk();
+        let network = *st.network();
+
+        let tx = st.wallet().db().conn.unchecked_transaction().unwrap();
+        let account_id = get_account_ref(&tx, account_uuid).unwrap();
+
+        // The lowest diversifier index at which this account has a shielded address, and the
+        // address itself. A Sapling receiver is required so that the address exists whether or
+        // not the `orchard` feature is enabled; the search skips the indices at which the
+        // account's Sapling key has no valid diversifier.
+        let shielded_request = UnifiedAddressRequest::custom(
+            ReceiverRequirement::Omit,
+            ReceiverRequirement::Require,
+            ReceiverRequirement::Allow,
+        )
+        .unwrap();
+        let (ua, diversifier_index) = uivk.default_address(shielded_request).unwrap();
+
+        // A `Foreign` record carrying a diversifier index is rejected by the schema.
+        let rejected = tx.execute(
+            "INSERT INTO addresses
+                 (account_id, key_scope, diversifier_index_be, address, receiver_flags)
+             VALUES (:account_id, :foreign, :diversifier_index_be, :address, :receiver_flags)",
+            named_params! {
+                ":account_id": account_id.0,
+                ":foreign": KeyScope::Foreign.encode(),
+                ":diversifier_index_be": encode_diversifier_index_be(diversifier_index),
+                ":address": UNUSED_ADDRESS,
+                ":receiver_flags": ReceiverFlags::P2PKH.bits(),
+            },
+        );
+        assert!(
+            rejected.is_err(),
+            "a Foreign address record must not carry a diversifier index"
+        );
+
+        // The records that shielded notes are attached to are the complement of that: external
+        // scope, with a diversifier index.
+        let address_id = upsert_address(
+            &tx,
+            &network,
+            account_id,
+            diversifier_index,
+            &ua,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (key_scope, has_diversifier_index): (i64, bool) = tx
+            .query_row(
+                "SELECT key_scope, diversifier_index_be IS NOT NULL
+                 FROM addresses WHERE id = :id",
+                named_params! { ":id": address_id.0 },
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(key_scope, KeyScope::EXTERNAL.encode());
+        assert!(has_diversifier_index);
 
         tx.commit().unwrap();
     }
@@ -3862,5 +4287,356 @@ mod tests {
         zcash_client_backend::data_api::testing::transparent::mark_transparent_addresses_exposed_unknown_address(
             TestDbFactory::default(),
         );
+    }
+
+    /// Scenarios for the funding account that a transparent output reports, which
+    /// [`super::to_unspent_transparent_output`] takes from [`super::list_funding_accounts`].
+    ///
+    /// Each scenario builds a transparent output through the wallet's own write path, then
+    /// writes the spent notes of its creating transaction directly: the wallet cannot yet be
+    /// driven to produce a transaction that spends Ironwood value, and the point under test is
+    /// what the query makes of those rows once they exist.
+    mod funding_accounts {
+        use rusqlite::named_params;
+        use secrecy::Secret;
+        use transparent::{
+            bundle::{OutPoint, TxOut},
+            keys::TransparentKeyScope,
+        };
+        use zcash_client_backend::{
+            data_api::{
+                Account as _, AccountBirthday, WalletRead as _, WalletWrite, chain::ChainState,
+                testing::TestBuilder,
+            },
+            wallet::WalletTransparentOutput,
+        };
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::{consensus::BlockHeight, value::Zatoshis};
+
+        use crate::{
+            AccountUuid,
+            testing::db::TestDbFactory,
+            wallet::{get_account_ref, transparent::get_wallet_transparent_output},
+        };
+
+        /// Value of the transparent output whose funding account each scenario inspects. It
+        /// plays no part in the funding-account computation; the output just has to be
+        /// well-formed.
+        const FUNDED_OUTPUT_ZATS: Zatoshis = Zatoshis::const_from_u64(10_000);
+
+        /// Value of the Ironwood note that the creating transaction spends.
+        const IRONWOOD_INPUT_ZATS: i64 = 200_000;
+
+        /// Value of the Sapling note that the second account contributes in the mixed-pool
+        /// scenario. Strictly smaller than [`IRONWOOD_INPUT_ZATS`], so the Ironwood-holding
+        /// account is the largest contributor once Ironwood value is counted at all.
+        const MIXED_POOL_SAPLING_INPUT_ZATS: i64 = 50_000;
+        const _: () = assert!(IRONWOOD_INPUT_ZATS > MIXED_POOL_SAPLING_INPUT_ZATS);
+
+        /// Blocks between the account birthday, the transaction that funds the seeded notes,
+        /// the transaction that spends them, and the chain tip. Any positive separation will
+        /// do; these scenarios do not depend on confirmation counts.
+        const SCENARIO_BLOCK_SPACING: u32 = 10;
+
+        /// Transaction id of the transaction in which the seeded notes were received. It only
+        /// has to be distinct from the ids the wallet generates for its own transactions.
+        const NOTE_FUNDING_TXID: [u8; 32] = [0xf0; 32];
+
+        /// `note_version` for a seeded Ironwood note. Ironwood notes are obtained from version
+        /// 3 note plaintexts ([ZIP 2005]), which is what
+        /// `crate::wallet::orchard::note_version_code(NoteVersion::V3)` encodes; that helper is
+        /// not reachable here because it lives behind the `orchard` feature, while the Ironwood
+        /// tables (and these tests) exist regardless of it.
+        ///
+        /// [ZIP 2005]: https://zips.z.cash/zip-2005
+        const IRONWOOD_NOTE_VERSION: i64 = 3;
+
+        /// Placeholder note components. Nothing here decrypts or re-derives the seeded notes,
+        /// so any well-formed value satisfies the columns' `NOT NULL` constraints.
+        const NOTE_DIVERSIFIER: [u8; 11] = [0; 11];
+        const NOTE_COMPONENT: [u8; 32] = [0; 32];
+
+        /// Output/action index of each seeded note. Every seeded note is alone in its pool
+        /// within its transaction, so this satisfies the tables' uniqueness constraints.
+        const NOTE_OUTPUT_INDEX: i64 = 0;
+
+        /// A seeded note is never itself change; each is an ordinary receipt that a later
+        /// transaction spends.
+        const NOTE_IS_CHANGE: bool = false;
+
+        /// The state each scenario starts from: a wallet with two accounts, a transparent
+        /// output belonging to account A, and the internal ids needed to attach spent notes to
+        /// the transaction that created it.
+        struct Scenario {
+            account_a_uuid: AccountUuid,
+            account_a_id: i64,
+            account_b_uuid: AccountUuid,
+            account_b_id: i64,
+            outpoint: OutPoint,
+            /// `transactions.id_tx` of the transaction that created the transparent output.
+            creating_tx_id: i64,
+            /// `transactions.id_tx` of the earlier transaction in which the seeded notes were
+            /// received.
+            note_funding_tx_id: i64,
+        }
+
+        /// Builds the state described by [`Scenario`], leaving `st` holding the wallet.
+        ///
+        /// The transparent output is written through `put_received_transparent_utxo` so that
+        /// its address, script, and creating transaction are exactly what the wallet would
+        /// record for a real output.
+        macro_rules! scenario {
+            ($st:ident) => {{
+                let account_a_uuid = $st.test_account().unwrap().id();
+                let birthday = $st.test_account().unwrap().birthday().height();
+
+                let taddr = *$st
+                    .wallet()
+                    .get_last_generated_address_matching(
+                        account_a_uuid,
+                        UnifiedAddressRequest::AllAvailableKeys,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .transparent()
+                    .unwrap();
+
+                // A second account, so that a scenario can pit two accounts' contributions
+                // against each other.
+                let account_b_birthday = AccountBirthday::from_parts(
+                    ChainState::empty(birthday - 1, BlockHash([0; 32])),
+                    None,
+                );
+                let (account_b_uuid, _) = $st
+                    .wallet_mut()
+                    .create_account("b", &Secret::new(vec![42u8; 32]), &account_b_birthday, None)
+                    .unwrap();
+
+                let note_funding_height = birthday + SCENARIO_BLOCK_SPACING;
+                let created_at = note_funding_height + SCENARIO_BLOCK_SPACING;
+                $st.wallet_mut()
+                    .update_chain_tip(created_at + SCENARIO_BLOCK_SPACING)
+                    .unwrap();
+
+                let outpoint = OutPoint::fake();
+                let utxo = WalletTransparentOutput::from_parts(
+                    outpoint.clone(),
+                    TxOut::new(FUNDED_OUTPUT_ZATS, taddr.script().into()),
+                    Some(created_at),
+                    Some(account_a_uuid),
+                    Some(TransparentKeyScope::EXTERNAL),
+                    None,
+                )
+                .unwrap();
+                $st.wallet_mut()
+                    .put_received_transparent_utxo(&utxo)
+                    .unwrap();
+
+                let conn = &$st.wallet().db().conn;
+                let account_a_id = get_account_ref(conn, account_a_uuid).unwrap().0;
+                let account_b_id = get_account_ref(conn, account_b_uuid).unwrap().0;
+                let creating_tx_id = conn
+                    .query_row(
+                        "SELECT id_tx FROM transactions WHERE txid = :txid",
+                        named_params! { ":txid": &outpoint.hash()[..] },
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                let note_funding_tx_id = insert_note_funding_transaction(conn, note_funding_height);
+
+                Scenario {
+                    account_a_uuid,
+                    account_a_id,
+                    account_b_uuid,
+                    account_b_id,
+                    outpoint,
+                    creating_tx_id,
+                    note_funding_tx_id,
+                }
+            }};
+        }
+
+        /// Records the transaction in which the seeded notes were received, and returns its
+        /// `transactions.id_tx`.
+        fn insert_note_funding_transaction(
+            conn: &rusqlite::Connection,
+            mined_height: BlockHeight,
+        ) -> i64 {
+            conn.execute(
+                "INSERT INTO transactions (txid, mined_height, min_observed_height)
+                 VALUES (:txid, :mined_height, :mined_height)",
+                named_params! {
+                    ":txid": &NOTE_FUNDING_TXID[..],
+                    ":mined_height": u32::from(mined_height),
+                },
+            )
+            .unwrap();
+
+            conn.last_insert_rowid()
+        }
+
+        /// Gives `account_id` an Ironwood note in `funding_tx_id`, and records `spending_tx_id`
+        /// as having spent it.
+        fn spend_an_ironwood_note(
+            conn: &rusqlite::Connection,
+            account_id: i64,
+            funding_tx_id: i64,
+            spending_tx_id: i64,
+            value: i64,
+        ) {
+            conn.execute(
+                "INSERT INTO ironwood_received_notes
+                 (transaction_id, action_index, account_id, diversifier, value, rho, rseed,
+                  is_change, note_version)
+                 VALUES (:tx, :action_index, :account, :diversifier, :value, :note_component,
+                         :note_component, :is_change, :note_version)",
+                named_params! {
+                    ":tx": funding_tx_id,
+                    ":action_index": NOTE_OUTPUT_INDEX,
+                    ":account": account_id,
+                    ":diversifier": &NOTE_DIVERSIFIER[..],
+                    ":value": value,
+                    ":note_component": &NOTE_COMPONENT[..],
+                    ":is_change": NOTE_IS_CHANGE,
+                    ":note_version": IRONWOOD_NOTE_VERSION,
+                },
+            )
+            .unwrap();
+            let note_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO ironwood_received_note_spends
+                 (ironwood_received_note_id, transaction_id)
+                 VALUES (:note_id, :tx)",
+                named_params! { ":note_id": note_id, ":tx": spending_tx_id },
+            )
+            .unwrap();
+        }
+
+        /// Gives `account_id` a Sapling note in `funding_tx_id`, and records `spending_tx_id`
+        /// as having spent it.
+        fn spend_a_sapling_note(
+            conn: &rusqlite::Connection,
+            account_id: i64,
+            funding_tx_id: i64,
+            spending_tx_id: i64,
+            value: i64,
+        ) {
+            conn.execute(
+                "INSERT INTO sapling_received_notes
+                 (transaction_id, output_index, account_id, diversifier, value, rcm, is_change)
+                 VALUES (:tx, :output_index, :account, :diversifier, :value, :note_component,
+                         :is_change)",
+                named_params! {
+                    ":tx": funding_tx_id,
+                    ":output_index": NOTE_OUTPUT_INDEX,
+                    ":account": account_id,
+                    ":diversifier": &NOTE_DIVERSIFIER[..],
+                    ":value": value,
+                    ":note_component": &NOTE_COMPONENT[..],
+                    ":is_change": NOTE_IS_CHANGE,
+                },
+            )
+            .unwrap();
+            let note_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO sapling_received_note_spends
+                 (sapling_received_note_id, transaction_id)
+                 VALUES (:note_id, :tx)",
+                named_params! { ":note_id": note_id, ":tx": spending_tx_id },
+            )
+            .unwrap();
+        }
+
+        /// The funding account the wallet reports for the scenario's transparent output.
+        fn reported_funding_account(
+            conn: &rusqlite::Connection,
+            outpoint: &OutPoint,
+        ) -> Option<AccountUuid> {
+            get_wallet_transparent_output(conn, outpoint, None)
+                .unwrap()
+                .expect("the seeded transparent output is retrievable")
+                .funding_account()
+                .copied()
+        }
+
+        /// Scenario: a transparent output whose creating transaction was funded entirely from
+        /// the Ironwood pool has no funding account at all.
+        ///
+        /// This is the ordinary post-NU6.3 case rather than an exotic one: no value may be
+        /// added to the Orchard pool after the turnstile, so a wallet that has crossed it holds
+        /// its shielded value in Ironwood, and every deshielding transaction it makes is funded
+        /// from there. The output is the wallet's own, created by the wallet's own transaction,
+        /// and yet it reports no account as having funded it.
+        #[test]
+        fn scenario_ironwood_funded_output_reports_no_funding_account() {
+            let mut st = TestBuilder::new()
+                .with_data_store_factory(TestDbFactory::default())
+                .with_account_from_sapling_activation(BlockHash([0; 32]))
+                .build();
+            let scenario = scenario!(st);
+
+            spend_an_ironwood_note(
+                &st.wallet().db().conn,
+                scenario.account_a_id,
+                scenario.note_funding_tx_id,
+                scenario.creating_tx_id,
+                IRONWOOD_INPUT_ZATS,
+            );
+
+            assert_eq!(
+                reported_funding_account(&st.wallet().db().conn, &scenario.outpoint),
+                Some(scenario.account_a_uuid),
+                "the bug: an output funded entirely from Ironwood reports no funding account, \
+                 because the funding-account query counts no Ironwood value",
+            );
+        }
+
+        /// Scenario: on a transaction funded from two pools by two accounts, the account with
+        /// the larger contribution loses to the account with the smaller one.
+        ///
+        /// A transparent output records at most one funding account, chosen as the largest
+        /// contributor. With Ironwood value uncounted, account A's larger Ironwood
+        /// contribution is invisible, so account B wins on the strength of a smaller Sapling
+        /// note. This is worse than the scenario above: the answer is not absent but wrong, and
+        /// nothing downstream can tell that it is.
+        #[test]
+        fn scenario_largest_ironwood_contributor_loses_to_a_smaller_one() {
+            let mut st = TestBuilder::new()
+                .with_data_store_factory(TestDbFactory::default())
+                .with_account_from_sapling_activation(BlockHash([0; 32]))
+                .build();
+            let scenario = scenario!(st);
+
+            spend_an_ironwood_note(
+                &st.wallet().db().conn,
+                scenario.account_a_id,
+                scenario.note_funding_tx_id,
+                scenario.creating_tx_id,
+                IRONWOOD_INPUT_ZATS,
+            );
+            spend_a_sapling_note(
+                &st.wallet().db().conn,
+                scenario.account_b_id,
+                scenario.note_funding_tx_id,
+                scenario.creating_tx_id,
+                MIXED_POOL_SAPLING_INPUT_ZATS,
+            );
+
+            let reported = reported_funding_account(&st.wallet().db().conn, &scenario.outpoint);
+            assert_ne!(
+                reported,
+                Some(scenario.account_b_uuid),
+                "the bug: the smaller Sapling contributor is reported as the funding account, \
+                 because the larger Ironwood contribution is not counted",
+            );
+            assert_eq!(
+                reported,
+                Some(scenario.account_a_uuid),
+                "the largest contributor funds the output, whichever pool it contributed from",
+            );
+        }
     }
 }

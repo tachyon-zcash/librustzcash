@@ -138,7 +138,7 @@ where
     /// derived from that interval by the ZIP 318 ratios. A wallet on the standard grid therefore
     /// gets exactly the ZIP 318 delays, and a wallet configured with a shortened grid gets the same
     /// schedule shape compressed by the same factor, rather than a short grid crossed with
-    /// three-hour delays. Override the delays with [`Self::with_scheduling_delays`].
+    /// ninety-minute delays. Override the delays with [`Self::with_scheduling_delays`].
     pub fn new(
         wallet: &'a W,
         account: <W as InputSource>::AccountId,
@@ -242,7 +242,7 @@ where
     /// the grid from the wallet rather than accepting it here is what makes it impossible for a
     /// migration to anchor to a boundary whose checkpoint the wallet has not retained.
     fn scheduling_params(&self) -> SchedulingParams {
-        let interval = self.wallet.anchor_retention_interval().into();
+        let interval = self.wallet.anchor_retention_interval();
         match self.scheduling_delays {
             Some((transfer_delay, preparation_delay)) => {
                 SchedulingParams::new(interval, transfer_delay, preparation_delay)
@@ -671,7 +671,7 @@ where
     /// checkpoints on, so a transfer committed against a different grid is rejected before its
     /// (by then pruned) checkpoint is looked up.
     fn anchor_bucket_interval(&self) -> AnchorBucketInterval {
-        self.wallet.anchor_retention_interval().into()
+        self.wallet.anchor_retention_interval()
     }
 }
 

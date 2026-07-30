@@ -22,9 +22,10 @@
 //! needs **layers**. A layer is a set of
 //! transactions with no dependencies between them (buildable, provable, and broadcastable in
 //! parallel); a later layer may spend the outputs of an earlier one, but only after they are mined
-//! and a boundary passes, so each extra layer extends the preparation phase by roughly one anchor
-//! bucket. The planner therefore prefers fewer layers (which dominate the wall-clock) over fewer
-//! transactions.
+//! and witnessable, so each extra layer extends the preparation phase by the mining latency plus
+//! the wallet's witness-sync turnaround (only the pool-crossing transfers wait on anchor-bucket
+//! boundaries). The planner therefore prefers fewer layers (which dominate the wall-clock) over
+//! fewer transactions.
 //!
 //! # The strategy
 //!
@@ -67,8 +68,10 @@ use core::fmt;
 /// padded up to this count, so no preparation transaction is distinguishable from another by its
 /// action count, and one transaction handles at most this many notes in total (spends plus outputs).
 ///
+/// Re-exported from [`zcash_protocol::zip318`], which owns the ZIP's specified value.
+///
 /// [ZIP 318]: https://zips.z.cash/zip-0318
-pub const PREP_TX_ACTIONS: usize = 16;
+pub use zcash_protocol::zip318::PREP_TX_ACTIONS;
 
 /// The most funding (or feeder) outputs one transaction produces from a single input: the action
 /// budget less that one input and one change/feeder slot (`16 - 1 - 1`).

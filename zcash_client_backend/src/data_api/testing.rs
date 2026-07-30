@@ -15,11 +15,16 @@ use nonempty::NonEmpty;
 use rand::{CryptoRng, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use secrecy::{ExposeSecret, Secret, SecretVec};
-use shardtree::{ShardTree, error::ShardTreeError, store::memory::MemoryShardStore};
+use shardtree::{
+    ShardTree,
+    error::ShardTreeError,
+    store::{ShardStore as _, memory::MemoryShardStore},
+};
 use subtle::ConditionallySelectable;
 
 use ::sapling::{
     note_encryption::{SaplingDomain, sapling_note_encryption},
+    prover::mock::{MockOutputProver, MockSpendProver},
     util::generate_random_rseed,
     zip32::DiversifiableFullViewingKey,
 };
@@ -64,6 +69,13 @@ use super::{
         propose_send_max_transfer, propose_standard_transfer_to_address, propose_transfer,
     },
 };
+
+fn real_test_prover() -> &'static LocalTxProver {
+    use std::sync::OnceLock;
+
+    static PROVER: OnceLock<LocalTxProver> = OnceLock::new();
+    PROVER.get_or_init(LocalTxProver::bundled)
+}
 use crate::{
     data_api::{
         MaxSpendMode, OutputLockStore, TargetValue,
@@ -126,6 +138,7 @@ pub struct TransactionSummary<AccountId> {
     memo_count: usize,
     expired_unmined: bool,
     is_shielding: bool,
+    pool_crossing_value: Option<Zatoshis>,
 }
 
 impl<AccountId> TransactionSummary<AccountId> {
@@ -150,6 +163,7 @@ impl<AccountId> TransactionSummary<AccountId> {
         memo_count: usize,
         expired_unmined: bool,
         is_shielding: bool,
+        pool_crossing_value: Option<Zatoshis>,
     ) -> Self {
         Self {
             account_id,
@@ -167,6 +181,7 @@ impl<AccountId> TransactionSummary<AccountId> {
             memo_count,
             expired_unmined,
             is_shielding,
+            pool_crossing_value,
         }
     }
 
@@ -267,6 +282,33 @@ impl<AccountId> TransactionSummary<AccountId> {
     /// above metrics.
     pub fn is_shielding(&self) -> bool {
         self.is_shielding
+    }
+
+    /// Returns `true` if this is detectably a wallet-internal transfer that moves the
+    /// account's own funds between shielded pools (for example, a ZIP 318
+    /// Orchard -> Ironwood migration transfer).
+    ///
+    /// Specifically, `true` means that at a minimum:
+    /// - Every wallet-spent note and wallet-received output is shielded.
+    /// - The transaction spends at least one of the account's notes.
+    /// - At least one output was received in a pool the account spent nothing from.
+    /// - We do not know about any external outputs of the transaction.
+    ///
+    /// A payment that returns value to one of the wallet's own addresses is classified
+    /// once the wallet has observed the returned output (which the scanner marks as
+    /// change); while such a transaction is unmined it is treated as an ordinary payment.
+    ///
+    /// This is exactly the condition that [`Self::pool_crossing_value`] is `Some`; the
+    /// crossed amount is what identifies the transaction, so it is the only thing stored.
+    pub fn is_pool_crossing(&self) -> bool {
+        self.pool_crossing_value.is_some()
+    }
+
+    /// Returns the total value received in pools the account did not spend from, which
+    /// is the amount that crossed pools, when this is a pool-crossing transaction as described
+    /// by [`Self::is_pool_crossing`], or `None` otherwise.
+    pub fn pool_crossing_value(&self) -> Option<Zatoshis> {
+        self.pool_crossing_value
     }
 }
 
@@ -1017,12 +1059,8 @@ where
         #[cfg(feature = "orchard")]
         let fallback_change_pool = ShieldedPool::Orchard;
 
-        let change_strategy = standard::SingleOutputChangeStrategy::new(
-            StandardFeeRule::Zip317,
-            None,
-            fallback_change_pool,
-            DustOutputPolicy::default(),
-        );
+        let change_strategy =
+            single_output_change_strategy(StandardFeeRule::Zip317, None, fallback_change_pool);
 
         let request =
             zip321::TransactionRequest::new(vec![Payment::without_memo(to, value)]).unwrap();
@@ -1052,7 +1090,6 @@ where
         InputsT: InputSelector<InputSource = DbT>,
         ChangeT: ChangeStrategy<MetaSource = DbT>,
     {
-        let prover = LocalTxProver::bundled();
         let network = self.network().clone();
 
         let account = self
@@ -1077,8 +1114,8 @@ where
         create_proposed_transactions(
             self.wallet_mut(),
             &network,
-            &prover,
-            &prover,
+            &MockSpendProver,
+            &MockOutputProver,
             &SpendingKeys::from_unified_spending_key(usk.clone()),
             ovk_policy,
             &proposal,
@@ -1328,13 +1365,12 @@ where
     where
         FeeRuleT: FeeRule,
     {
-        let prover = LocalTxProver::bundled();
         let network = self.network().clone();
         create_proposed_transactions(
             self.wallet_mut(),
             &network,
-            &prover,
-            &prover,
+            &MockSpendProver,
+            &MockOutputProver,
             &SpendingKeys::from_unified_spending_key(usk.clone()),
             ovk_policy,
             proposal,
@@ -1390,7 +1426,7 @@ where
     {
         use super::wallet::extract_and_store_transaction_from_pczt;
 
-        let prover = LocalTxProver::bundled();
+        let prover = real_test_prover();
         let (spend_vk, output_vk) = prover.verifying_keys();
 
         extract_and_store_transaction_from_pczt(
@@ -1423,13 +1459,12 @@ where
     {
         use crate::data_api::wallet::shield_transparent_funds;
 
-        let prover = LocalTxProver::bundled();
         let network = self.network().clone();
         shield_transparent_funds(
             self.wallet_mut(),
             &network,
-            &prover,
-            &prover,
+            &MockSpendProver,
+            &MockOutputProver,
             input_selector,
             change_strategy,
             shielding_threshold,
@@ -3044,6 +3079,31 @@ impl InputSource for MockWalletDb {
     type Error = ();
     type NoteRef = u32;
     type AccountId = u32;
+
+    fn anchor_computable(
+        &self,
+        protocol: ShieldedPool,
+        height: BlockHeight,
+    ) -> Result<bool, Self::Error> {
+        match protocol {
+            ShieldedPool::Sapling => Ok(self
+                .sapling_tree
+                .store()
+                .get_checkpoint(&height)
+                .map_err(|_| ())?
+                .is_some()),
+            #[cfg(feature = "orchard")]
+            ShieldedPool::Orchard => Ok(self
+                .orchard_tree
+                .store()
+                .get_checkpoint(&height)
+                .map_err(|_| ())?
+                .is_some()),
+            // The mock maintains no Ironwood tree (and no Orchard tree without the `orchard`
+            // feature), so no anchor is computable there.
+            _ => Ok(false),
+        }
+    }
 
     fn get_spendable_note(
         &self,

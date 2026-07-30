@@ -320,6 +320,95 @@ pub(crate) fn anchor_checkpoints_retained_across_deep_scan<T: ShieldedPoolTester
     }
 }
 
+pub(crate) fn oldest_note_is_selected_first<T: ShieldedPoolTester>() {
+    zcash_client_backend::data_api::testing::pool::oldest_note_is_selected_first::<T, _>(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+/// Runs the empty-boundary retention check at a short interval, so a handful of filler blocks
+/// crosses two boundaries.
+#[cfg(feature = "orchard")]
+pub(crate) fn empty_boundary_blocks_are_checkpointed_and_retained<T: ShieldedPoolTester>() {
+    zcash_client_backend::data_api::testing::pool::empty_boundary_blocks_are_checkpointed_and_retained::<
+        T,
+        _,
+    >(
+        TestDbFactory::default(),
+        BlockCache::new(),
+        AnchorRetentionInterval::custom(NonZeroU32::new(7).expect("nonzero")),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_is_bucketed_and_unpadded() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_is_bucketed_and_unpadded(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_builds_at_empty_boundary_block() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_builds_at_empty_boundary_block(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+/// Deletes every checkpoint record at `height`, simulating a wallet that scanned past NU6.3
+/// activation before boundary checkpointing was repaired and so is permanently missing the
+/// boundary.
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_abandoned_without_anchor_checkpoint() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_abandoned_without_anchor_checkpoint(
+        TestDbFactory::default(),
+        BlockCache::new(),
+        |st, height| {
+            let conn = st.wallet().conn();
+            for table in [
+                "sapling_tree_checkpoints",
+                "orchard_tree_checkpoints",
+                "ironwood_tree_checkpoints",
+                "sapling_tree_retained_checkpoints",
+                "orchard_tree_retained_checkpoints",
+                "ironwood_tree_retained_checkpoints",
+            ] {
+                conn.execute(
+                    &format!("DELETE FROM {table} WHERE checkpoint_id = :height"),
+                    rusqlite::named_params![":height": u32::from(height)],
+                )
+                .expect("checkpoint records can be deleted");
+            }
+        },
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn canonical_crossing_prefers_single_note() {
+    zcash_client_backend::data_api::testing::pool::canonical_crossing_prefers_single_note(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn multi_note_crossing_is_not_bucketed() {
+    zcash_client_backend::data_api::testing::pool::multi_note_crossing_is_not_bucketed(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn self_migration_keeps_spending_orchard() {
+    zcash_client_backend::data_api::testing::pool::self_migration_keeps_spending_orchard(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    )
+}
+
 #[cfg(feature = "orchard")]
 pub(crate) fn pool_crossing_required<P0: ShieldedPoolTester, P1: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::pool_crossing_required::<P0, P1>(
@@ -713,6 +802,7 @@ pub(crate) fn rewind_after_non_contiguous_scan<T: ShieldedPoolTester>() {
     )
 }
 
+#[cfg(feature = "expensive-tests")]
 pub(crate) fn stabilized_note_spendable_after_deep_rewind<T: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::stabilized_note_spendable_after_deep_rewind::<T, _>(
         TestDbFactory::default(),
@@ -720,6 +810,7 @@ pub(crate) fn stabilized_note_spendable_after_deep_rewind<T: ShieldedPoolTester>
     )
 }
 
+#[cfg(feature = "expensive-tests")]
 pub(crate) fn newly_discovered_notes_become_stabilized<T: ShieldedPoolTester>() {
     zcash_client_backend::data_api::testing::pool::newly_discovered_notes_become_stabilized::<T, _>(
         TestDbFactory::default(),
@@ -904,6 +995,22 @@ pub(crate) fn propose_and_build_shielding_coinbase_succeeds<T: ShieldedPoolTeste
 ))]
 pub(crate) fn shielding_coinbase_to_orchard_receiver_delivers_via_ironwood() {
     zcash_client_backend::data_api::testing::pool::shielding_coinbase_to_orchard_receiver_delivers_via_ironwood(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    );
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn orchard_to_ironwood_payment_reports_net_value_delta() {
+    zcash_client_backend::data_api::testing::pool::orchard_to_ironwood_payment_reports_net_value_delta(
+        TestDbFactory::default(),
+        BlockCache::new(),
+    );
+}
+
+#[cfg(feature = "orchard")]
+pub(crate) fn orchard_to_ironwood_self_migration_reports_fee_only_delta() {
+    zcash_client_backend::data_api::testing::pool::orchard_to_ironwood_self_migration_reports_fee_only_delta(
         TestDbFactory::default(),
         BlockCache::new(),
     );

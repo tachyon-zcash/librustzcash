@@ -10,7 +10,89 @@ workspace.
 
 ## [Unreleased]
 
+## [0.22.0-rc.6] - 2026-07-29
+
 ### Added
+- The additive `ignore-expensive-tests` feature, which compiles expensive tests
+  but marks them as ignored for broad `--all-features` test runs.
+- `zcash_client_sqlite::testing::db::TestDbFactory::file_backed`, for tests
+  that require database reopening or multiple connections.
+- The `v_transactions` view has a new `pool_crossing_value` column, which
+  classifies wallet-internal transfers that move an account's own funds between
+  shielded pools (for example, ZIP 318 Orchard -> Ironwood migration transfers)
+  and reports the amount that crossed. It is non-NULL exactly when every
+  wallet-spent note and wallet-received output in the transaction is shielded,
+  the account spent at least one note, at least one output was received in a
+  pool the account spent nothing from, and no external outputs of the
+  transaction are known; its value is then the total received in the pools the
+  account did not spend from. Use `pool_crossing_value IS NOT NULL` as the
+  classification predicate; a separate boolean column would restate that same
+  condition in a second place that could drift.
+
+  For such a transaction `account_balance_delta` is just the negated fee, which
+  is not a useful display quantity; clients should present `pool_crossing_value`
+  as the migrated amount instead of deriving an amount from `total_spent` or
+  `total_received`, both of which overstate the crossing whenever the
+  transaction also returns change to a pool it spent from.
+
+  A payment that returns value to one of the wallet's own addresses is
+  classified once the wallet has observed the returned output (which the
+  scanner marks as change); while such a transaction is unmined it is treated
+  as an ordinary payment.
+
+### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.6`, `zcash_pool_migration 0.1.0-rc.5`.
+- The `pczt-tests` feature flag now also enables this crate's `orchard` and
+  `transparent-inputs` features, which `zcash_client_backend/pczt` forces on in the
+  backend; enabling `pczt-tests` alone no longer fails to compile.
+- `zcash_client_sqlite::testing::db::TestDbFactory::default` and
+  `zcash_client_sqlite::testing::BlockCache::default` now use isolated
+  in-memory SQLite databases.
+
+### Fixed
+- A wallet created by a build that predates the addition of the
+  `anchor_bucket_interval` column to `orchard_ironwood_migrations` no longer
+  fails every scan. The column was added to the `orchard_ironwood_migration_tables`
+  DDL in place; a wallet that had already applied that migration never acquired
+  the column, and the committed-grid query issued by `put_blocks` then failed at
+  prepare time with `no such column: anchor_bucket_interval`, regardless of
+  whether a pool migration was in progress. Because that query runs on every
+  scan, no block could be written and no transaction acquired a mined height. A
+  new `orchard_ironwood_migration_anchor_interval` migration adds the column
+  where it is missing. An existing row is backfilled with the ZIP 318 grid,
+  which is exact on the production network but a reconstruction on a test
+  network, where a migration planned under a custom grid will be reported as
+  `AnchorIntervalMismatch` and must be re-planned.
+- Note selection now draws the oldest eligible notes first, ordering by note
+  commitment tree position (chain order). Previously notes were drawn in
+  scan-discovery order, which for a restored wallet prefers its most recently
+  discovered — typically newest — notes.
+- The `to_address` column of the `v_tx_outputs` view now reports transparent
+  outputs received by the wallet at the transparent receiver address itself,
+  rather than at a unified address containing that receiver, and for outputs
+  the wallet created, the recipient address recorded at transaction
+  construction time now takes precedence over the receiving address.
+  Previously, a payment to one of the wallet's own transparent addresses was
+  reported with the receiving account's unified address as its `to_address`.
+
+## [0.22.0-rc.5] - 2026-07-28
+
+### Added
+- `zcash_client_sqlite::wallet::init::migrations::V_0_20_0`, `V_0_22_0_RC1` and
+  `V_0_22_0_RC2`, the leaf migration sets for the releases published since
+  0.19.0, so that an external migration can anchor against any published state
+  of the migration graph. Release candidates are published crate versions and so
+  are covered here; versions that did not change the migration state relative to
+  the preceding constant are omitted, as before.
+- `zcash_client_sqlite::wallet::init::migrations::ids`, behind the `unstable`
+  feature flag, exposing the identifier of each individual internal migration.
+  External migrations registered via `WalletMigrator::with_external_migrations`
+  can be anchored against a specific internal migration where the per-release
+  constants (such as `migrations::V_0_19_0`) are not precise enough — in
+  particular when depending on schema added since the most recent release. These
+  identifiers are unstable: the set of them changes between releases, so they are
+  intended for development against unreleased schema, with the anchor moved to
+  the release constant that covers it once that release exists.
 - `zcash_client_sqlite::error::SqliteClientError::BackendError` and the
   `zcash_client_sqlite::error::BackendError` it wraps, reported when a
   `zcash_client_backend` error value carries a variant this crate has no
@@ -21,12 +103,50 @@ workspace.
   compilation failure.
 
 ### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.5`,
+  `zcash_pool_migration 0.1.0-rc.4`.
 - Every public error enum in this crate is now `#[non_exhaustive]`, so that
   future variants can be added without a breaking release. A `match` over any
   of them must now include a wildcard arm: `error::SqliteClientError`,
   `FsBlockDbError`, `pool_migration::error::Error`,
   `wallet::commitment_tree::Error`, `wallet::init::WalletMigrationError`, and
   `zewif::ZewifImportError`.
+
+### Fixed
+- Transaction status requests are now generated from explicit, durable
+  observation intent. A sent transaction is queried by txid when this wallet
+  cannot observe one of its shielded spends or outputs, including transactions
+  funded entirely by transparent inputs whose shielded outputs all belong to
+  another wallet. Status intent remains dormant while a transaction is mined
+  and becomes active again after a chain rewind. Redundant status requests
+  previously synthesized for wallet-observable shielded transactions are no
+  longer produced.
+- An Ironwood note received on an account's internal address is now classified as
+  change once the wallet learns that the same account funded the transaction.
+  This was previously applied to Sapling and Orchard notes only, so an Ironwood
+  note recorded before its transaction's spends could be linked to the wallet
+  kept the wrong classification permanently: `v_transactions` counted it in
+  `received_note_count` and `sent_note_count` rather than reporting `has_change`,
+  and `v_tx_outputs` reported the account's own change as a non-change output,
+  which presents it to the user as a recipient of their own transaction. Balances
+  were not affected. Notes already recorded with the wrong classification are
+  repaired on upgrade by a new migration; no rescan is required.
+- An address that had received only Ironwood notes was treated as never having
+  been used. Such an address was still considered unused by the transparent
+  address gap-limit search, so it could be handed out again, and the account
+  that received the note was not reported as being involved in the transaction
+  that paid it. Since NU6.3 every payment to an Orchard receiver is delivered
+  in the Ironwood bundle, so this affected ordinary received payments. A
+  migration corrects the affected view; no caller action is required beyond
+  upgrading.
+- The funding account reported for a transparent output by
+  `zcash_client_backend::wallet::WalletTransparentOutput::funding_account` now
+  takes value spent from the Ironwood pool into account. Ironwood inputs were
+  not counted, so an output whose creating transaction was funded entirely from
+  Ironwood reported no funding account, and one funded from several pools could
+  report an account other than the largest contributor. Post-NU6.3 wallets hold
+  their shielded value in Ironwood, so this affected ordinary spends rather than
+  only unusual ones.
 
 ## [0.22.0-rc.4] - 2026-07-26
 
@@ -355,8 +475,8 @@ workspace.
   `SqliteClientError::CommitmentTree` variant.
 
 ### Changed
-- Migrated to `sapling-crypto 0.7`, `orchard 0.13`, `zcash_encoding 0.4`, 
-  `zcash_protocol 0.8`, `zcash_address 0.11`, `zip321 0.7`, `zcash_transparent 0.7`, 
+- Migrated to `sapling-crypto 0.7`, `orchard 0.13`, `zcash_encoding 0.4`,
+  `zcash_protocol 0.8`, `zcash_address 0.11`, `zip321 0.7`, `zcash_transparent 0.7`,
   `zcash_primitives 0.27`, `zcash_proofs 0.27`, `zcash_keys 0.13`, `pczt 0.6`,
   `zcash_client_backend 0.22`
 - The `accounts` table now stores IVK item caches instead of FVK item caches for

@@ -21,6 +21,7 @@ use zcash_primitives::transaction::TxId;
 use zcash_protocol::{
     PoolType, ShieldedPool,
     consensus::{self, BlockHeight},
+    value::Zatoshis,
 };
 use zip32::Scope;
 
@@ -235,6 +236,56 @@ pub(crate) fn select_spendable_orchard_notes<P: consensus::Parameters>(
         confirmations_policy,
         exclude,
         ShieldedPool::Orchard,
+        to_received_note,
+        lock_filter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_single_spendable_orchard_note<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    account: AccountUuid,
+    value: Zatoshis,
+    target_height: TargetHeight,
+    confirmations_policy: ConfirmationsPolicy,
+    exclude: &[ReceivedNoteId],
+    lock_filter: LockFilter<'_>,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError> {
+    super::common::select_single_spendable_note(
+        conn,
+        params,
+        account,
+        value,
+        target_height,
+        confirmations_policy,
+        exclude,
+        ShieldedPool::Orchard,
+        to_received_note,
+        lock_filter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_single_spendable_ironwood_note<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    account: AccountUuid,
+    value: Zatoshis,
+    target_height: TargetHeight,
+    confirmations_policy: ConfirmationsPolicy,
+    exclude: &[ReceivedNoteId],
+    lock_filter: LockFilter<'_>,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError> {
+    super::common::select_single_spendable_note(
+        conn,
+        params,
+        account,
+        value,
+        target_height,
+        confirmations_policy,
+        exclude,
+        ShieldedPool::Ironwood,
         to_received_note,
         lock_filter,
     )
@@ -868,13 +919,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn empty_boundary_blocks_are_checkpointed_and_retained() {
+        testing::pool::empty_boundary_blocks_are_checkpointed_and_retained::<OrchardPoolTester>()
+    }
+
+    #[test]
     fn scan_cached_blocks_detects_spends_out_of_order() {
         testing::pool::scan_cached_blocks_detects_spends_out_of_order::<OrchardPoolTester>()
     }
 
     #[test]
+    fn oldest_note_is_selected_first() {
+        testing::pool::oldest_note_is_selected_first::<OrchardPoolTester>()
+    }
+
+    #[test]
     fn metadata_queries_exclude_unwanted_notes() {
         testing::pool::metadata_queries_exclude_unwanted_notes::<OrchardPoolTester>()
+    }
+
+    #[test]
+    fn canonical_crossing_is_bucketed_and_unpadded() {
+        testing::pool::canonical_crossing_is_bucketed_and_unpadded()
+    }
+
+    #[test]
+    fn canonical_crossing_builds_at_empty_boundary_block() {
+        testing::pool::canonical_crossing_builds_at_empty_boundary_block()
+    }
+
+    #[test]
+    fn canonical_crossing_prefers_single_note() {
+        testing::pool::canonical_crossing_prefers_single_note()
+    }
+
+    #[test]
+    fn canonical_crossing_abandoned_without_anchor_checkpoint() {
+        testing::pool::canonical_crossing_abandoned_without_anchor_checkpoint()
+    }
+
+    #[test]
+    fn multi_note_crossing_is_not_bucketed() {
+        testing::pool::multi_note_crossing_is_not_bucketed()
+    }
+
+    #[test]
+    fn self_migration_keeps_spending_orchard() {
+        testing::pool::self_migration_keeps_spending_orchard()
     }
 
     #[test]
@@ -1018,6 +1109,16 @@ pub(crate) mod tests {
     #[test]
     fn propose_v5_payment_to_orchard_receiver_is_rejected() {
         testing::pool::propose_v5_payment_to_orchard_receiver_is_rejected();
+    }
+
+    #[test]
+    fn orchard_to_ironwood_payment_reports_net_value_delta() {
+        testing::pool::orchard_to_ironwood_payment_reports_net_value_delta();
+    }
+
+    #[test]
+    fn orchard_to_ironwood_self_migration_reports_fee_only_delta() {
+        testing::pool::orchard_to_ironwood_self_migration_reports_fee_only_delta();
     }
 
     /// `put_received_note` records a note in the received-notes table chosen by the caller,
@@ -1211,12 +1312,12 @@ pub(crate) mod tests {
                 Account, WalletRead,
                 testing::{
                     AddressType, IronwoodFvk, TestBuilder, orchard::OrchardPoolTester,
-                    pool::ShieldedPoolTester,
+                    pool::ShieldedPoolTester, single_output_change_strategy,
                 },
                 wallet::ConfirmationsPolicy,
                 wallet::input_selection::GreedyInputSelector,
             },
-            fees::{DustOutputPolicy, StandardFeeRule, standard},
+            fees::StandardFeeRule,
             wallet::OvkPolicy,
         };
         use zcash_keys::address::Address;
@@ -1274,12 +1375,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let fee_rule = StandardFeeRule::Zip317;
-        let change_strategy = standard::SingleOutputChangeStrategy::new(
-            fee_rule,
-            None,
-            ShieldedPool::Orchard,
-            DustOutputPolicy::default(),
-        );
+        let change_strategy = single_output_change_strategy(fee_rule, None, ShieldedPool::Orchard);
         let input_selector = GreedyInputSelector::new();
 
         let proposal = st
@@ -1383,13 +1479,13 @@ pub(crate) mod tests {
                 Account, WalletRead,
                 testing::{
                     AddressType, IronwoodFvk, TestBuilder, orchard::OrchardPoolTester,
-                    pool::ShieldedPoolTester,
+                    pool::ShieldedPoolTester, single_output_change_strategy,
                 },
                 wallet::ConfirmationsPolicy,
                 wallet::input_selection::GreedyInputSelector,
             },
             decrypt_transaction,
-            fees::{DustOutputPolicy, StandardFeeRule, standard},
+            fees::StandardFeeRule,
             wallet::OvkPolicy,
         };
         use zcash_keys::address::Address;
@@ -1441,12 +1537,8 @@ pub(crate) mod tests {
         )])
         .unwrap();
 
-        let change_strategy = standard::SingleOutputChangeStrategy::new(
-            StandardFeeRule::Zip317,
-            None,
-            ShieldedPool::Orchard,
-            DustOutputPolicy::default(),
-        );
+        let change_strategy =
+            single_output_change_strategy(StandardFeeRule::Zip317, None, ShieldedPool::Orchard);
         let input_selector = GreedyInputSelector::new();
         let proposal = st
             .propose_transfer(

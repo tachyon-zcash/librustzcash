@@ -406,7 +406,7 @@ where
                 .map_err(PutBlocksError::Storage)?;
 
             // Mark notes as spent and remove them from the scanning cache
-            mark_notes_spent(
+            let _ = mark_notes_spent(
                 wallet_db,
                 tx_ref,
                 #[cfg(feature = "transparent-inputs")]
@@ -624,7 +624,11 @@ where
 /// - `anchor_retention`: If `Some(retention)`, the checkpoints the policy
 ///   [retains](AnchorRetention::retains) — those at or above its floor that fall on its interval —
 ///   are kept as durable anchors, exempting them from automatic pruning of excess checkpoints.
-///   `None` disables anchor retention.
+///   A checkpoint is CREATED at every retained height in the scanned range that would not
+///   otherwise receive one: scanning only checkpoints a block at its last note commitment, so a
+///   boundary block containing no shielded outputs in any pool would otherwise leave a permanent
+///   hole in the retained grid, and the anchor there could never be proved against. `None`
+///   disables anchor retention.
 pub fn put_blocks<DbT, SE, TE>(
     wallet_db: &mut DbT,
     #[cfg(feature = "transparent-inputs")] gap_limits: GapLimits,
@@ -682,6 +686,14 @@ where
         // Ensure that we have the same set of checkpoints across all trees. Each tree must gain a
         // checkpoint at every height that is checkpointed in any of the other trees, so the set of
         // heights to ensure for a given tree is the union of the checkpoint heights of the others.
+        //
+        // The heights the anchor-retention policy retains within this batch are added to every
+        // pool's ensure set. Scanning checkpoints a block only at its last note commitment, so a
+        // grid boundary landing on a block with no shielded outputs in ANY pool would otherwise
+        // never be checkpointed at all — and a retention policy can only keep alive a checkpoint
+        // that exists. The ensured checkpoint carries the tree state as of the last commitment at
+        // or before the boundary, which is exactly the state a ZIP 318 anchor at that height
+        // commits to.
         #[cfg(feature = "orchard")]
         let (
             missing_sapling_checkpoints,
@@ -692,11 +704,19 @@ where
             let orchard_checkpoint_positions = checkpoint_positions(&orchard_subtrees);
             let ironwood_checkpoint_positions = checkpoint_positions(&ironwood_subtrees);
 
-            let [ensure_sapling, ensure_orchard, ensure_ironwood] = cross_pool_ensure_heights(
-                &sapling_checkpoint_positions.keys().copied().collect(),
-                &orchard_checkpoint_positions.keys().copied().collect(),
-                &ironwood_checkpoint_positions.keys().copied().collect(),
-            );
+            let retained_heights = anchor_retention.map_or_else(BTreeSet::new, |retention| {
+                retention.retained_in_range(from_state.block_height() + 1..=last_scanned_height)
+            });
+
+            let [mut ensure_sapling, mut ensure_orchard, mut ensure_ironwood] =
+                cross_pool_ensure_heights(
+                    &sapling_checkpoint_positions.keys().copied().collect(),
+                    &orchard_checkpoint_positions.keys().copied().collect(),
+                    &ironwood_checkpoint_positions.keys().copied().collect(),
+                );
+            ensure_sapling.extend(retained_heights.iter().copied());
+            ensure_orchard.extend(retained_heights.iter().copied());
+            ensure_ironwood.extend(retained_heights.iter().copied());
 
             (
                 ensure_checkpoints(
@@ -925,7 +945,7 @@ where
         wallet_db.set_transaction_status(d_tx.tx().txid(), TransactionStatus::Mined(height))?;
     }
 
-    mark_notes_spent(
+    let has_wallet_shielded_spend = mark_notes_spent(
         wallet_db,
         tx_ref,
         #[cfg(feature = "transparent-inputs")]
@@ -1078,20 +1098,16 @@ where
         wallet_db.queue_transparent_input_retrieval(tx_ref, &d_tx)?
     }
 
+    // Receiving complete transaction data satisfies enhancement intent, but must not erase a
+    // durable status-observation intent created when the transaction was sent.
     wallet_db.delete_retrieval_queue_entries(d_tx.tx().txid())?;
 
-    // If the decrypted transaction is unmined and has no shielded components, add it to
-    // the queue for status retrieval.
-    #[cfg(feature = "transparent-inputs")]
+    // A shielded bundle is observable through compact-block scanning only when this wallet can
+    // match one of its real nullifiers or decrypt one of its outputs. Transactions without either
+    // capability require explicit status observation by txid.
+    if d_tx.mined_height().is_none() && !(has_wallet_shielded_spend || d_tx.has_decrypted_outputs())
     {
-        let detectable_via_scanning = d_tx.tx().sapling_bundle().is_some();
-        #[cfg(feature = "orchard")]
-        let detectable_via_scanning =
-            detectable_via_scanning | d_tx.tx().orchard_bundle().is_some();
-
-        if d_tx.mined_height().is_none() && !detectable_via_scanning {
-            wallet_db.queue_tx_retrieval(std::iter::once(d_tx.tx().txid()), None)?
-        }
+        wallet_db.queue_tx_status(d_tx.tx().txid())?;
     }
 
     Ok(())
@@ -1214,10 +1230,12 @@ fn mark_notes_spent<'a, DbT>(
     sapling_nfs: impl Iterator<Item = &'a sapling::Nullifier>,
     #[cfg(feature = "orchard")] orchard_nfs: impl Iterator<Item = &'a orchard::note::Nullifier>,
     #[cfg(feature = "orchard")] ironwood_nfs: impl Iterator<Item = &'a orchard::note::Nullifier>,
-) -> Result<(), <DbT as LowLevelWalletRead>::Error>
+) -> Result<bool, <DbT as LowLevelWalletRead>::Error>
 where
     DbT: LowLevelWalletWrite,
 {
+    let mut has_wallet_shielded_spend = false;
+
     // If any of the utxos spent in the transaction are ours, mark them as spent.
     #[cfg(feature = "transparent-inputs")]
     for outpoint in transparent_prevouts {
@@ -1226,22 +1244,22 @@ where
 
     // Mark Sapling notes as spent when we observe their nullifiers.
     for nf in sapling_nfs {
-        wallet_db.mark_sapling_note_spent(nf, tx_ref)?;
+        has_wallet_shielded_spend |= wallet_db.mark_sapling_note_spent(nf, tx_ref)?;
     }
 
     // Mark Orchard notes as spent when we observe their nullifiers.
     #[cfg(feature = "orchard")]
     for nf in orchard_nfs {
-        wallet_db.mark_orchard_note_spent(nf, tx_ref)?;
+        has_wallet_shielded_spend |= wallet_db.mark_orchard_note_spent(nf, tx_ref)?;
     }
 
     // Mark Ironwood notes as spent when we observe their nullifiers.
     #[cfg(feature = "orchard")]
     for nf in ironwood_nfs {
-        wallet_db.mark_ironwood_note_spent(nf, tx_ref)?;
+        has_wallet_shielded_spend |= wallet_db.mark_ironwood_note_spent(nf, tx_ref)?;
     }
 
-    Ok(())
+    Ok(has_wallet_shielded_spend)
 }
 
 #[allow(clippy::too_many_arguments)]
