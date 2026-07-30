@@ -7,6 +7,40 @@ and this library adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Changed
+- `engine::MigrationState::next_step` now returns a due `AdvanceStep::Broadcast`
+  in preference to `AdvanceStep::Prove` (previously the reverse), so a wallet
+  that wakes to find a transaction ready to broadcast can submit it and end the
+  session without syncing; proving work is surfaced only once no broadcast is
+  due.
+- `state::AdvanceStep::Prove` now also carries the transaction's
+  `engine::MigrationTxKind`, so a consumer can tell without a lookup whether it
+  is proving a preparation transaction — by construction due on its broadcast
+  schedule, so broadcastable at the same wake-up once proved — or a transfer,
+  whose broadcast follows at its own scheduled height. Match with
+  `AdvanceStep::Prove { id, kind }`.
+
+## [0.1.0-rc.5] - 2026-07-29
+
+### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.6`.
+- `scheduling::SchedulingParams::ZIP_318` adopts the revised ZIP 318 timing:
+  transfer delays now have a mean of 66 blocks (previously 144) and
+  preparation delays a mean of 16 blocks (previously a provisional 24), with
+  both caps unchanged; the preparation delay is now defined by
+  `zcash_protocol::zip318::{PREP_DELAY_MEAN, PREP_DELAY_CAP}`. The re-exported
+  `scheduling::ANCHOR_AGE_CAP` is now 4 boundaries (previously 16).
+- `scheduling::SchedulingParams::new_with_default_distributions` now scales
+  each ZIP 318 delay mean and cap by the ratio of the given interval to the
+  ZIP 318 one, instead of deriving the delays from fixed cap/mean ratios.
+
+### Removed
+- `scheduling::DELAY_CAP_RATIO` and `scheduling::PREP_MEAN_DIVISOR`; the
+  revised ZIP 318 delay parameters are no longer related by fixed ratios. Read
+  the means and caps from a `SchedulingParams` instead.
+
+## [0.1.0-rc.4] - 2026-07-28
+
 ### Added
 - `zcash_pool_migration::build::AccountDerivation`, the ZIP 32 account whose
   spending key authorizes a migration's Orchard spends. Behind the `orchard`
@@ -19,6 +53,19 @@ and this library adheres to Rust's notion of
   committed migration's transfers that still need proofs.
 
 ### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.5`.
+- The ZIP 318 constants this crate defined are now defined by `zcash_protocol::zip318`
+  and re-exported from their existing paths. `denomination::MIGRATION_MAX_DENOMINATION_ZEC`
+  is renamed to `denomination::DENOM_CAP` and `denomination::RESIDUAL_MIGRATION_MIN` to
+  `denomination::MAX_RESIDUAL_VALUE`; `scheduling::{AnchorBucketInterval, DELAY_CAP_RATIO,
+  ANCHOR_AGE_CAP, EXPIRY_MODULUS, EXPIRY_WINDOW}` and `preparation::PREP_TX_ACTIONS` keep
+  their paths and values, as does `scheduling::expiry_height`.
+- `denomination::DENOM_CAP` is a `Zatoshis` rather than a count of whole ZEC, and
+  `CanonicalOneTwoFive::new` takes its maximum denomination as a `Zatoshis`. Pass the
+  `Zatoshis` directly and drop any `* COIN`.
+- `scheduling::AnchorBucketInterval` and `zcash_client_backend`'s
+  `AnchorRetentionInterval` are now the same type; the `From` conversion between them is
+  gone. Remove any `.into()` at that boundary.
 - `zcash_pool_migration::build::{build_prep_tx, build_transfer_pczt}` take an
   additional `Option<&AccountDerivation>` argument, before the RNG. When it is
   supplied, every spend the built transaction still needs a signature for is

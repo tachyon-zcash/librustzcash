@@ -17,6 +17,7 @@ use zcash_protocol::{
     value::{BalanceError, Zatoshis},
 };
 
+use crate::data_api::anchor_retention::PoolMigrationParams;
 use crate::data_api::{InputSource, wallet::TargetHeight};
 
 pub mod common;
@@ -210,6 +211,43 @@ impl ChangeValue {
     }
 }
 
+/// Orchard actions in a canonical ZIP 318 crossing: the spend and its change, or a padding dummy
+/// when the note's value exactly covers the crossing and its fee.
+#[cfg(feature = "orchard")]
+const CANONICAL_CROSSING_ORCHARD_ACTIONS: usize = 2;
+
+/// Ironwood actions in a canonical ZIP 318 crossing: the single unpadded output.
+#[cfg(feature = "orchard")]
+const CANONICAL_CROSSING_IRONWOOD_ACTIONS: usize = 1;
+
+/// The fee a canonical ZIP 318 crossing pays at `target_height`, obtained by asking the STANDARD
+/// ZIP 317 rule what the canonical shape costs.
+///
+/// ZIP 318 requires this exact fee. Any other value partitions the anonymity set, so a transaction
+/// paying a non-standard fee is not a canonical crossing however well its structure matches. The
+/// standard rule is used rather than the caller's: a proposal built on a fixed non-standard rule
+/// would otherwise be compared against its own fee and always agree.
+#[cfg(feature = "orchard")]
+pub fn canonical_crossing_fee<P: consensus::Parameters>(
+    params: &P,
+    target_height: BlockHeight,
+) -> Result<Zatoshis, zcash_primitives::transaction::fees::zip317::FeeError> {
+    use zcash_primitives::transaction::fees::{
+        FeeRule as _, transparent::InputSize, zip317::FeeRule,
+    };
+
+    FeeRule::standard().fee_required(
+        params,
+        target_height,
+        std::iter::empty::<InputSize>(),
+        std::iter::empty::<usize>(),
+        0,
+        0,
+        CANONICAL_CROSSING_ORCHARD_ACTIONS,
+        CANONICAL_CROSSING_IRONWOOD_ACTIONS,
+    )
+}
+
 /// The amount of change and fees required to make a transaction's inputs and
 /// outputs balance under a specific fee rule, as computed by a particular
 /// [`ChangeStrategy`] that is aware of that rule.
@@ -221,6 +259,55 @@ pub struct TransactionBalance {
     // A cache for the sum of proposed change and fee; we compute it on construction anyway, so we
     // cache the resulting value.
     total: Zatoshis,
+
+    // The exact number of dummy outputs in each shielded bundle this balance was costed for.
+    // `None` is retained for compatibility with callers and serialized proposals that predate
+    // explicit transaction-shape modelling.
+    dummy_outputs: Option<DummyOutputCounts>,
+}
+
+/// The number of dummy outputs in each shielded value pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DummyOutputCounts {
+    sapling: usize,
+    #[cfg(feature = "orchard")]
+    orchard: usize,
+    #[cfg(feature = "orchard")]
+    ironwood: usize,
+}
+
+impl DummyOutputCounts {
+    /// Constructs per-pool dummy-output counts.
+    pub fn new(
+        sapling: usize,
+        #[cfg(feature = "orchard")] orchard: usize,
+        #[cfg(feature = "orchard")] ironwood: usize,
+    ) -> Self {
+        Self {
+            sapling,
+            #[cfg(feature = "orchard")]
+            orchard,
+            #[cfg(feature = "orchard")]
+            ironwood,
+        }
+    }
+
+    /// Returns the number of Sapling dummy outputs.
+    pub fn sapling(&self) -> usize {
+        self.sapling
+    }
+
+    /// Returns the number of Orchard dummy outputs.
+    #[cfg(feature = "orchard")]
+    pub fn orchard(&self) -> usize {
+        self.orchard
+    }
+
+    /// Returns the number of Ironwood dummy outputs.
+    #[cfg(feature = "orchard")]
+    pub fn ironwood(&self) -> usize {
+        self.ironwood
+    }
 }
 
 impl TransactionBalance {
@@ -240,7 +327,19 @@ impl TransactionBalance {
             proposed_change,
             fee_required,
             total,
+            dummy_outputs: None,
         })
+    }
+
+    /// Records the exact dummy-output counts this balance was computed for.
+    pub fn with_dummy_outputs(mut self, dummy_outputs: DummyOutputCounts) -> Self {
+        self.dummy_outputs = Some(dummy_outputs);
+        self
+    }
+
+    /// Returns the exact dummy-output counts this balance was computed for, when recorded.
+    pub fn dummy_outputs(&self) -> Option<DummyOutputCounts> {
+        self.dummy_outputs
     }
 
     /// The change values proposed by the [`ChangeStrategy`] that computed this balance.
@@ -644,6 +743,8 @@ pub trait ChangeStrategy {
         &self,
         params: &P,
         target_height: TargetHeight,
+        anchor_height: BlockHeight,
+        zip318: &PoolMigrationParams,
         transparent_inputs: &[impl transparent::InputView],
         transparent_outputs: &[impl transparent::OutputView],
         sapling: &impl sapling::BundleView<NoteRefT>,
@@ -659,6 +760,22 @@ pub(crate) mod tests {
     use ::transparent::bundle::{OutPoint, TxOut};
     use zcash_primitives::transaction::fees::transparent;
     use zcash_protocol::value::Zatoshis;
+
+    /// The canonical crossing fee is three ZIP 317 marginal fees: the Orchard bundle's two actions
+    /// plus the single unpadded Ironwood one, which together exceed the grace allowance. Pinning it
+    /// means a change to the marginal fee or to the canonical shape surfaces here rather than
+    /// silently reclassifying transactions.
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn canonical_crossing_fee_is_three_marginal_fees() {
+        use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
+        use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK};
+
+        let fee = super::canonical_crossing_fee(&MAIN_NETWORK, BlockHeight::from_u32(2_000_000))
+            .expect("the canonical shape is a valid input to the ZIP 317 rule");
+        assert_eq!(fee, (MARGINAL_FEE * 3u64).expect("a valid amount"));
+        assert_eq!(u64::from(fee), 15_000);
+    }
 
     use super::sapling;
 

@@ -66,7 +66,7 @@ use nonempty::NonEmpty;
 use secrecy::SecretVec;
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Debug,
+    fmt::{self, Debug},
     hash::Hash,
     io,
     num::{NonZeroU32, TryFromIntError},
@@ -1171,6 +1171,75 @@ impl<NoteRef> ReceivedNotes<NoteRef> {
             .ok_or(BalanceError::Overflow);
     }
 
+    /// Returns whether the collection contains no notes in any pool.
+    pub fn is_empty(&self) -> bool {
+        #[cfg(not(feature = "orchard"))]
+        return self.sapling.is_empty();
+
+        #[cfg(feature = "orchard")]
+        return self.sapling.is_empty() && self.orchard.is_empty() && self.ironwood.is_empty();
+    }
+
+    /// Consumes this collection, returning one holding only the OLDEST single note whose value
+    /// alone is at least `value`, drawn from the first pool in `sources` that holds one; the
+    /// result is empty when no single note qualifies. Age is the note's commitment tree
+    /// position, which is assigned in strict chain order.
+    ///
+    /// This is the best-effort reduction behind the default implementation of
+    /// [`InputSource::select_single_spendable_note`]: it can only choose among the notes it
+    /// holds, so a covering note the producing selection did not surface cannot be found here.
+    pub fn into_single_covering(mut self, value: Zatoshis, sources: &[ShieldedPool]) -> Self {
+        fn take_oldest_covering<NoteRef, N>(
+            notes: &mut Vec<ReceivedNote<NoteRef, N>>,
+            covers: impl Fn(&ReceivedNote<NoteRef, N>) -> bool,
+        ) -> Option<ReceivedNote<NoteRef, N>> {
+            let idx = notes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| covers(n))
+                .min_by_key(|(_, n)| n.note_commitment_tree_position())
+                .map(|(idx, _)| idx)?;
+            Some(notes.swap_remove(idx))
+        }
+
+        for pool in sources {
+            match pool {
+                ShieldedPool::Sapling => {
+                    if let Some(note) = take_oldest_covering(&mut self.sapling, |n| {
+                        n.note_value().is_ok_and(|v| v >= value)
+                    }) {
+                        return Self::new(
+                            vec![note],
+                            #[cfg(feature = "orchard")]
+                            vec![],
+                            #[cfg(feature = "orchard")]
+                            vec![],
+                        );
+                    }
+                }
+                #[cfg(feature = "orchard")]
+                ShieldedPool::Orchard => {
+                    if let Some(note) = take_oldest_covering(&mut self.orchard, |n| {
+                        n.note_value().is_ok_and(|v| v >= value)
+                    }) {
+                        return Self::new(vec![], vec![note], vec![]);
+                    }
+                }
+                #[cfg(feature = "orchard")]
+                ShieldedPool::Ironwood => {
+                    if let Some(note) = take_oldest_covering(&mut self.ironwood, |n| {
+                        n.note_value().is_ok_and(|v| v >= value)
+                    }) {
+                        return Self::new(vec![], vec![], vec![note]);
+                    }
+                }
+                #[cfg(not(feature = "orchard"))]
+                ShieldedPool::Orchard | ShieldedPool::Ironwood => {}
+            }
+        }
+        Self::empty()
+    }
+
     /// Consumes this [`ReceivedNotes`] value and produces a vector of
     /// [`ReceivedNote<NoteRef, Note>`] values.
     pub fn into_vec(
@@ -1712,6 +1781,23 @@ pub trait InputSource {
         lock_filter: LockFilter<'_>,
     ) -> Result<Option<ReceivedNote<Self::NoteRef, Note>>, Self::Error>;
 
+    /// Returns whether an anchor is COMPUTABLE at `height` for spends from the given pool: whether
+    /// this data source can produce the note commitment tree root, and witnesses to it, as of the
+    /// end of that block.
+    ///
+    /// A height inside the wallet's scanned range need not qualify: tree states are only
+    /// materialized at the heights the wallet chose to retain, and a wallet that scanned past
+    /// NU6.3 activation before boundary checkpointing was repaired is permanently missing the
+    /// anchor-retention boundaries whose blocks carried no shielded outputs. Such a hole cannot be
+    /// backfilled from local state, so a caller deciding whether to anchor at a retained boundary
+    /// should consult this before committing to it, and fall back rather than propose a
+    /// transaction that cannot be built.
+    fn anchor_computable(
+        &self,
+        protocol: ShieldedPool,
+        height: BlockHeight,
+    ) -> Result<bool, Self::Error>;
+
     /// Returns a list of spendable notes sufficient to cover the specified target value, if
     /// possible. Only spendable notes corresponding to the specified shielded protocol will
     /// be included. Locked outputs are selected according to `lock_filter` (see [`LockFilter`];
@@ -1727,6 +1813,43 @@ pub trait InputSource {
         exclude: &[Self::NoteRef],
         lock_filter: LockFilter<'_>,
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error>;
+
+    /// Returns the OLDEST single spendable note whose value alone is at least `value`, drawn
+    /// from the first pool in `sources` (in the given preference order) that holds one. The
+    /// returned collection contains at most one note; it is empty when no single eligible note
+    /// covers the value.
+    ///
+    /// This is the selection primitive behind
+    /// [`NoteSelection::PreferSingle`](crate::data_api::wallet::input_selection::NoteSelection):
+    /// a ZIP 318 migration transfer spends exactly one note, so a canonical pool crossing must
+    /// be funded from one.
+    ///
+    /// The default implementation is BEST-EFFORT: it reports a note only when
+    /// [`Self::select_spendable_notes`] happens to surface one that covers the value on its
+    /// own. An implementation backed by a queryable store should override it with a direct
+    /// query, so that a covering note is found whenever one exists.
+    #[allow(clippy::too_many_arguments)]
+    fn select_single_spendable_note(
+        &self,
+        account: Self::AccountId,
+        value: Zatoshis,
+        sources: &[ShieldedPool],
+        target_height: TargetHeight,
+        confirmations_policy: ConfirmationsPolicy,
+        exclude: &[Self::NoteRef],
+        lock_filter: LockFilter<'_>,
+    ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
+        self.select_spendable_notes(
+            account,
+            TargetValue::AtLeast(value),
+            sources,
+            target_height,
+            confirmations_policy,
+            exclude,
+            lock_filter,
+        )
+        .map(|notes| notes.into_single_covering(value, sources))
+    }
 
     /// Returns the list of notes belonging to the wallet that are unspent as of the specified
     /// target height. Locked outputs are selected according to `lock_filter` (see [`LockFilter`];
@@ -2099,6 +2222,18 @@ pub trait WalletRead {
     /// [`AnchorRetentionInterval::ZIP_318`]: anchor_retention::AnchorRetentionInterval::ZIP_318
     fn anchor_retention_interval(&self) -> anchor_retention::AnchorRetentionInterval {
         anchor_retention::AnchorRetentionInterval::ZIP_318
+    }
+
+    /// Returns the ZIP 318 pool-migration parameters in force for this wallet: the specified
+    /// values, with the anchor bucket grid taken from [`Self::anchor_retention_interval`].
+    ///
+    /// Every decision that depends on the grid must consult this rather than the network defaults,
+    /// so that a wallet retaining a non-standard interval is treated consistently: bucketing an
+    /// anchor and judging the resulting transaction a canonical crossing are the same question
+    /// asked twice, and they must be asked of the same grid. Overriding
+    /// [`Self::anchor_retention_interval`] is sufficient; this composes it.
+    fn pool_migration_params(&self) -> anchor_retention::PoolMigrationParams {
+        anchor_retention::PoolMigrationParams::new(self.anchor_retention_interval())
     }
 
     /// Returns the block hash for the block at the given height, if the
@@ -3154,10 +3289,36 @@ pub struct AccountBirthday {
 }
 
 /// Errors that can occur in the construction of an [`AccountBirthday`] from a [`TreeState`].
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum BirthdayError {
+    /// The block height of the [`TreeState`] was out of range for a [`BlockHeight`].
     HeightInvalid(TryFromIntError),
+    /// The note commitment tree frontiers of the [`TreeState`] could not be decoded.
     Decode(io::Error),
+}
+
+impl fmt::Display for BirthdayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BirthdayError::HeightInvalid(e) => {
+                write!(f, "Invalid block height for account birthday: {e}")
+            }
+            BirthdayError::Decode(e) => write!(
+                f,
+                "Failed to decode the note commitment tree state for the account birthday: {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BirthdayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BirthdayError::HeightInvalid(e) => Some(e),
+            BirthdayError::Decode(e) => Some(e),
+        }
+    }
 }
 
 impl From<TryFromIntError> for BirthdayError {

@@ -86,6 +86,7 @@ use zcash_protocol::{
     ShieldedPool,
     consensus::{self, BlockHeight, TxIndex},
     memo::Memo,
+    value::Zatoshis,
 };
 use zip32::{DiversifierIndex, fingerprint::SeedFingerprint};
 
@@ -766,6 +767,14 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> InputSour
         }
     }
 
+    fn anchor_computable(
+        &self,
+        protocol: ShieldedPool,
+        height: BlockHeight,
+    ) -> Result<bool, Self::Error> {
+        wallet::anchor_computable(self.conn.borrow(), protocol, height)
+    }
+
     fn select_spendable_notes(
         &self,
         account: Self::AccountId,
@@ -822,6 +831,77 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> InputSour
                 vec![]
             },
         ))
+    }
+
+    fn select_single_spendable_note(
+        &self,
+        account: Self::AccountId,
+        value: Zatoshis,
+        sources: &[ShieldedPool],
+        target_height: TargetHeight,
+        confirmations_policy: ConfirmationsPolicy,
+        exclude: &[Self::NoteRef],
+        lock_filter: LockFilter<'_>,
+    ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
+        // Pools are tried in the caller's preference order; the first pool holding a covering
+        // note supplies it.
+        for pool in sources {
+            match pool {
+                ShieldedPool::Sapling => {
+                    if let Some(note) = wallet::sapling::select_single_spendable_sapling_note(
+                        self.conn.borrow(),
+                        &self.params,
+                        account,
+                        value,
+                        target_height,
+                        confirmations_policy,
+                        exclude,
+                        lock_filter,
+                    )? {
+                        return Ok(ReceivedNotes::new(
+                            vec![note],
+                            #[cfg(feature = "orchard")]
+                            vec![],
+                            #[cfg(feature = "orchard")]
+                            vec![],
+                        ));
+                    }
+                }
+                #[cfg(feature = "orchard")]
+                ShieldedPool::Orchard => {
+                    if let Some(note) = wallet::orchard::select_single_spendable_orchard_note(
+                        self.conn.borrow(),
+                        &self.params,
+                        account,
+                        value,
+                        target_height,
+                        confirmations_policy,
+                        exclude,
+                        lock_filter,
+                    )? {
+                        return Ok(ReceivedNotes::new(vec![], vec![note], vec![]));
+                    }
+                }
+                #[cfg(feature = "orchard")]
+                ShieldedPool::Ironwood => {
+                    if let Some(note) = wallet::orchard::select_single_spendable_ironwood_note(
+                        self.conn.borrow(),
+                        &self.params,
+                        account,
+                        value,
+                        target_height,
+                        confirmations_policy,
+                        exclude,
+                        lock_filter,
+                    )? {
+                        return Ok(ReceivedNotes::new(vec![], vec![], vec![note]));
+                    }
+                }
+                #[cfg(not(feature = "orchard"))]
+                ShieldedPool::Orchard | ShieldedPool::Ironwood => {}
+            }
+        }
+        Ok(ReceivedNotes::empty())
     }
 
     fn select_unspent_notes(
@@ -1624,7 +1704,6 @@ where
         self.transactionally(|wdb| wallet::locking::clear_locked_outputs(wdb.conn.0, account))
     }
 
-    #[cfg(any(test, feature = "test-dependencies"))]
     fn get_locked_outputs(&self, account: Self::AccountId) -> Result<Vec<OutputRef>, Self::Error> {
         wallet::locking::get_locked_outputs(self.conn.borrow(), account)
     }
@@ -1926,7 +2005,6 @@ where
         wallet::locking::clear_locked_outputs(self.conn.0, account)
     }
 
-    #[cfg(any(test, feature = "test-dependencies"))]
     fn get_locked_outputs(&self, account: Self::AccountId) -> Result<Vec<OutputRef>, Self::Error> {
         wallet::locking::get_locked_outputs(self.conn.0, account)
     }
@@ -2890,6 +2968,10 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
         wallet::queue_tx_retrieval(self.conn.borrow(), txids, dependent_tx_ref)
     }
 
+    fn queue_tx_status(&mut self, txid: TxId) -> Result<(), Self::Error> {
+        wallet::queue_tx_status(self.conn.borrow(), txid)
+    }
+
     fn delete_retrieval_queue_entries(&mut self, txid: TxId) -> Result<(), Self::Error> {
         wallet::delete_retrieval_queue_entries(self.conn.borrow(), txid)
     }
@@ -3468,6 +3550,11 @@ impl BlockDb {
     /// Opens a connection to the wallet database stored at the specified path.
     pub fn for_path<P: AsRef<Path>>(path: P) -> Result<Self, rusqlite::Error> {
         rusqlite::Connection::open(path).map(BlockDb)
+    }
+
+    #[cfg(any(test, feature = "test-dependencies"))]
+    pub(crate) fn from_connection(conn: rusqlite::Connection) -> Self {
+        Self(conn)
     }
 }
 

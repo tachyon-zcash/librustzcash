@@ -17,93 +17,20 @@
 //! [ZIP 318]: https://zips.z.cash/zip-0318
 //! [`WalletRead::anchor_retention_interval`]: super::WalletRead::anchor_retention_interval
 
-use core::num::NonZeroU32;
 use std::collections::BTreeSet;
 
 use zcash_protocol::consensus::BlockHeight;
 
 /// The interval, in blocks, between the durable anchor checkpoints a wallet retains.
 ///
-/// A height `h` is a BOUNDARY of this interval exactly when `h` is a multiple of it (see
-/// [`Self::is_boundary`]); those are the heights whose checkpoints are retained, and the only tree
-/// states a migration transfer may anchor to. The interval is a modulus, so it is necessarily
-/// non-zero.
+/// This is a re-export of [`zcash_protocol::zip318::AnchorBucketInterval`], the single definition
+/// shared with `zcash_pool_migration`. The grid a wallet retains its checkpoints on and the grid a
+/// pool-crossing transfer anchors to must be the same, so they are one type rather than two kept
+/// aligned by a conversion.
 ///
 /// The value recommended for use with this crate is supplied by the [`Default`] implementation,
-/// which is [`Self::ZIP_318`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AnchorRetentionInterval(NonZeroU32);
-
-impl AnchorRetentionInterval {
-    /// The interval specified by [ZIP 318]: 144 blocks, roughly three hours (8 per day) at the
-    /// Zcash ~75-second target block spacing.
-    ///
-    /// [ZIP 318]: https://zips.z.cash/zip-0318
-    pub const ZIP_318: Self = Self(NonZeroU32::new(144).expect("144 is nonzero"));
-
-    /// Constructs an interval other than the [ZIP 318] one.
-    ///
-    /// A wallet on the production network MUST use [`Self::ZIP_318`]: the anonymity set a shared
-    /// anchor provides is exactly the set of transfers that chose the same boundary, so a wallet
-    /// retaining (and anchoring to) a different grid than its peers is distinguishable from them.
-    /// A shorter interval is useful on test networks, where waiting out 144-block buckets makes
-    /// exercising a migration impractical.
-    ///
-    /// This constructor is only available under the `unstable` feature, as it is not recommended
-    /// for general use.
-    ///
-    /// [ZIP 318]: https://zips.z.cash/zip-0318
-    #[cfg(any(test, feature = "test-dependencies", feature = "unstable"))]
-    pub const fn custom(blocks: NonZeroU32) -> Self {
-        Self(blocks)
-    }
-
-    /// Reconstructs an interval from a block count that was previously persisted, for a store
-    /// reading back its own durable state.
-    ///
-    /// This is the inverse of [`Self::block_count`], and is not a way to CHOOSE an interval: a
-    /// caller deciding what grid to retain on wants [`Self::ZIP_318`] or, deliberately and on a
-    /// test network only, [`Self::custom`].
-    pub const fn from_stored_block_count(blocks: NonZeroU32) -> Self {
-        Self(blocks)
-    }
-
-    /// Returns the interval as a number of blocks.
-    pub fn block_count(&self) -> NonZeroU32 {
-        self.0
-    }
-
-    /// Returns whether `height` is a boundary of this interval, i.e. whether a checkpoint at
-    /// `height` is retained as a durable anchor.
-    pub fn is_boundary(&self, height: BlockHeight) -> bool {
-        u32::from(height) % self.0 == 0
-    }
-
-    /// Returns the greatest boundary height that does not exceed `height`, i.e. `height` rounded
-    /// DOWN to a multiple of this interval.
-    pub fn boundary_at_or_below(&self, height: BlockHeight) -> BlockHeight {
-        let h = u32::from(height);
-        BlockHeight::from_u32(h - (h % self.0))
-    }
-
-    /// Returns the least boundary height that is not below `height`, i.e. `height` rounded UP to a
-    /// multiple of this interval. Saturates at [`u32::MAX`].
-    pub fn boundary_at_or_above(&self, height: BlockHeight) -> BlockHeight {
-        let h = u32::from(height);
-        let r = h % self.0;
-        BlockHeight::from_u32(if r == 0 {
-            h
-        } else {
-            h.saturating_add(self.0.get() - r)
-        })
-    }
-}
-
-impl Default for AnchorRetentionInterval {
-    fn default() -> Self {
-        Self::ZIP_318
-    }
-}
+/// which is `AnchorBucketInterval::ZIP_318`.
+pub use zcash_protocol::zip318::AnchorBucketInterval as AnchorRetentionInterval;
 
 /// The anchor-retention policy in force while a range of blocks is being added to the wallet: the
 /// set of grids whose boundaries are retained, and the height from which retention applies.
@@ -165,11 +92,47 @@ impl AnchorRetention {
     pub fn retains(&self, height: BlockHeight) -> bool {
         height >= self.from_height && self.intervals.iter().any(|i| i.is_boundary(height))
     }
+
+    /// Returns every height in `range` whose checkpoint this policy retains, ascending.
+    ///
+    /// This is the enumeration form of [`Self::retains`]: a height is in the result exactly when
+    /// `range` contains it and [`Self::retains`] holds for it. It exists so that a caller adding a
+    /// scanned range of blocks can CREATE the checkpoints the policy will need retained — a
+    /// boundary block containing no note commitments produces no checkpoint of its own, and a
+    /// policy can only keep alive a checkpoint that exists.
+    pub fn retained_in_range(
+        &self,
+        range: core::ops::RangeInclusive<BlockHeight>,
+    ) -> BTreeSet<BlockHeight> {
+        let start = u64::from(u32::from(core::cmp::max(*range.start(), self.from_height)));
+        let end = u64::from(u32::from(*range.end()));
+        self.intervals
+            .iter()
+            .flat_map(|interval| {
+                // A height is a boundary of an interval exactly when it is a multiple of it, so
+                // the boundaries in range are the multiples of `step` from the first at or above
+                // `start`. The arithmetic is in `u64` so that neither the round-up nor the
+                // iterator's one-past-the-end probe can overflow near the top of the height range.
+                let step = u64::from(interval.block_count().get());
+                let first = start.div_ceil(step) * step;
+                (0u64..)
+                    .map(move |k| first + k * step)
+                    .take_while(move |boundary| *boundary <= end)
+                    .map(|boundary| {
+                        BlockHeight::from_u32(
+                            u32::try_from(boundary).expect("bounded by a u32 height"),
+                        )
+                    })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use core::num::NonZeroU32;
 
     use proptest::prelude::*;
 
@@ -221,6 +184,34 @@ mod tests {
         assert!(!i.is_boundary(BlockHeight::from_u32(289)));
     }
 
+    /// The enumeration clamps to the policy's floor, includes both endpoints of the range, and
+    /// yields the union of every constituent grid's boundaries.
+    #[test]
+    fn retained_in_range_examples() {
+        let h = BlockHeight::from_u32;
+        let heights = |policy: &AnchorRetention, lo: u32, hi: u32| {
+            policy
+                .retained_in_range(h(lo)..=h(hi))
+                .into_iter()
+                .map(u32::from)
+                .collect::<Vec<_>>()
+        };
+
+        let single = AnchorRetention::new(h(25), interval(10));
+        // The floor excludes 20 even though it is a boundary within the range.
+        assert_eq!(heights(&single, 15, 55), vec![30, 40, 50]);
+        // Both endpoints are inclusive.
+        assert_eq!(heights(&single, 30, 50), vec![30, 40, 50]);
+        // An inverted range is empty rather than an error.
+        assert_eq!(heights(&single, 50, 30), Vec::<u32>::new());
+        // A range wholly below the floor is empty.
+        assert_eq!(heights(&single, 0, 24), Vec::<u32>::new());
+
+        let union = AnchorRetention::union(h(0), [interval(10), interval(15)]).expect("non-empty");
+        // Multiples of 10 and 15, deduplicated at the common multiple 30.
+        assert_eq!(heights(&union, 1, 45), vec![10, 15, 20, 30, 40, 45]);
+    }
+
     proptest! {
         /// Rounding down yields a boundary that does not exceed the height and is within one
         /// interval of it; rounding up yields a boundary that is not below it, likewise within one
@@ -263,6 +254,35 @@ mod tests {
             prop_assert_eq!(policy.retains(h), h >= BlockHeight::from_u32(floor) && i.is_boundary(h));
         }
 
+        /// Membership in the enumerated range agrees exactly with the predicate: `h` is in
+        /// `retained_in_range(lo..=hi)` iff `lo <= h <= hi` and `retains(h)`.
+        #[test]
+        fn retained_in_range_agrees_with_retains(
+            floor in 0u32..100_000,
+            lo in 0u32..200_000,
+            len in 0u32..2_000,
+            a in 1u32..500,
+            b in 1u32..500,
+        ) {
+            let f = BlockHeight::from_u32(floor);
+            let policy = AnchorRetention::union(f, [interval(a), interval(b)]).expect("non-empty");
+            let (lo, hi) = (BlockHeight::from_u32(lo), BlockHeight::from_u32(lo + len));
+            let enumerated = policy.retained_in_range(lo..=hi);
+
+            for h in u32::from(lo)..=u32::from(hi) {
+                let h = BlockHeight::from_u32(h);
+                prop_assert_eq!(
+                    enumerated.contains(&h),
+                    policy.retains(h),
+                    "height {:?}", h
+                );
+            }
+            // Nothing outside the range is ever emitted.
+            for h in &enumerated {
+                prop_assert!((lo..=hi).contains(h));
+            }
+        }
+
         /// A union policy retains a height iff ANY of its grids does, so adding a grid only ever
         /// widens what survives pruning — a migration committed under one interval keeps its
         /// boundaries even once the wallet is retaining on another.
@@ -289,5 +309,44 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// The [ZIP 318] pool-migration parameters in force for a particular wallet: the specified values,
+/// with the anchor bucket grid taken from the grid that wallet actually retains.
+///
+/// The wallet is the authority on the grid, because it is the side that keeps the checkpoints
+/// alive. A crossing anchored to a boundary the wallet did not retain cannot be proved, so every
+/// decision that depends on the grid — whether to bucket an anchor, and whether the resulting
+/// transaction is a canonical crossing — must consult the same source. Reading the grid from the
+/// network defaults instead would agree with the wallet only by coincidence, and silently disagree
+/// for any wallet configured with a different interval.
+///
+/// Obtained from [`WalletRead::pool_migration_params`].
+///
+/// [ZIP 318]: https://zips.z.cash/zip-0318
+/// [`WalletRead::pool_migration_params`]: super::WalletRead::pool_migration_params
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolMigrationParams {
+    interval: AnchorRetentionInterval,
+}
+
+impl PoolMigrationParams {
+    /// Constructs the parameters for a wallet retaining anchors on `interval`. Every other ZIP 318
+    /// value takes its specified default.
+    pub fn new(interval: AnchorRetentionInterval) -> Self {
+        Self { interval }
+    }
+}
+
+impl From<AnchorRetentionInterval> for PoolMigrationParams {
+    fn from(interval: AnchorRetentionInterval) -> Self {
+        Self::new(interval)
+    }
+}
+
+impl zcash_protocol::zip318::PoolMigrationConstants for PoolMigrationParams {
+    fn anchor_bucket_interval(&self) -> AnchorRetentionInterval {
+        self.interval
     }
 }

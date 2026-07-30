@@ -19,6 +19,7 @@ use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
 use zcash_protocol::{
     ShieldedPool, TxId,
     consensus::{self, BlockHeight},
+    value::Zatoshis,
 };
 use zip32::Scope;
 
@@ -174,6 +175,31 @@ pub(crate) fn select_spendable_sapling_notes<P: consensus::Parameters>(
         params,
         account,
         target_value,
+        target_height,
+        confirmations_policy,
+        exclude,
+        ShieldedPool::Sapling,
+        to_received_note,
+        lock_filter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_single_spendable_sapling_note<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    account: AccountUuid,
+    value: Zatoshis,
+    target_height: TargetHeight,
+    confirmations_policy: ConfirmationsPolicy,
+    exclude: &[ReceivedNoteId],
+    lock_filter: LockFilter<'_>,
+) -> Result<Option<ReceivedNote<ReceivedNoteId, sapling::Note>>, SqliteClientError> {
+    super::common::select_single_spendable_note(
+        conn,
+        params,
+        account,
+        value,
         target_height,
         confirmations_policy,
         exclude,
@@ -631,9 +657,20 @@ pub(crate) mod tests {
         testing::pool::anchor_checkpoints_retained_across_deep_scan::<SaplingPoolTester>()
     }
 
+    #[cfg(feature = "orchard")]
+    #[test]
+    fn empty_boundary_blocks_are_checkpointed_and_retained() {
+        testing::pool::empty_boundary_blocks_are_checkpointed_and_retained::<SaplingPoolTester>()
+    }
+
     #[test]
     fn scan_cached_blocks_detects_spends_out_of_order() {
         testing::pool::scan_cached_blocks_detects_spends_out_of_order::<SaplingPoolTester>()
+    }
+
+    #[test]
+    fn oldest_note_is_selected_first() {
+        testing::pool::oldest_note_is_selected_first::<SaplingPoolTester>()
     }
 
     #[test]
