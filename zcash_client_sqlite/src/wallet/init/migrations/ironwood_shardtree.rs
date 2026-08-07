@@ -322,6 +322,8 @@ mod tests {
                 nu6_3: Some(activation),
                 #[cfg(zcash_unstable = "nu7")]
                 nu7: None,
+                #[cfg(zcash_unstable = "zfuture")]
+                z_future: None,
             },
         }
         .up(&tx)

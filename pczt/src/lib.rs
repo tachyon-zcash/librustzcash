@@ -559,7 +559,7 @@ impl Pczt {
                 }
             }
             // v7 (tachyon) also reuses the v6 Ironwood body, so the same revision floor applies.
-            #[cfg(zcash_unstable = "nu7")]
+            #[cfg(zcash_unstable = "zfuture")]
             TxVersion::V7 => {
                 if orchard_protocol_revision < OrchardProtocolRevision::V3 {
                     return Err(ExtractError::UnsupportedConsensusBranchId.into());

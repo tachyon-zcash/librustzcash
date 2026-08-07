@@ -480,7 +480,7 @@ pub mod testing {
     fn orchard_bundle_version(v: TxVersion) -> BundleVersion {
         let is_v6_family = match v {
             TxVersion::V6 => true,
-            #[cfg(zcash_unstable = "nu7")]
+            #[cfg(zcash_unstable = "zfuture")]
             TxVersion::V7 => true,
             _ => false,
         };

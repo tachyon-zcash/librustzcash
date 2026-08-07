@@ -1742,6 +1742,8 @@ mod tests {
             nu6_3: one,
             #[cfg(zcash_unstable = "nu7")]
             nu7: one,
+            #[cfg(zcash_unstable = "zfuture")]
+            z_future: one,
         }
     }
 

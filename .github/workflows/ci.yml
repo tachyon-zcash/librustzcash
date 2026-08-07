@@ -485,7 +485,8 @@ jobs:
     permissions:
       checks: write
     env:
-      RUSTFLAGS: '--cfg zcash_unstable="nu7"'
+      # Tachyon lives behind `zcash_unstable = "zfuture"` on this fork, so lint it here.
+      RUSTFLAGS: '--cfg zcash_unstable="zfuture"'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -530,7 +531,8 @@ jobs:
       checks: write
     continue-on-error: true
     env:
-      RUSTFLAGS: '--cfg zcash_unstable="nu7"'
+      # Tachyon lives behind `zcash_unstable = "zfuture"` on this fork, so lint it here.
+      RUSTFLAGS: '--cfg zcash_unstable="zfuture"'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

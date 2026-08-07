@@ -28,7 +28,7 @@ use {
     blake2b_simd::Params,
     ff::PrimeField,
     // Only the `not(nu7)` tests below drive proptest strategies by hand; upstream keeps these
-    // in the ungated block because it never lints with `zcash_unstable = "nu7"`.
+    // in the ungated block because it never lints with `zcash_unstable = "zfuture"`.
     proptest::{strategy::ValueTree, test_runner::TestRunner},
     zcash_protocol::value::ZatBalance,
 };
@@ -1110,7 +1110,7 @@ fn zip_0244() {
     }
 }
 
-#[cfg(zcash_unstable = "nu7")]
+#[cfg(zcash_unstable = "zfuture")]
 #[test]
 fn tachyon_v7_test_vectors() {
     use self::data::tachyon_vectors::*;
@@ -1129,7 +1129,7 @@ fn tachyon_v7_test_vectors() {
 
     // Helper: deserialize, check version, roundtrip
     let read_and_roundtrip = |data: &[u8]| -> Transaction {
-        let tx = Transaction::read(data, BranchId::Nu7).unwrap();
+        let tx = Transaction::read(data, BranchId::ZFuture).unwrap();
         assert_eq!(tx.version, TxVersion::V7);
 
         let mut encoded = Vec::with_capacity(data.len());
@@ -1213,7 +1213,7 @@ fn tachyon_v7_test_vectors() {
 // `Bundle::read_body` and `ProofStamp::read`). The fixture is generated with both
 // sorted, so the specific action/tachygram order is determined by that sort rather
 // than by construction order; the assertions below are therefore order-independent.
-#[cfg(zcash_unstable = "nu7")]
+#[cfg(zcash_unstable = "zfuture")]
 #[test]
 fn tachyon_v7_multi_action() {
     use self::data::tachyon_vectors::*;
@@ -1241,7 +1241,7 @@ fn tachyon_v7_multi_action() {
         bytes
     };
 
-    let tx = Transaction::read(&V7_TX_TACHYON_MULTI_ACTION[..], BranchId::Nu7).unwrap();
+    let tx = Transaction::read(&V7_TX_TACHYON_MULTI_ACTION[..], BranchId::ZFuture).unwrap();
     assert_eq!(tx.version, TxVersion::V7);
 
     let mut encoded = Vec::with_capacity(V7_TX_TACHYON_MULTI_ACTION.len());

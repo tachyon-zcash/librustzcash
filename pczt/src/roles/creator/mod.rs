@@ -28,8 +28,8 @@ use zcash_protocol::{
     constants::{V5_TX_VERSION, V5_VERSION_GROUP_ID, V6_TX_VERSION, V6_VERSION_GROUP_ID},
 };
 
-#[cfg(zcash_unstable = "nu7")]
-use zcash_protocol::constants::V7_TX_VERSION;
+#[cfg(zcash_unstable = "zfuture")]
+use zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID};
 
 /// Initial flags allowing any modification.
 const INITIAL_TX_MODIFIABLE: u8 = FLAG_TRANSPARENT_INPUTS_MODIFIABLE
@@ -124,6 +124,9 @@ impl Creator {
             BranchId::Nu6_3 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => (V6_TX_VERSION, V6_VERSION_GROUP_ID),
+            // ZFUTURE deploys the tachyon protocol, whose transaction format is v7.
+            #[cfg(zcash_unstable = "zfuture")]
+            BranchId::ZFuture => (V7_TX_VERSION, V7_VERSION_GROUP_ID),
         };
 
         Ok(Self {
@@ -298,7 +301,7 @@ impl Creator {
             zcash_primitives::transaction::TxVersion::V4 => Some(V4_TX_VERSION),
             zcash_primitives::transaction::TxVersion::V5 => Some(V5_TX_VERSION),
             zcash_primitives::transaction::TxVersion::V6 => Some(V6_TX_VERSION),
-            #[cfg(zcash_unstable = "nu7")]
+            #[cfg(zcash_unstable = "zfuture")]
             zcash_primitives::transaction::TxVersion::V7 => Some(V7_TX_VERSION),
         }?;
 
