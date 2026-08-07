@@ -106,8 +106,7 @@ use crate::{
 
 #[cfg(feature = "transparent-inputs")]
 use {
-    crate::fees::StandardFeeRule,
-    crate::wallet::TransparentAddressMetadata,
+    crate::{fees::StandardFeeRule, wallet::TransparentAddressMetadata},
     getset::{CopyGetters, Getters},
     std::time::SystemTime,
     transparent::{address::TransparentAddress, bundle::OutPoint, keys::TransparentKeyScope},
@@ -139,6 +138,8 @@ pub use locking::OutputLockStore;
 pub use locking::ambassador_impl_OutputLockStore;
 pub mod scanning;
 pub mod wallet;
+#[cfg(feature = "orchard")]
+pub mod zip318;
 
 #[cfg(any(test, feature = "test-dependencies"))]
 pub mod testing;
@@ -3891,6 +3892,11 @@ pub trait WalletWrite:
     /// stored transactions. Once spend records exist, the outputs are protected from
     /// double-selection by the spend tracking mechanism, so the explicit locks are no
     /// longer needed.
+    ///
+    /// Implementations must be idempotent: storing a transaction the wallet has already
+    /// recorded replaces that record rather than failing, so that a caller which stores a
+    /// transaction and then dies before transmitting it can store the same transaction again
+    /// when it resumes.
     fn store_transactions_to_be_sent(
         &mut self,
         transactions: &[SentTransaction<<Self as WalletRead>::AccountId>],
@@ -4605,6 +4611,15 @@ mod balance_tests {
 
 #[cfg(test)]
 mod tests {
+    use incrementalmerkletree::{
+        Address as TreeAddress, Hashable, Level, Marking, Position, Retention,
+    };
+    use shardtree::store::{Checkpoint, memory::MemoryShardStore};
+    use zcash_keys::{
+        address::{Address, UnifiedAddress},
+        keys::UnifiedAddressRequest,
+    };
+
     use super::*;
 
     #[cfg(feature = "orchard")]
@@ -4614,14 +4629,10 @@ mod tests {
     };
 
     use transparent::address::TransparentAddress;
-    use zcash_keys::address::{Address, UnifiedAddress};
     use zip32::DiversifierIndex;
 
     #[test]
     fn put_sapling_shards_flushes_through_the_interface() {
-        use incrementalmerkletree::{Address, Hashable, Level, Marking, Position};
-        use shardtree::store::Checkpoint;
-
         let mut db = MockWalletDb::new(zcash_protocol::consensus::Network::TestNetwork);
 
         // Build a shard-rooted subtree the same way `put_blocks` does, with a checkpoint on
@@ -4660,7 +4671,10 @@ mod tests {
         db.with_sapling_tree_mut(|tree| {
             assert!(
                 tree.store()
-                    .get_shard(Address::from_parts(Level::from(SAPLING_SHARD_HEIGHT), 0))
+                    .get_shard(TreeAddress::from_parts(
+                        Level::from(SAPLING_SHARD_HEIGHT),
+                        0
+                    ))
                     .map_err(ShardTreeError::Storage)?
                     .is_some()
             );
@@ -4711,9 +4725,6 @@ mod tests {
     where
         H: incrementalmerkletree::Hashable + Clone + PartialEq + core::fmt::Debug,
     {
-        use incrementalmerkletree::{Address, Level, Marking, Position};
-        use shardtree::store::{Checkpoint, memory::MemoryShardStore};
-
         let mut tree: ShardTree<
             MemoryShardStore<H, BlockHeight>,
             { SAPLING_SHARD_HEIGHT * 2 },
@@ -4754,7 +4765,10 @@ mod tests {
 
         assert!(
             tree.store()
-                .get_shard(Address::from_parts(Level::from(SAPLING_SHARD_HEIGHT), 0))
+                .get_shard(TreeAddress::from_parts(
+                    Level::from(SAPLING_SHARD_HEIGHT),
+                    0
+                ))
                 .expect("shard read succeeds")
                 .is_some()
         );
@@ -4802,8 +4816,6 @@ mod tests {
     #[cfg(feature = "orchard")]
     #[test]
     fn put_ironwood_shards_is_ignored_without_an_ironwood_tree() {
-        use shardtree::store::Checkpoint;
-
         // `MockWalletDb` does not track an Ironwood tree, so the default
         // `with_ironwood_tree_mut` reports no tree and the changes are ignored rather than
         // returning an error.
@@ -4980,8 +4992,6 @@ mod tests {
 
     #[test]
     fn find_account_for_unified_address_returns_account_when_receivers_map_to_same_account() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         let ufvk = test_ufvk(1);
         let wallet = MockWalletDb::from_account_ufvks(
             zcash_protocol::consensus::Network::MainNetwork,
@@ -5002,8 +5012,6 @@ mod tests {
 
     #[test]
     fn find_account_for_unified_address_returns_none_when_no_receiver_matches() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         let wallet = MockWalletDb::from_account_ufvks(
             zcash_protocol::consensus::Network::MainNetwork,
             [(1, test_ufvk(1))],
@@ -5025,8 +5033,6 @@ mod tests {
 
     #[test]
     fn find_account_for_sapling_address_resolves_via_uivk_algebra_when_not_previously_exposed() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         // A bare Sapling address derivable from an account's UIVK must resolve even when the
         // wallet has never stored (and therefore never "exposed") that address.
         let ufvk = test_ufvk(1);
@@ -5074,8 +5080,6 @@ mod tests {
     #[cfg(feature = "orchard")]
     #[test]
     fn find_account_for_unified_address_errors_when_receivers_map_to_different_accounts() {
-        use zcash_keys::keys::UnifiedAddressRequest;
-
         let ufvk1 = test_ufvk(1);
         let ufvk2 = test_ufvk(2);
         let wallet = MockWalletDb::from_account_ufvks(

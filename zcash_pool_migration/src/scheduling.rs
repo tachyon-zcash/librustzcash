@@ -62,7 +62,11 @@
 //!   with its broadcasts. That is a scheduling-engine runtime policy over live network activity.
 //! - AT MOST ONE OVERDUE TRANSFER at wallet open: when a wallet reopens after being offline past
 //!   several scheduled heights, at most one overdue transfer is released immediately (the rest are
-//!   re-spread). That requires the persisted schedule and wall-clock state the engine owns.
+//!   re-spread). That requires the persisted schedule and wall-clock state the engine owns; the
+//!   drive API implements it as the overdue shift (see
+//!   [`advance_migration`](crate::satisfiability::advance_migration) and
+//!   [`overdue_shift_tolerance`](crate::satisfiability::overdue_shift_tolerance)), which moves the
+//!   whole pending schedule forward by the overdue amount rather than redrawing it.
 //!
 //! This module supplies the heights and anchors those policies act on; it does not enact them.
 //!
@@ -273,6 +277,24 @@ impl Default for SchedulingParams {
     }
 }
 
+/// How deep below the wallet's fully-scanned tip a transfer's drawn anchor boundary must sit —
+/// AT LEAST this many blocks — before the planning kernel offers the transfer's proof: about
+/// 12.5 minutes of reorg stability at the target block spacing, so the boundary checkpoint
+/// proved against is one a reorg can no longer plausibly displace. This is the same settling
+/// judgment [`WakeupParams::DEFAULT`] expresses as a wake-up margin — that margin IS this
+/// constant, so a zero-jitter wake-up landing exactly on its scheduled height syncs to the
+/// first tip at which the kernel offers the proofs the wake-up exists to produce — and it
+/// matches the conventional [`ReorgSettleDepth`](crate::satisfiability::ReorgSettleDepth).
+/// Not specified by ZIP 318; provisional.
+///
+/// Proving a shallower boundary would cost correctness nothing — the satisfiability oracle
+/// detects an anchor a settled reorg invalidated, and the proof is simply redone — but it
+/// spends the proving work exactly when a reorg is most plausible, so the kernel holds the
+/// proof until the boundary is this deep. The gate is judged only against the SCANNED target
+/// ([`DuenessTargets::scanned`](crate::satisfiability::DuenessTargets::scanned)): an estimate
+/// cannot conjure the checkpoint, nor its depth.
+pub const PROVABLE_ANCHOR_DEPTH: u32 = 10;
+
 /// Parameters shaping the sync/proving wake-up schedule ([`schedule_sync_wakeups`]): how many
 /// blocks past an anchor boundary a wake-up waits for that boundary to settle, and how much random
 /// jitter spreads independent wallets' wake-ups apart as a thundering-herd defense. These values
@@ -284,9 +306,11 @@ pub struct WakeupParams {
 }
 
 impl WakeupParams {
-    /// The provisional defaults: a 10-block settle margin (about 12.5 minutes at the target block
-    /// spacing, so the synced boundary is one a reorg can no longer plausibly displace) and a
-    /// 12-block jitter cap (about 15 minutes).
+    /// The provisional defaults: a settle margin of [`PROVABLE_ANCHOR_DEPTH`] blocks (10 —
+    /// about 12.5 minutes at the target block spacing; the kernel's provability gate and this
+    /// margin are the SAME depth, so a zero-jitter wake-up syncs to the first tip at which the
+    /// kernel offers the proofs the wake-up exists to produce) and a 12-block jitter cap (about
+    /// 15 minutes).
     ///
     /// The jitter cap exists as a THUNDERING-HERD defense, and for nothing else: anchor
     /// boundaries sit on a GLOBAL grid shared by every migrating wallet, so un-jittered wake-ups
@@ -303,7 +327,7 @@ impl WakeupParams {
     /// same-height wallets WITHIN a block, so the jitter only needs to spread wallets ACROSS
     /// blocks.
     pub const DEFAULT: Self = Self {
-        settle_margin: 10,
+        settle_margin: PROVABLE_ANCHOR_DEPTH,
         jitter_cap: 12,
     };
 
@@ -580,7 +604,7 @@ pub use zcash_protocol::zip318::expiry_height;
 /// freshly committed schedule, the commit height); a wake-up at exactly `current_tip` means
 /// "right now". A transfer whose deadline is already below the tip but which still needs a proof
 /// joins an immediate wake-up at exactly `current_tip` instead (mirroring
-/// [`MigrationState::next_step`], which offers `Prove` for it now); this is not an error. That
+/// [`advance_migration`], which offers `Prove` for it now); this is not an error. That
 /// immediate wake-up also absorbs any transfer whose proving window CONTAINS `current_tip` (i.e.
 /// whose clamped ready height is exactly `current_tip`): its mandatory piercing point covers them
 /// for free, which is what keeps the schedule minimal whenever overdue transfers are present.
@@ -590,7 +614,7 @@ pub use zcash_protocol::zip318::expiry_height;
 /// no schedule produced by this crate contains.
 ///
 /// [`MigrationTransaction::anchor_boundary`]: crate::engine::MigrationTransaction::anchor_boundary
-/// [`MigrationState::next_step`]: crate::engine::MigrationState::next_step
+/// [`advance_migration`]: crate::satisfiability::advance_migration
 pub fn schedule_sync_wakeups<T: Copy, R: RngCore + CryptoRng>(
     params: &WakeupParams,
     current_tip: BlockHeight,
@@ -771,8 +795,74 @@ pub fn draw_anchor_boundary<R: RngCore + CryptoRng>(
         u32::from(funding_creation_height),
         most_recent,
     )?;
+    Some(BlockHeight::from_u32(sample_recency_weighted_boundary(
+        interval,
+        lowest,
+        highest,
+        most_recent,
+        rng,
+    )))
+}
 
-    // Rejection-sample the geometric age until the candidate lands in [lowest, highest].
+/// Select a REPLACEMENT boundary for a transfer whose broadcast schedule has moved out from under
+/// its drawn anchor — the overdue shift
+/// ([`advance_migration`](crate::satisfiability::advance_migration)) defers every pending
+/// broadcast when a wallet resumes after downtime, and a boundary that was in-distribution for
+/// the ORIGINAL schedule sits `delta` blocks too old against the shifted one. With
+/// [`ANCHOR_AGE_CAP`] at 4 buckets, even a modest shift leaves an anchor age no honest draw
+/// produces, and every deferred transfer of one wallet would carry the SAME excess age — a
+/// linkable fingerprint. Redrawing against the new schedule restores the age distribution the
+/// anchor cohorts rely on.
+///
+/// The draw is [`draw_anchor_boundary`]'s recency-weighted draw against the NEW
+/// `broadcast_height`, with the candidate set floored at `prior_boundary` — the boundary being
+/// replaced — instead of the funding constraints: every note witnessable in the prior boundary's
+/// tree state is witnessable in every later one, so the floor preserves provability without the
+/// funding-note heights this crate's state does not hold. (A funding note that POSTDATES the
+/// prior boundary is the separate staleness `prove_transfer` re-validates and re-draws for at
+/// proving time, with the real mined heights in hand.) The prior boundary also subsumes the
+/// NU6.3-activation bound, which it satisfies by construction.
+///
+/// Returns `None` when no candidate at or above `prior_boundary` lies strictly below the most
+/// recent boundary at `broadcast_height` — possible only when the prior boundary was itself
+/// drawn against a tip past the new schedule (a proving-time re-draw followed by a small shift);
+/// the caller keeps the prior boundary, which remains provable.
+///
+/// [`prove_transfer`]: crate::engine::prove_transfer
+pub fn redraw_anchor_boundary<R: RngCore + CryptoRng>(
+    interval: AnchorBucketInterval,
+    prior_boundary: BlockHeight,
+    broadcast_height: BlockHeight,
+    rng: &mut R,
+) -> Option<BlockHeight> {
+    let most_recent = boundary_at_or_below_u32(&interval, u32::from(broadcast_height));
+    // Highest candidate: strictly below the most recent boundary (age >= 1), one interval down.
+    let highest = most_recent.checked_sub(interval.block_count().get())?;
+    let lowest = boundary_at_or_above_u32(&interval, u32::from(prior_boundary));
+    if lowest > highest {
+        return None;
+    }
+    Some(BlockHeight::from_u32(sample_recency_weighted_boundary(
+        interval,
+        lowest,
+        highest,
+        most_recent,
+        rng,
+    )))
+}
+
+/// The rejection-sampling core shared by [`draw_anchor_boundary`] and
+/// [`redraw_anchor_boundary`]: draw recency-weighted ages until `most_recent - age * interval`
+/// lands in `[lowest, highest]`, and return that candidate. The caller guarantees
+/// `lowest <= highest` and `highest = most_recent - interval` (both grid boundaries), so age 1
+/// always yields `highest` and the loop terminates.
+fn sample_recency_weighted_boundary<R: RngCore>(
+    interval: AnchorBucketInterval,
+    lowest: u32,
+    highest: u32,
+    most_recent: u32,
+    rng: &mut R,
+) -> u32 {
     loop {
         let age = draw_anchor_age(rng);
         if age > ANCHOR_AGE_CAP {
@@ -788,7 +878,7 @@ pub fn draw_anchor_boundary<R: RngCore + CryptoRng>(
             None => continue,
         };
         if candidate >= lowest && candidate <= highest {
-            return Some(BlockHeight::from_u32(candidate));
+            return candidate;
         }
     }
 }
@@ -851,6 +941,7 @@ mod tests {
     use proptest::prelude::*;
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
+    use zcash_protocol::zip318::{PREP_DELAY_CAP, TRANSFER_DELAY_CAP};
 
     /// A seeded deterministic RNG for a proptest-drawn seed.
     fn rng(seed: u64) -> ChaCha8Rng {
@@ -864,20 +955,6 @@ mod tests {
 
     /// The ZIP 318 parameters, under which every golden vector in this module was captured.
     const P: SchedulingParams = SchedulingParams::ZIP_318;
-
-    /// The ZIP 318 anchor bucket interval as a raw block count, for arithmetic in test expectations.
-    const MODULUS: u32 = 144;
-
-    /// The ZIP 318 transfer delay cap, as a raw block count.
-    const MAX_DELAY: u32 = 576;
-
-    /// The ZIP 318 preparation delay cap, as a raw block count.
-    const PREP_MAX_DELAY: u32 = 96;
-
-    /// The ZIP 318 anchor bucket interval.
-    fn modulus() -> AnchorBucketInterval {
-        AnchorBucketInterval::ZIP_318
-    }
 
     /// An anchor bucket interval of `blocks` blocks.
     fn interval(blocks: u32) -> AnchorBucketInterval {
@@ -918,12 +995,13 @@ mod tests {
     /// Assert one hand-derived [`AnchorBucketInterval::boundary_at_or_below`] value plus its
     /// invariants (a boundary, `<= height`, and within one interval of it) at the ZIP 318 interval.
     fn check_most_recent_boundary_golden(height: u32, expected: u32) {
-        let b = u32::from(modulus().boundary_at_or_below(bh(height)));
+        let i = P.anchor_bucket_interval();
+        let b = u32::from(i.boundary_at_or_below(bh(height)));
         assert_eq!(b, expected, "boundary_at_or_below({height})");
-        assert!(modulus().is_boundary(bh(b)), "not a boundary");
+        assert!(i.is_boundary(bh(b)), "not a boundary");
         assert!(b <= height, "boundary {b} above height {height}");
         assert!(
-            height - b < MODULUS,
+            height - b < i.block_count().get(),
             "boundary {b} more than an interval below {height}"
         );
     }
@@ -1056,7 +1134,8 @@ mod tests {
     #[test]
     fn delay_mean_is_near_expected() {
         // Sanity on the distribution: the truncated-exponential mean sits below MEAN_DELAY (the
-        // tail past MAX_DELAY is removed). Large sample keeps this deterministic and robust.
+        // tail past TRANSFER_DELAY_CAP is removed). Large sample keeps this deterministic and
+        // robust.
         let mut r = rng(42);
         let n = 20_000u64;
         let mut sum = 0u64;
@@ -1081,8 +1160,9 @@ mod tests {
             .map(|_| P.transfer_delay().draw(&mut r))
             .collect();
         assert_eq!(got, expected, "transfer_delay().draw(seed={seed})");
+        let cap = TRANSFER_DELAY_CAP.get();
         for &d in &got {
-            assert!(d <= MAX_DELAY, "delay {d} exceeds the cap {MAX_DELAY}");
+            assert!(d <= cap, "delay {d} exceeds the cap {cap}");
         }
     }
 
@@ -1578,7 +1658,7 @@ mod tests {
     /// `(commit, n, seed)`, plus the structural invariants they must satisfy. The heights are captured
     /// from the deterministic [`ChaCha8Rng`], so they pin the exact delay draws as a regression guard;
     /// the invariant checks keep each vector auditable by eye, since each per-step GAP is the drawn
-    /// inter-arrival delay and must be a valid `[0, MAX_DELAY]` value.
+    /// inter-arrival delay and must be a valid `[0, TRANSFER_DELAY_CAP]` value.
     fn check_schedule_golden(commit: u32, n: usize, seed: u64, expected: &[u32]) {
         let hs: Vec<u32> = schedule_broadcast_heights(&P, bh(commit), n, &mut rng(seed))
             .into_iter()
@@ -1586,6 +1666,7 @@ mod tests {
             .collect();
         assert_eq!(hs, expected, "schedule({commit}, {n}, seed={seed})");
         assert_eq!(hs.len(), n);
+        let cap = TRANSFER_DELAY_CAP.get();
         let mut prev = commit;
         for &h in &hs {
             assert!(
@@ -1593,7 +1674,7 @@ mod tests {
                 "heights must be non-decreasing (commit {commit})"
             );
             let gap = h - prev;
-            assert!(gap <= MAX_DELAY, "delay {gap} exceeds the cap {MAX_DELAY}");
+            assert!(gap <= cap, "delay {gap} exceeds the cap {cap}");
             prev = h;
         }
     }
@@ -1642,7 +1723,7 @@ mod tests {
             let mut prev = bh(start);
             for h in hs {
                 prop_assert!(h >= prev);
-                prop_assert!(u32::from(h) - u32::from(prev) <= PREP_MAX_DELAY);
+                prop_assert!(u32::from(h) - u32::from(prev) <= PREP_DELAY_CAP.get());
                 prev = h;
             }
         }
@@ -1662,7 +1743,10 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "preparation_delay().draw(seed={seed})");
             for &d in &got {
-                assert!(d <= PREP_MAX_DELAY, "delay {d} exceeds the preparation cap");
+                assert!(
+                    d <= PREP_DELAY_CAP.get(),
+                    "delay {d} exceeds the preparation cap"
+                );
             }
         }
         let exp_seed1 = [8, 1, 15, 4, 5, 20, 10, 3];
@@ -1797,7 +1881,7 @@ mod tests {
 
     #[test]
     fn anchor_empty_candidate_set_is_none() {
-        for blocks in [MODULUS, 12] {
+        for blocks in [AnchorBucketInterval::ZIP_318.block_count().get(), 12] {
             let i = interval(blocks);
             let mut r = rng(1);
             // Chain tip below the second boundary: no candidate strictly below the derived boundary
@@ -1841,7 +1925,7 @@ mod tests {
 
     #[test]
     fn anchor_funding_after_most_recent_is_none() {
-        for blocks in [MODULUS, 12] {
+        for blocks in [AnchorBucketInterval::ZIP_318.block_count().get(), 12] {
             let i = interval(blocks);
             let mut r = rng(2);
             // Funding note created after the tip's most recent boundary: nothing at/after it can be
@@ -1861,7 +1945,7 @@ mod tests {
     /// boundary derived from `chain_tip`, at/after `funding`, and with an age in
     /// `[1, ANCHOR_AGE_CAP]`.
     fn check_anchor_golden(act: u32, funding: u32, chain_tip: u32, seed: u64, expected: &[u32]) {
-        let i = modulus();
+        let i = P.anchor_bucket_interval();
         let most_recent = boundary_at_or_below_u32(&i, chain_tip);
         let mut r = rng(seed);
         let got: Vec<u32> = (0..expected.len())
@@ -1889,7 +1973,7 @@ mod tests {
                 b >= funding,
                 "boundary {b} must be at/after funding {funding}"
             );
-            let age = (most_recent - b) / MODULUS;
+            let age = (most_recent - b) / i.block_count().get();
             assert!(
                 (1..=ANCHOR_AGE_CAP).contains(&age),
                 "age {age} out of [1, cap]"
@@ -1906,7 +1990,8 @@ mod tests {
     /// vectors.
     #[test]
     fn draw_anchor_boundary_golden() {
-        let (act, funding, tip) = (MODULUS, 2 * MODULUS, 20 * MODULUS);
+        let m = AnchorBucketInterval::ZIP_318.block_count().get();
+        let (act, funding, tip) = (m, 2 * m, 20 * m);
         let exp_seed1 = [2736, 2736, 2736, 2592, 2736, 2304];
         let exp_seed42 = [2736, 2304, 2448, 2592, 2592, 2448];
         let exp_seed7 = [2736, 2592, 2736, 2736, 2304, 2592];
@@ -1917,7 +2002,73 @@ mod tests {
         check_anchor_golden(act, funding, tip, 100, &exp_seed100);
         // A mid-interval tip (not itself a boundary) must yield identical draws.
         check_anchor_golden(act, funding, tip + 100, 1, &exp_seed1);
-        check_anchor_golden(act, funding, tip + MODULUS - 1, 42, &exp_seed42);
+        check_anchor_golden(act, funding, tip + m - 1, 42, &exp_seed42);
+    }
+
+    // --- redraw_anchor_boundary ---------------------------------------------------------------
+
+    proptest! {
+        /// A replacement boundary, when one exists, is on the grid, at or above the boundary it
+        /// replaces, and in-distribution against the NEW broadcast height: within
+        /// [`ANCHOR_AGE_CAP`] buckets strictly below its most recent grid boundary. `None` arises
+        /// exactly when no candidate at or above the prior boundary lies strictly below that
+        /// most recent boundary.
+        #[test]
+        fn redraw_anchor_boundary_props(
+            seed in any::<u64>(),
+            prior_bucket in 0u32..100,
+            broadcast in 0u32..5_000_000,
+            blocks in 2u32..10_000,
+        ) {
+            let i = interval(blocks);
+            let prior = prior_bucket.saturating_mul(blocks);
+            let chosen = redraw_anchor_boundary(i, bh(prior), bh(broadcast), &mut rng(seed));
+            let most_recent = broadcast - (broadcast % blocks);
+            match chosen {
+                Some(b) => {
+                    let b = u32::from(b);
+                    prop_assert!(i.is_boundary(bh(b)));
+                    prop_assert!(b >= prior, "replacement {b} regressed below the prior {prior}");
+                    prop_assert!(b < most_recent, "age >= 1: strictly below {most_recent}");
+                    prop_assert!(
+                        b + ANCHOR_AGE_CAP * blocks >= most_recent,
+                        "replacement {b} is older than the age cap allows"
+                    );
+                }
+                None => prop_assert!(
+                    most_recent < blocks || prior > most_recent - blocks,
+                    "a non-empty candidate window must yield a draw"
+                ),
+            }
+        }
+    }
+
+    /// The endpoints of the replacement window: a prior boundary above the window keeps its
+    /// (still-provable) anchor by yielding `None`, and a prior boundary AT the window's single
+    /// candidate returns that candidate deterministically.
+    #[test]
+    fn redraw_anchor_boundary_window_endpoints() {
+        // Broadcast 1_900: most recent boundary 1_872, highest candidate 1_728.
+        assert_eq!(
+            redraw_anchor_boundary(
+                AnchorBucketInterval::ZIP_318,
+                bh(1_872),
+                bh(1_900),
+                &mut rng(1)
+            ),
+            None,
+            "a prior at the most recent boundary has no strictly-older candidate to move to"
+        );
+        assert_eq!(
+            redraw_anchor_boundary(
+                AnchorBucketInterval::ZIP_318,
+                bh(1_728),
+                bh(1_900),
+                &mut rng(1)
+            ),
+            Some(bh(1_728)),
+            "a single-candidate window is deterministic"
+        );
     }
 
     /// The two axes of [`SchedulingParams`] are independent: changing only the anchor bucket
@@ -1961,7 +2112,7 @@ mod tests {
 
     #[test]
     fn anchor_tiny_range_single_candidate() {
-        for blocks in [MODULUS, 12] {
+        for blocks in [AnchorBucketInterval::ZIP_318.block_count().get(), 12] {
             let i = interval(blocks);
             // Exactly one candidate: the boundary below the tip's, and it satisfies all bounds.
             let mut r = rng(3);

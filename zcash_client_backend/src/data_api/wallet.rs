@@ -43,11 +43,8 @@ use std::{
 
 use shardtree::error::{QueryError, ShardTreeError};
 
-use super::InputSource;
-use super::locking::lock_proposal_inputs;
 pub use super::locking::{LockRequest, unlock_proposal_inputs};
-#[cfg(feature = "orchard")]
-use crate::data_api::anchor_retention::PoolMigrationParams;
+use super::{InputSource, locking::lock_proposal_inputs};
 use crate::{
     data_api::{
         Account, MaxSpendMode, NoteCommitmentTree, SentTransaction, SentTransactionOutput,
@@ -72,22 +69,25 @@ use zcash_keys::{
     keys::{UnifiedFullViewingKey, UnifiedSpendingKey},
 };
 use zcash_primitives::transaction::{
-    Transaction, TxId,
+    Transaction, TxId, TxVersion,
     builder::{BuildConfig, BuildResult, Builder, BundlePadding},
     components::sapling::zip212_enforcement,
     fees::FeeRule,
 };
-use zcash_protocol::zip318::AnchorBucketInterval;
-#[cfg(feature = "orchard")]
-use zcash_protocol::zip318::PoolMigrationConstants;
 use zcash_protocol::{
     PoolType, ShieldedPool,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
+    zip318::AnchorBucketInterval,
 };
 use zip32::Scope;
 use zip321::Payment;
+#[cfg(feature = "orchard")]
+use {
+    crate::data_api::anchor_retention::PoolMigrationParams,
+    zcash_protocol::{consensus::NetworkUpgrade, zip318::PoolMigrationConstants},
+};
 
 #[cfg(feature = "transparent-inputs")]
 use {
@@ -103,9 +103,6 @@ use {
     transparent::bundle::TxOut,
 };
 
-#[cfg(feature = "orchard")]
-use zcash_protocol::consensus::NetworkUpgrade;
-
 #[cfg(feature = "transparent-key-import")]
 use zcash_script::script::{self as zs_script, Evaluable};
 
@@ -113,19 +110,20 @@ use zcash_script::script::{self as zs_script, Evaluable};
 use {
     crate::data_api::error::PcztError,
     bip32::ChildNumber,
-    orchard::note_encryption::OrchardDomain,
+    orchard::note_encryption::{IronwoodDomain, OrchardDomain},
     pczt::roles::{
         creator::Creator, io_finalizer::IoFinalizer, redactor::Redactor,
         spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor, updater::Updater,
     },
     sapling::note_encryption::SaplingDomain,
     serde::{Deserialize, Serialize},
+    std::collections::BTreeMap,
     transparent::pczt::Bip32Derivation,
-    zcash_note_encryption::try_output_recovery_with_pkd_esk,
+    zcash_note_encryption::{
+        Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput, try_output_recovery_with_pkd_esk,
+    },
     zcash_protocol::{consensus::NetworkConstants, value::BalanceError},
 };
-
-use zcash_primitives::transaction::TxVersion;
 
 pub mod input_selection;
 use input_selection::{
@@ -3184,21 +3182,19 @@ where
                     .iter()
                     .enumerate()
                     .filter_map(|(index, input)| {
-                        build_state
-                            .transparent_input_addresses
-                            .get(
-                                &TransparentAddress::from_script_from_chain(input.script_pubkey())
-                                    .expect("we created this with a supported transparent address"),
-                            )
-                            .and_then(|address_metadata| match address_metadata.source() {
-                                TransparentAddressSource::Derived {
-                                    scope,
-                                    address_index,
-                                } => Some((index, *scope, *address_index)),
-                                #[cfg(feature = "transparent-key-import")]
-                                TransparentAddressSource::StandalonePubkey(_)
-                                | TransparentAddressSource::StandaloneScript(_) => None,
-                            })
+                        let address_metadata = build_state.transparent_input_addresses.get(
+                            &TransparentAddress::from_script_from_chain(input.script_pubkey())
+                                .expect("we created this with a supported transparent address"),
+                        )?;
+                        match address_metadata.source() {
+                            TransparentAddressSource::Derived {
+                                scope,
+                                address_index,
+                            } => Some((index, *scope, *address_index)),
+                            #[cfg(feature = "transparent-key-import")]
+                            TransparentAddressSource::StandalonePubkey(_)
+                            | TransparentAddressSource::StandaloneScript(_) => None,
+                        }
                     })
                     .collect::<Vec<_>>();
 
@@ -3408,15 +3404,15 @@ fn compact_signer_view(pczt: &pczt::Pczt) -> pczt::Pczt {
 /// independently and returns only new Orchard and Ironwood signatures.
 ///
 /// In addition to the [`SignerView::Compact`] policy of [`redact_pczt_for_signer`],
-/// this removes spend full viewing keys, and removes the randomizer from actions already
-/// authorized in `pczt`, while unsigned actions such as wallet controlled zero value
-/// spends retain theirs. Existing signatures are retained, so every action in the
-/// returned view is either already authorized or still authorizable. Sapling signatures
-/// require a separate signing path.
+/// this removes spend full viewing keys and existing signatures. It also removes the
+/// randomizer from actions already authorized in `pczt`, while unsigned actions such as
+/// wallet controlled zero value spends retain theirs. Sapling signatures require a
+/// separate signing path.
 ///
 /// The caller must retain the authoritative PCZT and apply the returned signature
-/// contributions to it. This function must run before its existing signatures are
-/// redacted. The returned view cannot be signed with the high level
+/// contributions to it; the returned view is not independently extractable. This
+/// function must run before its existing signatures are redacted. The returned view
+/// cannot be signed with the high level
 /// [`pczt::roles::signer::Signer`] because that role expects full viewing keys.
 #[cfg(feature = "pczt")]
 pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
@@ -3436,13 +3432,15 @@ pub fn redact_pczt_for_batch_signer(pczt: &pczt::Pczt) -> pczt::Pczt {
         mut redactor: pczt::roles::redactor::orchard::OrchardRedactor<'_>,
         preauthorized_action_indices: &[usize],
     ) {
-        // The batch Signer derives its FVK and returns only new signatures.
-        redactor.redact_actions(|mut action| action.clear_spend_fvk());
-        // An action that already carries a signature needs nothing further, so it gives up its
-        // randomizer. Its signature is RETAINED: the only pre-signed actions in a wallet PCZT
-        // are the protocol padding dummies, which carry no ZIP 32 derivation and whose
-        // `dummy_sk` the compact view has already cleared, so stripping the signature would
-        // leave an action that neither the Signer nor the wallet could ever authorize.
+        // The batch Signer derives its FVK and returns only new signatures. Existing
+        // signatures MUST be omitted: deployed batch Signers reject requests that
+        // already carry signatures. Omitting them strands nothing — this view is a
+        // signing request, not the authoritative PCZT, and the caller's authoritative
+        // copy retains them.
+        redactor.redact_actions(|mut action| {
+            action.clear_spend_fvk();
+            action.clear_spend_auth_sig();
+        });
         // Unsigned actions keep alpha, including wallet controlled zero value spends.
         for &index in preauthorized_action_indices {
             redactor.redact_action(index, |mut action| action.clear_spend_alpha());
@@ -3491,9 +3489,6 @@ where
     DbT: WalletWrite + WalletCommitmentTrees,
     <DbT as WalletRead>::AccountId: serde::de::DeserializeOwned,
 {
-    use std::collections::BTreeMap;
-    use zcash_note_encryption::{Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput};
-
     let finalized = SpendFinalizer::new(pczt).finalize_spends()?;
 
     let proposal_info = finalized
@@ -3509,62 +3504,82 @@ where
             })
         })?;
 
-    let orchard_output_info = finalized
-        .orchard()
-        .actions()
-        .iter()
-        .map(|act| {
-            let note = || {
-                let recipient =
-                    act.output().recipient().as_ref().and_then(|b| {
+    // The per-action sent-output recovery shared by the Orchard and Ironwood bundles, which
+    // differ only in the note plaintext version their notes carry (`V2` for Orchard, `V3` —
+    // ZIP 2005 — for Ironwood): the note reconstructed from the PCZT's output fields, zipped
+    // with the recipient metadata `create_pczt_from_proposal` attached to the output.
+    #[allow(clippy::type_complexity)]
+    fn orchard_protocol_output_info<AccountId: serde::de::DeserializeOwned>(
+        actions: &[pczt::orchard::Action],
+        note_version: orchard::note::NoteVersion,
+    ) -> Result<
+        Vec<
+            Option<(
+                (PcztRecipient<AccountId>, Option<ZcashAddress>),
+                orchard::Note,
+            )>,
+        >,
+        PcztError,
+    > {
+        actions
+            .iter()
+            .map(|act| {
+                let note = || {
+                    let recipient = act.output().recipient().as_ref().and_then(|b| {
                         ::orchard::Address::from_raw_address_bytes(b).into_option()
                     })?;
-                let value = act
+                    let value = act
+                        .output()
+                        .value()
+                        .map(orchard::value::NoteValue::from_raw)?;
+                    let rho =
+                        orchard::note::Rho::from_bytes(act.spend().nullifier()).into_option()?;
+                    let rseed = act.output().rseed().as_ref().and_then(|rseed| {
+                        orchard::note::RandomSeed::from_bytes(*rseed, &rho).into_option()
+                    })?;
+
+                    orchard::Note::from_parts(recipient, value, rho, rseed, note_version)
+                        .into_option()
+                };
+
+                let external_address = act
                     .output()
-                    .value()
-                    .map(orchard::value::NoteValue::from_raw)?;
-                let rho = orchard::note::Rho::from_bytes(act.spend().nullifier()).into_option()?;
-                let rseed = act.output().rseed().as_ref().and_then(|rseed| {
-                    orchard::note::RandomSeed::from_bytes(*rseed, &rho).into_option()
-                })?;
+                    .user_address()
+                    .as_deref()
+                    .map(ZcashAddress::try_from_encoded)
+                    .transpose()
+                    .map_err(|e| PcztError::Invalid(format!("Invalid user_address: {e}")))?;
 
-                orchard::Note::from_parts(
-                    recipient,
-                    value,
-                    rho,
-                    rseed,
-                    orchard::note::NoteVersion::V2,
-                )
-                .into_option()
-            };
+                let pczt_recipient = act
+                    .output()
+                    .proprietary()
+                    .get(PROPRIETARY_OUTPUT_INFO)
+                    .map(|v| postcard::from_bytes::<PcztRecipient<AccountId>>(v))
+                    .transpose()
+                    .map_err(|e: postcard::Error| {
+                        PcztError::Invalid(format!(
+                            "Postcard decoding of proprietary output info failed: {e}"
+                        ))
+                    })?
+                    .map(|pczt_recipient| (pczt_recipient, external_address));
 
-            let external_address = act
-                .output()
-                .user_address()
-                .as_deref()
-                .map(ZcashAddress::try_from_encoded)
-                .transpose()
-                .map_err(|e| PcztError::Invalid(format!("Invalid user_address: {e}")))?;
+                // If the pczt recipient is not present, this is a dummy note; if the note is not
+                // present, then the PCZT has been pruned to make this output unrecoverable and so
+                // we also ignore it.
+                Ok(pczt_recipient.zip(note()))
+            })
+            .collect::<Result<Vec<_>, PcztError>>()
+    }
 
-            let pczt_recipient = act
-                .output()
-                .proprietary()
-                .get(PROPRIETARY_OUTPUT_INFO)
-                .map(|v| postcard::from_bytes::<PcztRecipient<<DbT as WalletRead>::AccountId>>(v))
-                .transpose()
-                .map_err(|e: postcard::Error| {
-                    PcztError::Invalid(format!(
-                        "Postcard decoding of proprietary output info failed: {e}"
-                    ))
-                })?
-                .map(|pczt_recipient| (pczt_recipient, external_address));
+    let orchard_output_info = orchard_protocol_output_info::<<DbT as WalletRead>::AccountId>(
+        finalized.orchard().actions(),
+        orchard::note::NoteVersion::V2,
+    )?;
 
-            // If the pczt recipient is not present, this is a dummy note; if the note is not
-            // present, then the PCZT has been pruned to make this output unrecoverable and so we
-            // also ignore it.
-            Ok(pczt_recipient.zip(note()))
-        })
-        .collect::<Result<Vec<_>, PcztError>>()?;
+    let ironwood_output_info = orchard_protocol_output_info::<<DbT as WalletRead>::AccountId>(
+        finalized.ironwood().actions(),
+        orchard::note::NoteVersion::V3,
+    )?;
 
     let sapling_output_info = finalized
         .sapling()
@@ -3689,6 +3704,15 @@ where
             MemoBytes::from_bytes(memo_bytes(&m)).expect("Memo is the correct length.")
         });
 
+        // The note commitment tree an output's note is appended to is fully determined by the
+        // pool the output was created in; recording it mirrors the transaction-builder path
+        // (`create_proposed_transactions`), which tags every shielded sent output with its tree.
+        let note_commitment_tree = match output_pool {
+            ShieldedPool::Sapling => NoteCommitmentTree::Sapling,
+            ShieldedPool::Orchard => NoteCommitmentTree::Orchard,
+            ShieldedPool::Ironwood => NoteCommitmentTree::Ironwood,
+        };
+
         let note_value = Zatoshis::try_from(note_value(&note))?;
         let recipient = match (pczt_recipient, external_address) {
             (PcztRecipient::External, Some(addr)) => Ok(Recipient::External {
@@ -3715,7 +3739,8 @@ where
             }
         }?;
 
-        Ok(SentTransactionOutput::from_parts(
+        Ok(SentTransactionOutput::from_parts_in_tree(
+            Some(note_commitment_tree),
             output_index,
             recipient,
             note_value,
@@ -3749,6 +3774,40 @@ where
                             |note| Note::Orchard {
                                 note,
                                 pool: orchard::ValuePool::Orchard,
+                            },
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+
+    #[cfg(feature = "orchard")]
+    let ironwood_outputs = transaction
+        .ironwood_bundle()
+        .map(|bundle| {
+            assert_eq!(bundle.actions().len(), ironwood_output_info.len());
+            bundle
+                .actions()
+                .iter()
+                .zip(ironwood_output_info)
+                .enumerate()
+                .filter_map(|(output_index, (action, output_info))| {
+                    output_info.map(|((pczt_recipient, external_address), note)| {
+                        let domain = IronwoodDomain::for_action(action);
+                        to_sent_transaction_output::<_, _, _, DbT, _>(
+                            domain,
+                            note,
+                            action,
+                            ShieldedPool::Ironwood,
+                            output_index,
+                            pczt_recipient,
+                            external_address,
+                            |note| note.value().inner(),
+                            |memo| memo,
+                            |note| Note::Orchard {
+                                note,
+                                pool: orchard::ValuePool::Ironwood,
                             },
                         )
                     })
@@ -3864,6 +3923,8 @@ where
     let mut outputs: Vec<SentTransactionOutput<_>> = vec![];
     #[cfg(feature = "orchard")]
     outputs.extend(orchard_outputs.into_iter().flatten());
+    #[cfg(feature = "orchard")]
+    outputs.extend(ironwood_outputs.into_iter().flatten());
     outputs.extend(sapling_outputs.into_iter().flatten());
     outputs.extend(transparent_outputs.into_iter().flatten());
 

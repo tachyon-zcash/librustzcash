@@ -8132,7 +8132,7 @@ pub fn propose_v5_payment_to_orchard_receiver_is_rejected<Dsf>(
 pub fn create_pczt_supports_ironwood_output<Dsf>(ds_factory: Dsf, cache: impl TestCache)
 where
     Dsf: DataStoreFactory,
-    <Dsf as DataStoreFactory>::AccountId: serde::Serialize,
+    <Dsf as DataStoreFactory>::AccountId: serde::Serialize + serde::de::DeserializeOwned,
 {
     // A network on which NU6.3 — the version 6 transaction format — is active from height 100_000.
     let ironwood_active_network = {
@@ -8416,20 +8416,10 @@ where
         assert_eq!(batch_bundle.len(), original_bundle.len());
         for (original, batch) in original_bundle.iter().zip(batch_bundle) {
             assert!(!batch.has_fvk);
-            // A pre-signed protocol padding dummy keeps its signature: the batch view has
-            // already dropped its `dummy_sk` and it carries no derivation, so nothing
-            // downstream could ever reproduce that signature.
-            assert_eq!(batch.has_signature, original.has_signature);
+            assert!(!batch.has_signature);
             assert_eq!(
                 batch.has_alpha,
                 original.has_alpha && !original.has_signature
-            );
-            // The invariant the redaction must preserve: every action is either already
-            // authorized or still authorizable. Neither the Signer nor the wallet can
-            // rescue an action that is left with no signature and no randomizer.
-            assert!(
-                batch.has_signature || batch.has_alpha,
-                "the batch signer view stranded an action: {batch:?}",
             );
 
             if original.has_signature {
@@ -8522,14 +8512,16 @@ where
         .unwrap()
         .finish();
 
-    // Every action is now authorized: the ones the Signer signed, plus the pre-signed
-    // padding dummies whose signatures the batch view retained. Those retained signatures
-    // ride back along with the new ones and re-apply to the authoritative PCZT unchanged.
     let signatures = pczt::roles::signer::extract_orchard_spend_auth_signatures(&signed_view);
-    let expected_signature_positions = (0..original_spend_states.0.len())
+    let expected_signature_positions = orchard_signable
+        .iter()
+        .copied()
         .map(|index| (orchard::ValuePool::Orchard, index))
         .chain(
-            (0..original_spend_states.1.len()).map(|index| (orchard::ValuePool::Ironwood, index)),
+            ironwood_signable
+                .iter()
+                .copied()
+                .map(|index| (orchard::ValuePool::Ironwood, index)),
         )
         .collect::<Vec<_>>();
     let signature_positions = signatures
@@ -8591,6 +8583,51 @@ where
             original.output().proprietary()
         );
     }
+
+    // Prove both bundles — a single Orchard proving key governs both pools post-NU6.3, selected
+    // by the circuit version the PCZT's consensus branch implies — then extract the final
+    // transaction and store it. The stored record must carry the IRONWOOD payment output (the
+    // payment itself, which post-NU6.3 travels in the Ironwood bundle) alongside the Orchard
+    // change; the Ironwood outputs were previously dropped from the stored `SentTransaction`
+    // entirely (issue #2890).
+    let pczt_branch_id = consensus::BranchId::try_from(*authorized.global().consensus_branch_id())
+        .expect("the PCZT carries a valid consensus branch ID");
+    let orchard_pk = zcash_primitives::transaction::builder::cached_orchard_proving_key(
+        zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+            pczt_branch_id,
+            ::orchard::ValuePool::Orchard,
+        )
+        .expect("the PCZT's consensus branch supports the Orchard pool")
+        .circuit_version(),
+    );
+    let proven = Prover::new(authorized)
+        .create_orchard_proof(orchard_pk)
+        .unwrap()
+        .create_ironwood_proof(orchard_pk)
+        .unwrap()
+        .finish();
+
+    let txid = st
+        .extract_and_store_transaction_from_pczt(proven)
+        .expect("extracts, verifies, and stores the finalized transaction");
+
+    // The Ironwood payment output is recorded among the transaction's sent outputs, carrying the
+    // payment value and the external recipient address.
+    let sent_outputs = st.wallet().get_sent_outputs(&txid).unwrap();
+    assert!(
+        sent_outputs.iter().any(|output| {
+            output.value() == Zatoshis::const_from_u64(10_000)
+                && output.external_recipient().is_some()
+        }),
+        "the Ironwood payment output is recorded among the sent outputs: {sent_outputs:?}",
+    );
+    assert!(
+        !st.wallet()
+            .get_sent_note_ids(&txid, ShieldedPool::Ironwood)
+            .unwrap()
+            .is_empty(),
+        "the payment's sent-note record belongs to the Ironwood pool",
+    );
 }
 
 /// The transaction history entry for a payment funded from the Orchard pool and delivered

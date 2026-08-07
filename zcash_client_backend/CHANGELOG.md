@@ -10,6 +10,59 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- The `orchard` feature is now enabled by default. Consumers that require a
+  smaller feature set should disable default features and enable only the
+  features they need.
+- `data_api::WalletWrite::store_transactions_to_be_sent` is now required to be
+  idempotent: storing a transaction the wallet has already recorded must
+  replace that record rather than fail. An implementation that inserts its
+  sent-output records must upsert them instead.
+
+## [0.24.0-rc.7] - 2026-08-03
+
+### Added
+- `zcash_client_backend::data_api::zip318` (requires the `orchard` feature), which
+  assembles ZIP 318 classification evidence from a decrypted transaction and
+  classifies it. What it can observe is weaker than what the same predicate sees on
+  a transaction the wallet is building, because on chain a zero-valued padding dummy
+  and an unrelated party's output are equally undecryptable; the weaker reading
+  admits more, never less.
+- `zcash_client_backend::data_api::ll::LowLevelWalletWrite::put_zip318_classification`,
+  a required method, called by `store_decrypted_tx` under the `orchard` feature. A
+  store that has not been given a classification for a transaction must report it as
+  unclassified, never as `Nonconforming`.
+- `zcash_client_backend::data_api::testing::TestState::generate_and_scan_empty_blocks`
+- `zcash_client_backend::data_api::testing::TestState::create_account_from_test_seed`
+- `zcash_client_backend::data_api::testing::TestState::orchard_anchor_at` (requires
+  the `orchard` feature)
+- `zcash_client_backend::data_api::ll::wallet::batch_ensure_heights`, the complete set
+  of checkpoint heights a batch of scanned blocks must ensure: cross-pool alignment
+  unioned with the heights an `AnchorRetention` policy retains within the batch's
+  range. `put_blocks` now composes its ensure sets through it; behaviour is unchanged.
+  A consumer maintaining its note commitment trees by other means must compose both
+  obligations. Scanning checkpoints a block only at its last note commitment, so a
+  retention-grid boundary landing on a block with no shielded output in any pool is
+  not checkpointed by cross-pool alignment; marking such a boundary without ensuring
+  it leaves anything pre-signed against that height (for example a ZIP 318
+  pool-migration transfer) permanently unprovable.
+
+### Fixed
+- `zcash_client_backend::data_api::wallet::extract_and_store_transaction_from_pczt`
+  now records the transaction's Ironwood outputs in the stored `SentTransaction`.
+  Previously every Ironwood output was silently omitted: for a post-NU6.3 PCZT
+  delivering a payment through the Ironwood pool, the external recipient's
+  address and decrypted memo were never persisted (and are not otherwise
+  recoverable), and wallet-internal Ironwood outputs were invisible to the
+  wallet until the transaction was mined and scanned. The function also now
+  tags every shielded sent output with its note commitment tree, as the
+  transaction-builder spend path does.
+- `zcash_client_backend::data_api::wallet::redact_pczt_for_batch_signer` now
+  omits existing Orchard and Ironwood spend authorization signatures from the
+  batch signing request. They remain present in the caller's authoritative
+  PCZT, so the response only contains new signatures. This restores
+  compatibility with batch Signers that reject pre-signed requests.
+
 ## [0.24.0-rc.6] - 2026-07-29
 
 ### Added
@@ -116,7 +169,7 @@ workspace.
   at that boundary. `AnchorRetentionInterval::custom` is no longer gated behind
   `unstable`, and `AnchorRetentionInterval::from_stored_block_count` is removed — use
   `custom`.
-- Every public error enum in this crate is now `#[non_exhaustive]` 
+- Every public error enum in this crate is now `#[non_exhaustive]`
   so that future variants can be added without a breaking release. A
   `match` over any of them must now include a wildcard arm:
   `data_api::chain::Error`, `data_api::error::{Error, RewindError, PcztError,
@@ -744,7 +797,7 @@ workspace.
 - Migrated to `lightwallet-protocol v0.5.0`, `zcash_protocol 0.10.0`,
   `zcash_address 0.13.0`, `zcash_transparent 0.9.0`, `zip321 0.9.0-rc.1`,
   `zcash_keys 0.15.0`, `orchard 0.15`, `zcash_primitives 0.29.0`,
-  `zcash_proofs 0.29.0`, `zip321 0.9.0-rc.1`, `pczt 0.8.0-rc.1`, `shardtree 0.7`. 
+  `zcash_proofs 0.29.0`, `zip321 0.9.0-rc.1`, `pczt 0.8.0-rc.1`, `shardtree 0.7`.
 - `zcash_client_backend::data_api::ll::LowLevelWalletRead` has an added
   `block_fully_scanned_height` method, returning the height to which the wallet
   has been fully scanned.

@@ -10,6 +10,243 @@ workspace.
 
 ## [Unreleased]
 
+## [0.22.0-rc.8] - 2026-08-07
+
+### Added
+- `wallet::init::migrations` release-state constants backfilling every
+  published crate version whose migration-graph state had no constant:
+  `V_0_7_0`, `V_0_8_0_RC1`, `V_0_8_0_RC4`, `V_0_8_0_RC5`, `V_0_8_1`,
+  `V_0_22_0_RC5`, and `V_0_22_0_RC6`. Each was computed from the corresponding
+  crate artifact published on crates.io.
+- The `v_migration_transactions` view: one row per SCHEDULED pool-migration
+  transaction (belonging to a non-terminal migration and not yet broadcast),
+  with its identity, kind, lifecycle state, scheduled and expiry heights,
+  values, and ZIP 318 classification code.
+- The `v_transactions_with_pending_migrations` view: `v_transactions` plus the
+  scheduled migration transactions projected into the same column shape.
+  `v_transactions` itself is unchanged; a consumer that wants pending
+  migration activity in one merged feed reads this view instead.
+- `pool_migration::orchard_ironwood::PoolMigrations::cancel_migration` and
+  `pool_migration::CancelOutcome`: cancel the account's migration at the
+  user's request. Releases the note reservations of its never-broadcast
+  transactions (returning them to default note selection immediately), then
+  records the terminal `cancelled` status, without deserializing the migration
+  state — so it works on a record that no longer parses. Transactions already
+  broadcast cannot be recalled; the outcome reports them rather than refusing.
+  With no pending migration, only the repair half runs: the latest retained
+  record's reservations are released and its status is untouched.
+- `pool_migration::orchard_ironwood::PoolMigrations::take_transaction_for_broadcast`:
+  finalizes a proved migration transaction, records it in the wallet's own
+  transaction tables, and returns the broadcastable `Transaction`, in one
+  database transaction. This — not proving — is now where a migration
+  transaction enters the wallet's view (see the Changed entries).
+- A schema migration removing the wallet-side transaction records of
+  never-broadcast transactions belonging to TERMINAL pool migrations, which
+  earlier releases wrote at prove time: their spend marks froze the input
+  notes out of the user's balance until each transaction's expiry, with
+  nothing left to broadcast them.
+- `pool_migration::MigrationUuid`: the stable external identity of one
+  pool-migration record, safe to hand across an FFI (row ids are not stable
+  across a restore).
+- `pool_migration::MigrationSummary` and, on each pool facade
+  (`pool_migration::orchard_ironwood::PoolMigrations`), the history read API:
+  `latest_migration` (the most recent record whatever its status — what a UI
+  renders once `get_migration` reports `None` for a finished migration),
+  `list_migrations` (newest-first summaries projected in SQL, reading no
+  stored PCZTs), and `get_migration_by_id` (one record's full state,
+  historical or pending).
+- A schema migration giving each pool-migration record a durable identity — a
+  `uuid` column (random per row, backfilled for existing rows) and a nullable
+  `committed_height` column (`NULL` for rows that predate it) — and rescoping
+  the per-account uniqueness of `orchard_ironwood_migrations` to NON-TERMINAL
+  rows, so an account retains every finished migration while holding at most
+  one in progress.
+
+### Changed
+- Migrated to `zcash_pool_migration 0.1.0-rc.7`.
+- The pool-migration transactions table's `txid` column is now a `BLOB` holding
+  the transaction id's internal bytes, matching how the wallet's own
+  `transactions` table keys them; it was hex `TEXT`. An application querying
+  this table directly must bind and read raw bytes, and must not route them
+  through the display encoding, which is byte-reversed. The
+  `orchard_ironwood_migration_txid_blob` migration converts existing rows.
+- `WalletWrite::store_transactions_to_be_sent` now upserts each transaction's
+  sent-output records, so storing a transaction the wallet has already
+  recorded replaces that record instead of failing.
+- Persisting a pool-migration state with any terminal status through
+  `replace_migration` now releases the note reservations held by its
+  never-broadcast transactions, in the same write: a migration superseded in
+  response to `Replan` (or marked failed or cancelled through the engine) no
+  longer strands its live transfers' locks until they expire.
+- Proving a migration transaction no longer writes it into the wallet's own
+  transaction tables: `store_proved_transaction` records the proof in the
+  migration store alone, and the wallet-side record (raw transaction, sent
+  outputs, input spend marks, status-retrieval queue entry) is written by
+  `take_transaction_for_broadcast`, atomically with handing out the
+  broadcastable bytes. Consequences a consumer can observe: the user's full
+  balance remains spendable through the prove-to-broadcast window (the
+  reservation is the advisory note lock taken at proving, overridable via a
+  `LockedInputPolicy` naming the migration's lock owners); a never-broadcast
+  txid is no longer queued for status retrieval (previously disclosed to the
+  light wallet server before broadcast); and a pending migration transaction
+  no longer appears in `v_transactions` before broadcast.
+- `pool_migration::PoolMigrations::get_migration` now reports only the
+  migration IN PROGRESS: a migration persisted with a terminal status is
+  retained as history rather than returned here, and committing a replacement
+  migration no longer destroys the record of the one it replaces. A caller
+  that rendered a finished migration from `get_migration` (which now returns
+  `None` for it) should use `latest_migration` (or `list_migrations` /
+  `get_migration_by_id`) instead.
+- A newly committed pool migration's record is stamped with the wallet's chain
+  height at first persistence (`MigrationSummary::committed_height`); records
+  that predate the column report `None`.
+- Wallet truncation now revisits every retained `complete` pool-migration
+  record as well as the pending one, so a reorg that un-mines a PREVIOUS
+  migration's transfers demotes that record exactly as it always demoted a
+  pending migration's state. `failed`, `superseded`, and `cancelled` records
+  are policy determinations and are not revisited.
+- The `orchard` feature is now enabled by default. Consumers that require a
+  smaller feature set should disable default features and enable only the
+  features they need.
+- A migration transaction is now classified against ZIP 318 when broadcast stores
+  it, in the same database transaction as the record itself, rather than only
+  once it has mined and been enhanced.
+- `WalletWrite::store_transactions_to_be_sent` now likewise classifies each
+  transaction as it stores it, so a transaction the wallet built is labelled
+  without waiting for it to mine. This covers canonical crossings built through
+  the ordinary proposal flow, not only those the pool-migration engine
+  constructs.
+- Neither change makes the NOT CLASSIFIED default safe to read as a decision.
+  Clients must still render it as "no label yet" rather than as "not a migration
+  transaction": rows written before the column existed keep that default, and
+  need the transaction rescanned before they can be labelled.
+
+### Fixed
+- Anchor-checkpoint retention is no longer owed to a migration that has reached
+  any terminal status. The grids of `failed`, `superseded`, and `cancelled`
+  migrations were retained for the lifetime of the wallet, because retention
+  excluded only `complete` migrations; nothing will drive a terminal migration
+  further, so those checkpoints were kept for proofs that will never be
+  requested and, the migration being terminal, were never revisited.
+- `wallet::init::migrations::V_0_8_0` held the leaf state of the 0.8.1 release
+  rather than 0.8.0's: the published 0.8.0 crate's final migration was
+  `v_transactions_shielding_balance`, with `v_transactions_note_uniqueness`
+  following in 0.8.1. The constant now records the true 0.8.0 state, and the
+  0.8.1 state it previously held is the new `V_0_8_1`. An external migration
+  anchored on `V_0_8_0` now anchors one migration earlier in the graph, which
+  cannot invalidate its ordering because every migration `V_0_8_0` previously
+  named is still ordered after the corrected state.
+
+## [0.22.0-rc.7] - 2026-08-03
+
+### Added
+- A `zip318_kind` column on the `transactions` table, recording how each transaction
+  classifies against ZIP 318 so that a wallet can label a pool-migration transaction
+  in its history without a migration plan, which does not survive a seed restore.
+  The column defaults to the code for NOT CLASSIFIED. The migration deliberately
+  does not classify existing rows: those keep the default and need the transaction
+  rescanned. A client must render the default as no label, never as "not a
+  migration".
+- A `zip318_kind` column on `v_transactions`, carrying that value through to the
+  view clients read their transaction history from. The mobile SDKs build their
+  history types from this view with their own SQL, so the column reaches them
+  with no change to any foreign function interface.
+- `pool_migration::orchard_ironwood::Error::ChainStateUnavailable`, returned
+  when a satisfiability check has no fully-scanned height to observe from.
+- `pool_migration::orchard_ironwood::FinalizeError`, and new
+  `pool_migration::orchard_ironwood::Error` variants `UnknownTransaction`,
+  `NotProved`, `ViewingKeyUnavailable`, `Finalize`, and `Wallet`, reporting
+  failures of the store's new proved-transaction finalization.
+- `zcash_client_sqlite::testing::db::TestDb::conn` and `TestDb::conn_mut`, for
+  tests that open a sibling store (a `pool_migration` `PoolMigrations`, say)
+  over the wallet database's own connection.
+
+### Changed
+- Migrated to `zcash_client_backend 0.24.0-rc.7`, `zcash_pool_migration 0.1.0-rc.6`.
+- `pool_migration::orchard_ironwood::PoolMigrations` now carries the network
+  parameters and a clock — `PoolMigrations::for_account` takes them ahead of
+  the connection (`for_account(params, clock, conn, account)`; a caller that
+  only reads or writes migration state may pass `()` for both, but the
+  `PoolMigrationWrite` implementation requires
+  `zcash_protocol::consensus::Parameters` and `util::Clock` values) — and
+  implements the new `PoolMigrationWrite::store_proved_transaction` (under the
+  `orchard` feature) by finalizing the proved migration transaction and
+  persisting it to the wallet's own transaction tables, atomically with the
+  migration state, in one database transaction: the raw transaction, its fee,
+  its outputs as sent notes, and its input notes marked spent. From the moment
+  a migration transaction is proved, the wallet therefore reports its inputs
+  spent (its own spends can no longer consume them) and its balance reflects
+  the pending transaction, rather than neither until the transaction is mined
+  and scanned. The `orchard_ironwood_migration_unsatisfiability` schema
+  migration renames `orchard_ironwood_migration_transactions.tx_id` to
+  `transfer_id`, and `orchard_ironwood_migration_transaction_deps`'s `tx_id`
+  and `depends_on_tx_id` to `transfer_id` and `depends_on_transfer_id`;
+  applications querying these tables directly must use the new names.
+  `orchard_ironwood_migration_tables` is unchanged and still creates the old
+  names, so an external migration anchored between the two sees the schema it
+  always has.
+- The database schema now includes the `unsatisfiable_at`,
+  `unsatisfiable_kind`, and `broadcast_failure_at` columns on
+  `orchard_ironwood_migration_transactions`, recording the chain height backing
+  a spent-input observation when a pool-migration transaction has been
+  determined unsatisfiable, which observation that was (`inputs_spent`,
+  `inputs_invalidated`, `anchor_invalidated`, or `inherited`), and the chain tip
+  a node reported when it REJECTED a broadcast of the transaction; the
+  `orchard_ironwood_migration_spend_nullifiers` table, caching each
+  transaction's real-spend nullifiers one row per nullifier, ordered by
+  `ordinal` and held to 32 bytes by a `CHECK`; and the
+  `replan_threshold` column
+  on `orchard_ironwood_migrations`, recording the integer percent of planned
+  transfer value, unsatisfiable, above which the migration is re-planned
+  immediately. `unsatisfiable_at` and `unsatisfiable_kind` are `NULL` together
+  or non-`NULL` together, and a row where they disagree — or one naming a kind
+  this release does not know — is reported as corrupt. The migration that adds
+  these backfills the nullifier cache for existing rows from their
+  stored PCZTs — failing with a corrupted-data error for a not-yet-mined row
+  whose stored PCZT is already proven (its real spends are no longer
+  identifiable, so the cache cannot be reconstructed), and leaving a mined
+  row's cache empty — and `replan_threshold` to the default policy;
+  `unsatisfiable_kind` and `broadcast_failure_at` need no backfill, since a
+  database lacking `unsatisfiable_at` carried neither marks nor
+  broadcast-failure reports.
+- `WalletWrite::truncate_to_height` (and everything routed through it) now also
+  rolls every stored pool migration back to the height it actually truncated
+  to, clearing unsatisfiability marks and broadcast-failure reports that rest on
+  discarded chain state, demoting transactions recorded mined above it, and
+  reverting a `Complete` status the demotion unsettles. Applications that were calling
+  `MigrationState::truncate_to_height` themselves from a reorg hook should stop:
+  the wallet now does it, in the same database transaction.
+- `pool_migration::orchard_ironwood::PoolMigrations` implements the new
+  `zcash_pool_migration` `PoolMigrationRead::check_step_satisfiability`
+  method, answering each cached real-spend nullifier from the wallet's
+  Orchard note and note-spend tables as observed at the fully-scanned height
+  (an unrecognized nullifier reads as not-yet-satisfiable). A pool-migration
+  TRANSFER that has been broadcast and is not yet mined is additionally
+  reported unsatisfiable through `UnsatisfiableCause::AnchorInvalidated` once
+  the Orchard anchor installed in its stored proven PCZT is the root of none of
+  the tree states the wallet retains, and the fully-scanned height has
+  advanced at least the caller's `ReorgSettleDepth` past the boundary the
+  transfer anchored to. A broadcast PREPARATION is never so reported: it
+  records no anchor boundary, so neither the root to compare against nor the
+  height to settle the comparison at is recoverable. Per-input
+  `InputObservation::Invalidated` observations are likewise not produced.
+- The pool-migration transactions table's `txid` column now holds EVERY row's transaction id,
+  recorded when the transaction is built, rather than appearing only once a transaction is
+  broadcast. The `orchard_ironwood_migration_unsatisfiability` migration fills it for existing
+  rows by DERIVING each id from that row's own stored PCZT, which works whatever the row's
+  lifecycle state; it fails with a corrupted-data error naming any row whose stored PCZT yields
+  no id.
+- `pool_migration::orchard_ironwood::PoolMigrations` implements the new
+  `zcash_pool_migration` `PoolMigrationRead::mined_height` method, answering
+  from the wallet's own `transactions` table. The answer is bounded by the
+  FULLY-SCANNED height rather than the chain tip: `mined_height` is also written
+  by transaction-status retrieval, which can learn that a transaction mined
+  before scanning reaches its block, and promoting on that would record `Mined`
+  above the region a reorg truncation would roll back. An unsynced wallet
+  reports nothing mined rather than erroring. Together with the truncation hook
+  above, a stored migration's mined heights now follow the wallet's scan in both
+  directions with no consumer hook in either.
+
 ## [0.22.0-rc.6] - 2026-07-29
 
 ### Added

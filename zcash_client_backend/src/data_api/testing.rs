@@ -8,6 +8,8 @@ use std::{
     num::NonZeroU32,
 };
 
+#[cfg(feature = "pczt")]
+use super::wallet::{create_pczt_from_proposal, extract_and_store_transaction_from_pczt};
 use assert_matches::assert_matches;
 use group::ff::Field;
 use incrementalmerkletree::{Marking, Retention};
@@ -21,6 +23,19 @@ use shardtree::{
     store::{ShardStore as _, memory::MemoryShardStore},
 };
 use subtle::ConditionallySelectable;
+#[cfg(feature = "transparent-inputs")]
+use {
+    super::{
+        CoinbaseFilter, TransactionsInvolvingAddress, TransparentBalances,
+        wallet::{
+            input_selection::ShieldingSelector, propose_shielding, propose_shielding_coinbase,
+            shield_transparent_funds,
+        },
+    },
+    crate::wallet::TransparentAddressMetadata,
+    ::transparent::address::TransparentAddress,
+    zcash_keys::keys::transparent::gap_limits::GapLimits,
+};
 
 use ::sapling::{
     note_encryption::{SaplingDomain, sapling_note_encryption},
@@ -38,6 +53,7 @@ use zcash_primitives::{
     block::BlockHash,
     transaction::{Transaction, TxId, components::sapling::zip212_enforcement, fees::FeeRule},
 };
+#[cfg(feature = "pczt")]
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
     ShieldedPool,
@@ -50,6 +66,19 @@ use zcash_protocol::{
 use zcash_script::script;
 use zip32::DiversifierIndex;
 use zip321::Payment;
+#[cfg(feature = "orchard")]
+use {
+    super::ORCHARD_SHARD_HEIGHT,
+    crate::proto::compact_formats::CompactOrchardAction,
+    ::orchard::{
+        note::{ExtractedNoteCommitment, Note as OrchardNote, NoteVersion, RandomSeed, Rho},
+        note_encryption::{IronwoodDomain, IronwoodNoteEncryption},
+        tree::MerkleHashOrchard,
+    },
+    group::ff::PrimeField,
+    pasta_curves::pallas,
+    zcash_note_encryption::ShieldedOutput,
+};
 
 use super::{
     Account, AccountBalance, AccountBirthday, AccountMeta, AccountPurpose, AccountSource,
@@ -70,6 +99,7 @@ use super::{
     },
 };
 
+#[cfg(feature = "pczt")]
 fn real_test_prover() -> &'static LocalTxProver {
     use std::sync::OnceLock;
 
@@ -93,23 +123,6 @@ use crate::{
     wallet::{
         LockOwner, Note, NoteId, OutputRef, OvkPolicy, ReceivedNote, WalletTransparentOutput,
     },
-};
-
-#[cfg(feature = "transparent-inputs")]
-use {
-    super::{
-        CoinbaseFilter, TransactionsInvolvingAddress, TransparentBalances,
-        wallet::input_selection::ShieldingSelector,
-    },
-    crate::wallet::TransparentAddressMetadata,
-    ::transparent::address::TransparentAddress,
-    zcash_keys::keys::transparent::gap_limits::GapLimits,
-};
-
-#[cfg(feature = "orchard")]
-use {
-    super::ORCHARD_SHARD_HEIGHT, crate::proto::compact_formats::CompactOrchardAction,
-    ::orchard::tree::MerkleHashOrchard, group::ff::PrimeField, pasta_curves::pallas,
 };
 
 pub mod pool;
@@ -609,6 +622,41 @@ impl<Cache, DataStore: WalletTest, Network: consensus::Parameters>
     }
 }
 
+impl<Cache, DataStore, Network> TestState<Cache, DataStore, Network>
+where
+    DataStore: WalletTest + WalletWrite,
+    Network: consensus::Parameters,
+{
+    /// Creates a FURTHER account under the test seed, at the test account's birthday, and returns
+    /// its id and spending key.
+    ///
+    /// The wallet assigns the next unused ZIP 32 account index, so this is a sibling of the
+    /// account [`TestBuilder`] configured — the shape a test needs to check that some answer is
+    /// scoped to the account it was asked of, rather than to the wallet.
+    ///
+    /// Create every account a test needs BEFORE scanning anything: account creation adjusts the
+    /// scan queue, which clears the wallet's fully-scanned height.
+    pub fn create_account_from_test_seed(
+        &mut self,
+        account_name: &str,
+    ) -> (<DataStore as WalletRead>::AccountId, UnifiedSpendingKey) {
+        let seed = SecretVec::new(
+            self.test_seed()
+                .expect("the test state was built with a seed")
+                .expose_secret()
+                .clone(),
+        );
+        let birthday = self
+            .test_account()
+            .expect("the test state was built with an account")
+            .birthday()
+            .clone();
+        self.wallet_mut()
+            .create_account(account_name, &seed, &birthday, None)
+            .expect("creates a further account under the test seed")
+    }
+}
+
 impl<Cache: TestCache, DataStore, Network> TestState<Cache, DataStore, Network>
 where
     Network: consensus::Parameters,
@@ -1022,6 +1070,40 @@ where
 
         Ok(())
     }
+
+    /// Generates `n` empty blocks, scans each, and returns the wallet's resulting fully-scanned
+    /// height.
+    ///
+    /// This is the "let the chain advance" step of a test that needs the scanned region to reach a
+    /// chosen depth above some earlier height — an anchor boundary a fixed number of blocks below
+    /// the tip, say — with none of the intervening blocks carrying wallet-relevant data.
+    pub fn generate_and_scan_empty_blocks(&mut self, n: usize) -> BlockHeight {
+        for _ in 0..n {
+            let (height, _) = self.generate_empty_block();
+            self.scan_cached_blocks(height, 1);
+        }
+        self.wallet()
+            .block_fully_scanned()
+            .expect("the wallet reports its fully-scanned block")
+            .expect("the wallet is fully scanned")
+            .block_height()
+    }
+
+    /// The root of the wallet's own Orchard note commitment tree at the checkpoint `height`, as an
+    /// anchor: the value a transaction proved against that height would have installed.
+    ///
+    /// `None` when the tree holds no checkpoint there; the tree's own error when it holds one but
+    /// cannot complete a root over the shard data it retains.
+    #[cfg(feature = "orchard")]
+    pub fn orchard_anchor_at(
+        &mut self,
+        height: BlockHeight,
+    ) -> Result<Option<::orchard::Anchor>, ShardTreeError<<DbT as WalletCommitmentTrees>::Error>>
+    {
+        self.wallet_mut()
+            .with_orchard_tree_mut(|tree| tree.root_at_checkpoint_id(&height))
+            .map(|root| root.map(::orchard::Anchor::from))
+    }
 }
 
 impl<Cache, DbT, ParamsT, AccountIdT, ErrT> TestState<Cache, DbT, ParamsT>
@@ -1296,8 +1378,6 @@ where
         InputsT: ShieldingSelector<InputSource = DbT>,
         ChangeT: ChangeStrategy<MetaSource = DbT>,
     {
-        use super::wallet::propose_shielding;
-
         let network = self.network().clone();
         propose_shielding::<_, _, _, _, Infallible>(
             self.wallet_mut(),
@@ -1337,8 +1417,6 @@ where
         InputsT: ShieldingSelector<InputSource = DbT>,
         FeeRuleT: zcash_primitives::transaction::fees::FeeRule + Clone,
     {
-        use super::wallet::propose_shielding_coinbase;
-
         let network = self.network().clone();
         propose_shielding_coinbase::<_, _, _, _, Infallible>(
             self.wallet_mut(),
@@ -1397,8 +1475,6 @@ where
         <DbT as WalletRead>::AccountId: serde::Serialize,
         FeeRuleT: FeeRule,
     {
-        use super::wallet::create_pczt_from_proposal;
-
         let network = self.network().clone();
 
         create_pczt_from_proposal(
@@ -1424,8 +1500,6 @@ where
     where
         <DbT as WalletRead>::AccountId: serde::de::DeserializeOwned,
     {
-        use super::wallet::extract_and_store_transaction_from_pczt;
-
         let prover = real_test_prover();
         let (spend_vk, output_vk) = prover.verifying_keys();
 
@@ -1457,8 +1531,6 @@ where
         InputsT: ShieldingSelector<InputSource = DbT>,
         ChangeT: ChangeStrategy<MetaSource = DbT>,
     {
-        use crate::data_api::wallet::shield_transparent_funds;
-
         let network = self.network().clone();
         shield_transparent_funds(
             self.wallet_mut(),
@@ -2580,8 +2652,6 @@ fn compact_orchard_action<R: RngCore + CryptoRng>(
     sender_ovk: Option<&::orchard::keys::OutgoingViewingKey>,
     rng: &mut R,
 ) -> (CompactOrchardAction, ::orchard::Note) {
-    use zcash_note_encryption::ShieldedOutput;
-
     let (compact_action, note) = ::orchard::note_encryption::testing::fake_compact_action(
         rng,
         nf_old,
@@ -2622,10 +2692,6 @@ fn compact_ironwood_action<R: RngCore + CryptoRng>(
     sender_ovk: Option<&::orchard::keys::OutgoingViewingKey>,
     rng: &mut R,
 ) -> (CompactOrchardAction, ::orchard::Note) {
-    use ::orchard::note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho};
-    use ::orchard::note_encryption::{IronwoodDomain, IronwoodNoteEncryption};
-    use zcash_note_encryption::Domain;
-
     // Derive `rho` from the revealed nullifier exactly as the crate does internally
     // (`Rho::from_nf_old(nf) == Rho(nf.inner())`), so that the domain the scanner reconstructs via
     // `IronwoodDomain::for_compact_action(nf_old)` matches and decryption succeeds.
@@ -2637,7 +2703,7 @@ fn compact_ironwood_action<R: RngCore + CryptoRng>(
             break rseed;
         }
     };
-    let note = Note::from_parts(
+    let note = OrchardNote::from_parts(
         recipient,
         ::orchard::value::NoteValue::from_raw(value.into_u64()),
         rho,
@@ -3635,7 +3701,6 @@ impl WalletCommitmentTrees for MockWalletDb {
         &mut self,
         index: u64,
     ) -> Result<Option<::sapling::Node>, ShardTreeError<Self::Error>> {
-        use shardtree::store::ShardStore as _;
         self.with_sapling_tree_mut(|t| {
             let addr =
                 incrementalmerkletree::Address::from_parts(SAPLING_SHARD_HEIGHT.into(), index);
@@ -3695,7 +3760,6 @@ impl WalletCommitmentTrees for MockWalletDb {
         &mut self,
         index: u64,
     ) -> Result<Option<::orchard::tree::MerkleHashOrchard>, ShardTreeError<Self::Error>> {
-        use shardtree::store::ShardStore as _;
         self.with_orchard_tree_mut(|t| {
             let addr =
                 incrementalmerkletree::Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), index);

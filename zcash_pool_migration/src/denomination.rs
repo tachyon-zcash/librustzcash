@@ -148,18 +148,6 @@ pub use zcash_protocol::zip318::{DENOM_CAP, MAX_RESIDUAL_VALUE};
 /// This is a policy default of this crate, not a ZIP 318 constant.
 pub const MIGRATION_MAX_PREPARED_NOTES_PER_RUN: usize = 50;
 
-/// Source-pool (Orchard) logical actions in a canonical migration transfer: the spend and its
-/// change. With [`DESTINATION_ACTIONS_PER_TRANSFER`], this is the canonical transfer shape whose
-/// ZIP-317 fee is the per-note transfer-fee buffer.
-pub(crate) const SOURCE_ACTIONS_PER_TRANSFER: usize = 2;
-
-/// Destination-pool (Ironwood) logical actions in a canonical migration transfer: the single
-/// canonical output, UNPADDED. The Ironwood builder permits a one-action bundle (no padding dummy),
-/// which the migration uses to save proving bandwidth on hardware signers; every migration transfer
-/// shares this shape, so the action count reveals nothing a canonical transfer does not already
-/// reveal.
-pub(crate) const DESTINATION_ACTIONS_PER_TRANSFER: usize = 1;
-
 /// The outcome of denomination planning: the self-funding notes to create, the values that will
 /// cross the turnstile, and the residual kept in the source pool. Produced by a
 /// [`DenominationStrategy`].
@@ -303,18 +291,27 @@ pub trait DenominationStrategy {
     /// Decompose `total_input_zatoshi` into self-funding notes, accounting the preparation fees at
     /// each step of the decomposition.
     ///
-    /// `prep_tx_fee_zatoshi` is the ZIP-317 fee of one canonical (padded) preparation transaction,
-    /// computed by the caller from the canonical shape. `prep_tx_count` is the capability that
-    /// answers, for a candidate multiset of prepared-note values (each `crossing + buffer`), how
-    /// many preparation transactions minting them will take — `None` when the wallet's notes cannot
-    /// mint that multiset at all. The engine backs it with the preparation planner, so the
-    /// decomposition reserves the TRUE preparation cost (consolidation, fan-out layers, and all) as
-    /// it grows, instead of a fixed guess repaired after the fact. `rng` is used by randomized
-    /// strategies and ignored by deterministic ones; it is bound as [`CryptoRng`] because a
-    /// randomized strategy's draws decide the on-chain crossing values, which are privacy-relevant.
+    /// `spendable_note_count` is how many spendable notes hold `total_input`. A strategy may
+    /// consult it only through the single predicate `spendable_note_count == 1`, which decides
+    /// whether preparation is avoidable at all: a lone note necessarily equals the balance, so a
+    /// balance of exactly one denomination plus its buffer is certain to fund that crossing
+    /// directly with no preparation fee, while with two or more notes no note can equal that
+    /// funding value and the fee reserve is mandatory. Beyond that bit, the published values must
+    /// remain a function of the balance alone. `prep_tx_fee_zatoshi` is the ZIP-317 fee of one
+    /// canonical (padded) preparation transaction, computed by the caller from the canonical
+    /// shape. `prep_tx_count` is the capability that answers, for a candidate multiset of
+    /// prepared-note values (each `crossing + buffer`), how many preparation transactions minting
+    /// them will take — `None` when the wallet's notes cannot mint that multiset at all. The
+    /// engine backs it with the preparation planner. A strategy must use it only to RECONCILE a
+    /// split it computed as above — dropping parts the wallet cannot fund, never substituting
+    /// different denominations — so the published values cannot otherwise depend on the wallet's
+    /// note shape. `rng` is used by randomized strategies and ignored by deterministic ones; it is
+    /// bound as [`CryptoRng`] because a randomized strategy's draws decide the on-chain crossing
+    /// values, which are privacy-relevant.
     fn plan<R: RngCore + CryptoRng>(
         &self,
         total_input: Zatoshis,
+        spendable_note_count: usize,
         prep_tx_fee: Zatoshis,
         prep_tx_count: &dyn Fn(&[Zatoshis]) -> Option<usize>,
         rng: &mut R,
@@ -332,6 +329,7 @@ pub(crate) fn zat(value: u64) -> Zatoshis {
 /// quantization), sized by the caller-computed canonical fees (see [`DenominationStrategy::plan`]).
 pub fn plan_denominations<R: RngCore + CryptoRng>(
     total_input: Zatoshis,
+    spendable_note_count: usize,
     transfer_fee_buffer: Zatoshis,
     prep_tx_fee: Zatoshis,
     prep_tx_count: &dyn Fn(&[Zatoshis]) -> Option<usize>,
@@ -339,8 +337,31 @@ pub fn plan_denominations<R: RngCore + CryptoRng>(
 ) -> DenominationPlan {
     CanonicalOneTwoFive::recommended(transfer_fee_buffer).plan(
         total_input,
+        spendable_note_count,
         prep_tx_fee,
         prep_tx_count,
         rng,
     )
+}
+
+/// Whether `total_input`, held as `spendable_note_count` notes, quantizes to at least one canonical
+/// part under the recommended strategy — that is, whether a wallet in this state could migrate part
+/// of its balance if its note values allowed. Independent of the note VALUES: reconciliation
+/// against them can only truncate the canonical split, never extend it, so a state for which this
+/// is `false` has nothing to migrate regardless of how the notes hold the value, while `true` with
+/// an empty reconciled plan means the note values — not the balance — blocked the run (see
+/// [`MigrationError::UnfundableSplit`](crate::engine::MigrationError::UnfundableSplit)).
+pub(crate) fn balance_has_canonical_split(
+    total_input: Zatoshis,
+    spendable_note_count: usize,
+    transfer_fee_buffer: Zatoshis,
+    prep_tx_fee: Zatoshis,
+) -> bool {
+    !CanonicalOneTwoFive::recommended(transfer_fee_buffer)
+        .unconstrained_split(
+            u64::from(total_input),
+            spendable_note_count,
+            u64::from(prep_tx_fee),
+        )
+        .is_empty()
 }

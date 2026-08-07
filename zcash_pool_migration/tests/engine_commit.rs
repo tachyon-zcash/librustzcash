@@ -12,16 +12,21 @@
 use orchard::keys::SpendAuthorizingKey;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
+use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::COIN;
 
 use zcash_pool_migration::build::sign_pczt;
 use zcash_pool_migration::engine::{
-    MigrationPlan, MigrationStatus, MigrationTxKind, MigrationTxState, PoolMigrationRead,
-    PoolMigrationWrite, batch_unsigned_by_action_budget, build_preparation_unsigned,
-    commit_preparation, plan_migration,
+    MigrationPlan, MigrationState, MigrationStatus, MigrationTxKind, MigrationTxState,
+    PoolMigrationRead, PoolMigrationWrite, batch_unsigned_by_action_budget,
+    build_preparation_unsigned, commit_preparation, plan_migration,
 };
+use zcash_pool_migration::pczt_txid::{pczt_txid, stored_pczt_txid};
 use zcash_pool_migration::preparation::PREP_TX_ACTIONS;
+use zcash_pool_migration::satisfiability::{
+    AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold, advance_migration,
+};
 use zcash_pool_migration::signing_rounds::SigningRoundBudget;
 use zcash_pool_migration::state::AdvanceStep;
 use zcash_pool_migration_memory::{CommitMock, TARGET_HEIGHT, regtest_network, spending_key};
@@ -57,6 +62,7 @@ fn commits_the_whole_migration_in_one_pass() {
         &mut backend,
         &plan,
         &mut rng,
+        ReplanThreshold::DEFAULT,
     )
     .expect("commits the migration");
     assert_eq!(state.status(), MigrationStatus::Committed);
@@ -126,6 +132,7 @@ fn commits_a_multi_layer_migration_in_one_pass() {
         &mut backend,
         &plan,
         &mut rng,
+        ReplanThreshold::DEFAULT,
     )
     .expect("commits the migration");
     assert_eq!(state.transactions().len(), prep_count + transfer_count);
@@ -152,20 +159,39 @@ fn commits_a_multi_layer_migration_in_one_pass() {
         }
     }
 
-    // The state machine walks the broadcasts in dependency order: layer 0 first; layer 1 only once
-    // layer 0 mines; the transfers only once the whole preparation mines.
+    // Driven the way a consumer drives it — through `advance_migration`, against the mock store,
+    // which vouches for every candidate — the migration walks the broadcasts in dependency order:
+    // layer 0 first; layer 1 only once layer 0 mines; the transfers only once the whole preparation
+    // mines.
     let mut state = state;
+    let config = AdvanceConfig::new(ReorgSettleDepth::new(10));
     // A height past every scheduled broadcast (so each transaction is due, not blocked on the
     // schedule) but within every expiry window (so none is expired and offered for rebuild): the
-    // latest scheduled height. This exercises the dependency-ordering walk, not expiry handling.
-    let target = state
-        .transactions()
-        .iter()
-        .map(|t| t.scheduled_height())
-        .max()
-        .expect("the committed migration has transactions");
-    match state.next_step(target) {
-        AdvanceStep::Prove { id, .. } | AdvanceStep::Broadcast { id } => {
+    // latest scheduled height. This exercises the dependency-ordering walk, not schedule
+    // handling — and because the drive layer RE-SPREADS a schedule this overdue (the whole
+    // pending schedule shifts forward before the first step of each backlog is served), the
+    // target is recomputed from the current schedule before every call rather than fixed once.
+    let latest_scheduled = |state: &MigrationState| {
+        state
+            .transactions()
+            .iter()
+            .map(|t| t.scheduled_height())
+            .max()
+            .expect("the committed migration has transactions")
+    };
+    let targets = DuenessTargets::at(latest_scheduled(&state));
+    match advance_migration(&mut backend, &mut state, targets, &config, &mut rng)
+        .expect("the store answers")
+        .step()
+        .clone()
+    {
+        AdvanceStep::Prove { transactions } => {
+            assert!(
+                transactions.iter().all(|t| layer0_ids.contains(&t.id())),
+                "layer 0 proves first"
+            )
+        }
+        AdvanceStep::Broadcast { id } => {
             assert!(layer0_ids.contains(&id), "layer 0 broadcasts first")
         }
         other => panic!("expected a broadcast step, got {other:?}"),
@@ -179,8 +205,19 @@ fn commits_a_multi_layer_migration_in_one_pass() {
         .filter(|t| matches!(t.kind(), MigrationTxKind::Preparation { layer: 1, .. }))
         .map(|t| t.id())
         .collect();
-    match state.next_step(target) {
-        AdvanceStep::Prove { id, .. } | AdvanceStep::Broadcast { id } => {
+    let targets = DuenessTargets::at(latest_scheduled(&state));
+    match advance_migration(&mut backend, &mut state, targets, &config, &mut rng)
+        .expect("the store answers")
+        .step()
+        .clone()
+    {
+        AdvanceStep::Prove { transactions } => {
+            assert!(
+                transactions.iter().all(|t| layer1_ids.contains(&t.id())),
+                "layer 1 proves once layer 0 mines"
+            )
+        }
+        AdvanceStep::Broadcast { id } => {
             assert!(
                 layer1_ids.contains(&id),
                 "layer 1 broadcasts once layer 0 mines"
@@ -191,8 +228,18 @@ fn commits_a_multi_layer_migration_in_one_pass() {
     for id in &layer1_ids {
         state.mark_mined(*id, BlockHeight::from_u32(2_000_020));
     }
-    match state.next_step(target) {
-        AdvanceStep::Prove { id, .. } | AdvanceStep::Broadcast { id } => {
+    let targets = DuenessTargets::at(latest_scheduled(&state));
+    match advance_migration(&mut backend, &mut state, targets, &config, &mut rng)
+        .expect("the store answers")
+        .step()
+        .clone()
+    {
+        step @ (AdvanceStep::Prove { .. } | AdvanceStep::Broadcast { .. }) => {
+            let id = match &step {
+                AdvanceStep::Prove { transactions } => transactions[0].id(),
+                AdvanceStep::Broadcast { id } => *id,
+                _ => unreachable!(),
+            };
             let tx = state
                 .transactions()
                 .iter()
@@ -223,6 +270,7 @@ fn external_signing_batches_by_action_budget() {
         &mut backend,
         &plan,
         &mut rng,
+        ReplanThreshold::DEFAULT,
     )
     .expect("builds the migration unsigned");
     assert_eq!(unsigned.len(), state.transactions().len());
@@ -266,4 +314,126 @@ fn external_signing_batches_by_action_budget() {
     for tx in state.transactions() {
         assert_eq!(tx.state(), MigrationTxState::Signed);
     }
+}
+
+/// Every committed transaction's txid is derivable from its stored SIGNED PCZT, before anything is
+/// proved or broadcast, and each one is distinct.
+///
+/// This is what lets [`advance_migration`] recognize a transaction the wallet has seen mine even
+/// when the consumer never recorded broadcasting it. The derivation is over real committed
+/// artifacts — absent anchors, deferred witnesses — because that is the state the sweep meets them
+/// in. That the id survives proving is forced by the signatures made here: they commit to the
+/// txid, so a transaction whose id moved when its proof was installed could not be broadcast at
+/// all.
+///
+/// [`advance_migration`]: zcash_pool_migration::satisfiability::advance_migration
+#[test]
+fn every_committed_transaction_has_a_derivable_txid() {
+    let seed = 11u64;
+    let (mut backend, plan) = single_note_setup(seed, 78 * COIN);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+    let state = commit_preparation(
+        &regtest_network(true),
+        BlockHeight::from_u32(TARGET_HEIGHT),
+        &mut backend,
+        &plan,
+        &mut rng,
+        ReplanThreshold::DEFAULT,
+    )
+    .expect("commits the migration");
+
+    let mut seen: Vec<TxId> = Vec::new();
+    for tx in state.transactions() {
+        assert_eq!(tx.state(), MigrationTxState::Signed, "signed, not proved");
+        let parsed = pczt::Pczt::parse(tx.pczt()).expect("the stored PCZT parses");
+        assert!(
+            parsed.orchard().anchor().is_none(),
+            "the anchor is still deferred, which is the point",
+        );
+        let txid = pczt_txid(&parsed).expect("a signed migration PCZT yields its txid");
+        assert_eq!(
+            stored_pczt_txid(tx.pczt()).expect("and so do the stored bytes"),
+            txid,
+            "the bytes-level helper agrees with the parsed one",
+        );
+        assert!(
+            !seen.contains(&txid),
+            "each transaction has its own id: {txid:?} repeated",
+        );
+        seen.push(txid);
+    }
+    assert_eq!(seen.len(), state.transactions().len());
+}
+
+/// The unrecorded-broadcast sweep, end to end over real artifacts: a `Proved` transaction whose
+/// broadcast was never recorded, but which the wallet's scan has seen mine, is promoted by
+/// [`advance_migration`] — THROUGH `Broadcast`, since that is the state the lost record would have
+/// written — with nothing but its stored PCZT to identify it by.
+///
+/// [`advance_migration`]: zcash_pool_migration::satisfiability::advance_migration
+#[test]
+fn advance_promotes_a_proved_transaction_whose_broadcast_was_never_recorded() {
+    let seed = 13u64;
+    let (mut backend, plan) = single_note_setup(seed, 78 * COIN);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+    let mut state = commit_preparation(
+        &regtest_network(true),
+        BlockHeight::from_u32(TARGET_HEIGHT),
+        &mut backend,
+        &plan,
+        &mut rng,
+        ReplanThreshold::DEFAULT,
+    )
+    .expect("commits the migration");
+
+    // The crashed submission: a preparation was proved, submitted, and mined, but the process
+    // died before `mark_broadcast` — so the stored row still says `Proved` and carries no txid.
+    let victim = state.transactions()[0].id();
+    let victim_txid = stored_pczt_txid(
+        state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == victim)
+            .expect("the row is stored")
+            .pczt(),
+    )
+    .expect("the stored PCZT yields its txid");
+    state.set_transaction_proved(victim, state.transactions()[0].pczt().to_vec(), None);
+    assert_eq!(
+        state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == victim)
+            .unwrap()
+            .state(),
+        MigrationTxState::Proved,
+        "precondition: the row is proved and NOT recorded broadcast",
+    );
+
+    let mined_at = BlockHeight::from_u32(TARGET_HEIGHT + 5);
+    backend.mined.insert(victim_txid, mined_at);
+    backend.replace_migration(&state).unwrap();
+
+    advance_migration(
+        &mut backend,
+        &mut state,
+        DuenessTargets::at(BlockHeight::from_u32(TARGET_HEIGHT + 10)),
+        &AdvanceConfig::new(ReorgSettleDepth::new(10)),
+        &mut rng,
+    )
+    .expect("the mock store never fails");
+
+    assert_eq!(
+        state
+            .transactions()
+            .iter()
+            .find(|t| t.id() == victim)
+            .unwrap()
+            .state(),
+        MigrationTxState::Mined {
+            txid: victim_txid,
+            height: mined_at,
+        },
+        "the lost broadcast is recovered from the stored PCZT alone",
+    );
 }

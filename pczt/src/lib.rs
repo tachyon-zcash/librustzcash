@@ -20,11 +20,15 @@
 
 #[macro_use]
 extern crate alloc;
+// The crate itself needs only `alloc`; the unit tests lean on `proptest`, which is a `std` crate.
+#[cfg(test)]
+extern crate std;
 
 use alloc::vec::Vec;
 
 use getset::Getters;
 
+use zcash_protocol::PoolType;
 #[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
 use zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID};
 #[cfg(all(
@@ -408,6 +412,23 @@ pub enum EncodingError {
 }
 
 impl Pczt {
+    /// Whether this PCZT carries any inputs or outputs in the given pool.
+    ///
+    /// Every bundle is always present as a value, so its existence says nothing; this asks whether
+    /// it holds anything.
+    pub fn has_data_in_pool(&self, pool: PoolType) -> bool {
+        match pool {
+            PoolType::TRANSPARENT => {
+                !self.transparent.inputs().is_empty() || !self.transparent.outputs().is_empty()
+            }
+            PoolType::SAPLING => {
+                !self.sapling.spends().is_empty() || !self.sapling.outputs().is_empty()
+            }
+            PoolType::ORCHARD => !self.orchard.actions().is_empty(),
+            PoolType::IRONWOOD => !self.ironwood.actions().is_empty(),
+        }
+    }
+
     /// Parses a PCZT from its encoding.
     pub fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let (version, body) = parse_header(bytes, MAGIC_BYTES).map_err(|e| match e {
@@ -707,6 +728,57 @@ pub enum ExtractError {
     UnsupportedTxVersion { version: u32, version_group_id: u32 },
 }
 
+#[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
+impl core::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ExtractError::IncompatibleLockTimes => {
+                write!(f, "the transparent inputs have incompatible lock times")
+            }
+            ExtractError::IronwoodExtract(e) => {
+                write!(f, "could not extract the Ironwood bundle: {e}")
+            }
+            ExtractError::IronwoodNotSupported => write!(
+                f,
+                "the PCZT carries Ironwood bundle data, but its transaction version has no \
+                 Ironwood bundle"
+            ),
+            ExtractError::IronwoodParse(e) => {
+                write!(f, "could not parse the Ironwood bundle: {e:?}")
+            }
+            ExtractError::OrchardExtract(e) => {
+                write!(f, "could not extract the Orchard bundle: {e}")
+            }
+            ExtractError::OrchardParse(e) => write!(f, "could not parse the Orchard bundle: {e:?}"),
+            ExtractError::SaplingExtract(e) => {
+                write!(f, "could not extract the Sapling bundle: {e}")
+            }
+            ExtractError::SaplingParse(e) => write!(f, "could not parse the Sapling bundle: {e:?}"),
+            ExtractError::TransparentExtract(e) => {
+                write!(f, "could not extract the transparent bundle: {e:?}")
+            }
+            ExtractError::TransparentParse(e) => {
+                write!(f, "could not parse the transparent bundle: {e:?}")
+            }
+            ExtractError::UnknownConsensusBranchId => write!(f, "unknown consensus branch ID"),
+            ExtractError::UnsupportedConsensusBranchId => write!(
+                f,
+                "the consensus branch ID predates the v5 transaction format"
+            ),
+            ExtractError::UnsupportedTxVersion {
+                version,
+                version_group_id,
+            } => write!(
+                f,
+                "unsupported transaction version {version} (version group ID {version_group_id})"
+            ),
+        }
+    }
+}
+
+#[cfg(any(feature = "io-finalizer", feature = "signer", feature = "tx-extractor"))]
+impl core::error::Error for ExtractError {}
+
 /// Errors that can occur while parsing a PCZT.
 #[derive(Debug)]
 pub enum ParseError {
@@ -722,6 +794,22 @@ pub enum ParseError {
     /// The PCZT has an unknown version.
     UnknownVersion(u32),
 }
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ParseError::NotPczt => write!(f, "the bytes do not contain a PCZT"),
+            ParseError::Invalid(e) => write!(f, "invalid PCZT encoding: {e}"),
+            ParseError::MissingRequiredField(field) => {
+                write!(f, "the PCZT encoding omitted the required field {field}")
+            }
+            ParseError::TooShort => write!(f, "the bytes are too short to contain a PCZT"),
+            ParseError::UnknownVersion(v) => write!(f, "unknown PCZT version {v}"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
 
 #[cfg(all(test, any(feature = "io-finalizer", feature = "signer")))]
 mod extraction_tests {
