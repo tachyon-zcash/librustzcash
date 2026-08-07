@@ -23,18 +23,24 @@ use core::num::NonZeroU32;
 
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
-use zcash_protocol::consensus::BlockHeight;
-use zcash_protocol::value::COIN;
+use zcash_protocol::{consensus::BlockHeight, value::COIN};
 
 #[cfg(feature = "test-dependencies")]
-use zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN;
-use zcash_pool_migration::engine::{
-    MigrationCrypto, MigrationPlan, MigrationState, MigrationTxState, PoolMigrationWrite,
-    UnsignedMigrationTx, build_preparation_unsigned, estimate_migration_runs, plan_migration,
+use zcash_pool_migration::{
+    denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
+    signing_rounds::min_signing_rounds,
+    testing::{
+        MIGRATION_SCENARIOS, MULTI_RUN_EVOLUTION, NOTE_SHAPE_BUDGET_ROUNDS, SIGNING_ROUND_EVOLUTION,
+    },
 };
-use zcash_pool_migration::signing_rounds::{MinRounds, NextFit, SigningRoundBudget};
-#[cfg(feature = "test-dependencies")]
-use zcash_pool_migration::testing::MIGRATION_SCENARIOS;
+use zcash_pool_migration::{
+    engine::{
+        MigrationCrypto, MigrationPlan, MigrationState, MigrationTxState, PoolMigrationWrite,
+        UnsignedMigrationTx, build_preparation_unsigned, estimate_migration_runs, plan_migration,
+    },
+    satisfiability::ReplanThreshold,
+    signing_rounds::{MinRounds, NextFit, SigningRoundBudget},
+};
 use zcash_pool_migration_memory::{CommitMock, TARGET_HEIGHT, regtest_network};
 
 /// Plan a migration for a wallet holding the given raw note values (in zatoshi).
@@ -118,6 +124,7 @@ fn keystone_external_signing_end_to_end() {
         &mut backend,
         &plan,
         &mut rng,
+        ReplanThreshold::DEFAULT,
     )
     .expect("builds the migration unsigned");
     assert_eq!(unsigned.len(), plan.total_transactions());
@@ -301,6 +308,123 @@ fn migration_scenarios_end_to_end() {
     }
 }
 
+/// What the wallet's NOTE SHAPE costs the user at the SIGNER: one 10 ZEC balance held four ways,
+/// each priced for five signer budgets from the minimum feasible up to a software signer, against
+/// the hand-derived `NOTE_SHAPE_BUDGET_ROUNDS` table.
+///
+/// The note shape decides the action total (a preparation is 16 actions, a transfer 3), and the
+/// budget decides how many interactions that total costs, so the two together are what the user
+/// actually experiences. The case this pins: 10 ZEC held as `1 + 9` plans 4 preparations and 11
+/// crossings (97 actions), ONE action over a Keystone round, so it takes two device interactions
+/// where the same balance in a single note (43 actions) takes one; on a 48-action signer the gap
+/// widens to 3 interactions against 1.
+///
+/// Each row is checked three ways: against the plan's own `signing_round_count`, against the
+/// materialized packing (whose length must agree and whose rounds must be within budget), and
+/// against `min_signing_rounds`, so a golden value that drifted from the optimum is caught rather
+/// than silently blessed.
+#[cfg(feature = "test-dependencies")]
+#[test]
+fn note_shape_and_signer_budget_decide_the_interaction_count() {
+    let seed = 7;
+
+    for case in NOTE_SHAPE_BUDGET_ROUNDS {
+        let sc = MIGRATION_SCENARIOS
+            .iter()
+            .find(|sc| sc.label == case.scenario_label)
+            .expect("every budget case names a scenario");
+        let (_backend, plan) = plan_notes(seed, sc.source_notes);
+        let budget = SigningRoundBudget::new(
+            NonZeroU32::new(case.budget_actions).expect("a swept budget is nonzero"),
+        );
+        let label = format!("{} at {} actions", sc.label, case.budget_actions);
+
+        assert_eq!(
+            plan.signing_round_count(budget),
+            case.expected_rounds,
+            "{label}: signing rounds",
+        );
+
+        // The golden count is the OPTIMUM, not merely what the packer happens to produce.
+        assert_eq!(
+            min_signing_rounds(
+                plan.preparation_tx_count(),
+                plan.transfer_tx_count(),
+                budget
+            ),
+            case.expected_rounds,
+            "{label}: the golden count must be the optimal packing",
+        );
+
+        // The materialized rounds agree with the count, cover every transaction once, and (except
+        // for a single transaction larger than the whole budget) stay within it.
+        let rounds = plan.signing_rounds(budget);
+        assert_eq!(rounds.len(), case.expected_rounds, "{label}: packed rounds");
+        let packed: usize = rounds.iter().map(|r| r.len()).sum();
+        assert_eq!(
+            packed,
+            plan.total_transactions(),
+            "{label}: every transaction is signed exactly once",
+        );
+        for round in &rounds {
+            assert!(!round.is_empty(), "{label}: no empty round");
+            if round.len() > 1 {
+                assert!(
+                    round.total_actions() <= budget.max_actions(),
+                    "{label}: a multi-transaction round stays within the budget",
+                );
+            }
+        }
+    }
+}
+
+/// The smallest signer a wallet can use and still migrate in ONE interaction: the inverse of the
+/// sweep above, and what a wallet shows when helping a user pick a device.
+///
+/// It is the same for every note shape of one balance, because each plans the same one preparation
+/// transaction and nine crossings: `1 * 16 + 9 * 3 = 43` actions.
+#[cfg(feature = "test-dependencies")]
+#[test]
+fn the_single_round_signer_requirement_is_the_same_for_every_note_shape() {
+    let seed = 7;
+    // The plan's total actions ARE the single-round requirement.
+    for (label, expected_actions) in [
+        ("10 ZEC in a single note", 43u32),
+        ("10 ZEC as 1 + 9", 43),
+        ("10 ZEC as 2 + 8", 43),
+        ("10 ZEC as 5 + 5", 43),
+    ] {
+        let sc = MIGRATION_SCENARIOS
+            .iter()
+            .find(|sc| sc.label == label)
+            .expect("the note-shape scenario exists");
+        let (_backend, plan) = plan_notes(seed, sc.source_notes);
+
+        assert_eq!(plan.total_actions(), expected_actions, "{label}: actions");
+        assert_eq!(
+            plan.min_budget_for_single_round().get(),
+            expected_actions,
+            "{label}: the smallest signer that migrates this in one interaction",
+        );
+        // A signer at exactly that budget signs once; one action short of it signs twice.
+        let exact = SigningRoundBudget::new(
+            NonZeroU32::new(expected_actions).expect("the requirement is nonzero"),
+        );
+        let short = SigningRoundBudget::new(
+            NonZeroU32::new(expected_actions - 1).expect("one short is still nonzero"),
+        );
+        assert_eq!(
+            plan.signing_round_count(exact),
+            1,
+            "{label}: exactly enough"
+        );
+        assert!(
+            plan.signing_round_count(short) > 1,
+            "{label}: one action short costs another interaction",
+        );
+    }
+}
+
 /// The quanta -> RUNS -> total-rounds evolution: a balance beyond one run's note cap migrates over
 /// several runs (each within the cap), and the signer interactions are SUMMED per run because rounds
 /// cannot span runs. Reuses the plan-only `MULTI_RUN_EVOLUTION` table to show the total Keystone
@@ -308,8 +432,6 @@ fn migration_scenarios_end_to_end() {
 #[cfg(feature = "test-dependencies")]
 #[test]
 fn total_keystone_rounds_evolve_across_runs() {
-    use zcash_pool_migration::testing::MULTI_RUN_EVOLUTION;
-
     let seed = 7;
     for case in MULTI_RUN_EVOLUTION {
         let backend = CommitMock::new(seed, &[case.balance_zec * COIN]);
@@ -371,8 +493,6 @@ fn total_keystone_rounds_evolve_across_runs() {
 #[cfg(feature = "test-dependencies")]
 #[test]
 fn keystone_rounds_evolve_with_actions() {
-    use zcash_pool_migration::testing::SIGNING_ROUND_EVOLUTION;
-
     let seed = 7;
     for case in SIGNING_ROUND_EVOLUTION {
         let (_backend, plan) = plan_notes(seed, &[case.balance_zec * COIN]);

@@ -42,28 +42,43 @@
 //! [`scheduling`]: crate::scheduling
 
 use alloc::vec::Vec;
-use core::fmt;
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::{
+    fmt,
+    num::{NonZeroU32, NonZeroUsize},
+};
+#[cfg(feature = "orchard")]
+use {
+    crate::{
+        build::{AccountDerivation, build_prep_tx, build_transfer_pczt},
+        preparation::PrepOutput,
+    },
+    alloc::collections::BTreeMap,
+};
 
 use corez::io;
 
 use getset::{CopyGetters, Getters};
 use rand_core::RngCore;
-use zcash_protocol::TxId;
-use zcash_protocol::consensus::BlockHeight;
-use zcash_protocol::value::{BalanceError, Zatoshis};
+use zcash_protocol::{
+    TxId,
+    consensus::BlockHeight,
+    value::{BalanceError, Zatoshis},
+    zip318::{CROSSING_DESTINATION_ACTIONS, CROSSING_SOURCE_ACTIONS},
+};
 
-use zcash_primitives::transaction::fees::FeeRule as _;
-use zcash_primitives::transaction::fees::{transparent, zip317};
+use zcash_primitives::transaction::fees::{FeeRule as _, transparent, zip317};
 
 #[cfg(feature = "orchard")]
-use crate::build::AccountDerivation;
-use crate::denomination::{DenominationPlan, plan_denominations};
-use crate::preparation::{PrepError, PrepInput, PreparationPlan, plan_preparation};
-use crate::scheduling::{self, Schedule};
-use crate::signing_rounds::{
-    MinRounds, PlannedSigningRound, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
-    min_budget_for_rounds, min_signing_rounds,
+use crate::satisfiability::{DuenessTargets, UnsatisfiableCause};
+use crate::{
+    denomination::{DenominationPlan, balance_has_canonical_split, plan_denominations},
+    preparation::{PREP_TX_ACTIONS, PrepError, PrepInput, PreparationPlan, plan_preparation},
+    satisfiability::{ReorgSettleDepth, ReplanThreshold, StepSatisfiability, UnsatisfiableKind},
+    scheduling::{self, Schedule},
+    signing_rounds::{
+        MinRounds, PlannedSigningRound, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
+        min_budget_for_rounds, min_signing_rounds,
+    },
 };
 
 /// The estimated number of blocks for a preparation layer's LAST scheduled transaction to mine and
@@ -72,9 +87,15 @@ use crate::signing_rounds::{
 /// successive layers need only TEMPORAL serialization (the predecessor mined and witnessable) —
 /// they do not wait for anchor-bucket boundaries, which only the pool-crossing transfers anchor to.
 /// Appended after each layer's last scheduled broadcast to base the next layer's schedule, and
-/// after the final layer's to lower-bound the transfer schedule (see [`plan_migration`]); an
-/// under-estimate is self-healing (the commit-time anchor draw re-checks and reports a stale plan),
-/// an over-estimate merely delays the follow-on schedule.
+/// after the final layer's to lower-bound the transfer schedule (see [`plan_migration`]).
+///
+/// This is an ESTIMATE, and preparations routinely mine later than it (a wallet asleep through a
+/// broadcast window delays every layer behind it), so nothing final may rest on it. The commit-time
+/// anchor draw uses it only as a PROVISIONAL lower bound; the boundary a transfer is actually
+/// proved against is re-validated at proving time against the funding preparation's REAL mined
+/// height, and re-drawn if the preparation out-mined the estimate (see [`prove_transfer`]). An
+/// under-estimate therefore costs at most a proving-time re-draw; an over-estimate merely delays
+/// the follow-on schedule.
 const EST_PREP_LAYER_MINING_BLOCKS: u32 = 10;
 
 /// What the migration engine needs from a wallet to PLAN a migration: the account's spendable notes and
@@ -119,8 +140,81 @@ pub trait PoolMigrationRead {
     /// The store's own error type.
     type Error;
 
-    /// The migration currently in progress, if any.
+    /// The migration currently in progress, if any: PENDING-ONLY. A migration whose status is
+    /// terminal ([`MigrationStatus::is_terminal`]) is retained history and is NOT reported here —
+    /// persisting a terminal state through
+    /// [`replace_migration`](PoolMigrationWrite::replace_migration) is precisely how a migration
+    /// leaves this accessor and enters whatever history reads the store offers.
     fn get_migration(&self) -> Result<Option<MigrationState>, Self::Error>;
+
+    /// Report whether the environment this store lives in obstructs the given pre-signed
+    /// transaction, as observed at the wallet's fully-scanned height. Implementations answer the
+    /// MECHANICAL question — per cached spend nullifier
+    /// ([`spend_nullifiers`](MigrationTransaction::spend_nullifiers)): is the note unspent, seen
+    /// spent in a mined transaction, known with a dead unmined creator, or unknown; plus the
+    /// transaction-level expiry judgment, and, for a broadcast-unmined transaction, whether its
+    /// installed anchor survives on the current chain judged settled per `settle` — and compose
+    /// [`classify_input_observations`]. The judgment of what to DO with an answer is made once,
+    /// in this crate. An empty nullifier cache on a non-mined transaction is CORRUPTION (see
+    /// [`classify_input_observations`]) and surfaces the store's own error, never an answer.
+    ///
+    /// # Precondition
+    ///
+    /// The store answers for the environment of the WALLET THAT COMMITTED the migration, and that
+    /// wallet's scanned height does not regress in normal operation: a chain rollback reaches this
+    /// state through [`MigrationState::truncate_to_height`], which withdraws the determinations
+    /// resting on the discarded region rather than leaving the store to answer as though they were
+    /// still backed. An implementation may therefore treat its `as_of_height` as monotone between
+    /// truncations, and every answer it gives rests on evidence at or below that height. Asking a
+    /// store about a migration committed by some other wallet is outside the contract: the two
+    /// have neither the same notes nor the same scan history, so the answers would describe a
+    /// different environment than the one the transaction must execute in.
+    ///
+    /// [`classify_input_observations`]: crate::satisfiability::classify_input_observations
+    fn check_step_satisfiability(
+        &self,
+        tx: &MigrationTransaction,
+        settle: ReorgSettleDepth,
+    ) -> Result<StepSatisfiability, Self::Error>;
+
+    /// The height at which this wallet's scan has observed the transaction `txid` mined, or `None`
+    /// if it has not observed it mined.
+    ///
+    /// Which of a migration's transactions are mined is CHAIN-DERIVED, exactly like the
+    /// unsatisfiability marks, and this is the roll-forward half of that: a rollback reaches the
+    /// state through [`MigrationState::truncate_to_height`], and the promotion reaches it through
+    /// [`advance_migration`](crate::satisfiability::advance_migration), which asks this question
+    /// about every in-flight transaction it sweeps. A consumer driving through that function
+    /// therefore never calls [`MigrationState::mark_mined`]: it broadcasts, records THAT, and the
+    /// engine notices the mining on its own.
+    ///
+    /// # Precondition
+    ///
+    /// The same evidence discipline as [`check_step_satisfiability`](Self::check_step_satisfiability):
+    /// report a height only once it lies at or below the wallet's fully-scanned height, so a
+    /// rollback of the block carrying the transaction necessarily truncates below the height
+    /// stamped on the row this promotes. A mined height learned AHEAD of scanning (from
+    /// transaction-status polling, say) is withheld until scanning reaches it, exactly as evidence
+    /// above `as_of_height` is withheld there — otherwise a promotion could rest on a block the
+    /// wallet would not roll back, and `Mined` would outlive the chain state that justified it.
+    ///
+    /// # Consistency with the oracle
+    ///
+    /// This method and [`check_step_satisfiability`](Self::check_step_satisfiability) must answer
+    /// from ONE view of the wallet's scan. Concretely: if the store reports a transaction's inputs
+    /// seen spent in a mined transaction, and that spender IS the transaction being asked about,
+    /// then this method must report that transaction mined. Both answers are already bounded by
+    /// the same fully-scanned height, so an implementation deriving them from one scan gets this
+    /// for free; one that could report the spend without the inclusion does not satisfy the
+    /// contract.
+    ///
+    /// [`advance_migration`](crate::satisfiability::advance_migration) rests on exactly this to
+    /// tell a FOREIGN spend from a transaction's own. Having asked this method first and been told
+    /// the wallet has not seen the transaction mine, it reads a subsequent
+    /// [`InputsSpent`](crate::satisfiability::UnsatisfiableCause::InputsSpent) answer as a spender
+    /// other than this transaction, and marks on it. A store whose two answers can disagree would
+    /// turn that into killing a transaction that is mining.
+    fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, Self::Error>;
 }
 
 /// Write access to a persisted pool migration, mirroring `zcash_client_backend`'s `WalletWrite`.
@@ -137,6 +231,39 @@ pub trait PoolMigrationWrite: PoolMigrationRead {
         id: MigrationTransferId,
         state: MigrationTxState,
     ) -> Result<(), Self::Error>;
+
+    /// Record a successfully proved transaction — the [`ProvedTransaction`] carried out of
+    /// [`prove_transfer`] / [`prove_preparation`] — on `state`, and persist.
+    ///
+    /// From the moment the proof exists, the transaction is FULLY CONSTRUCTED: its PCZT carries
+    /// both signatures (installed at commit) and proofs, and extracting the broadcastable
+    /// `Transaction` from it is purely mechanical. Every implementation does the same two things
+    /// and nothing else: apply the proof to `state` with [`ProvedTransaction::apply`], then
+    /// persist it with [`replace_migration`](Self::replace_migration).
+    ///
+    /// Deliberately NOT here: any record in the wallet's own transaction store. A
+    /// proved-but-unbroadcast transaction is in no mempool and is scheduled future intent, not
+    /// in-flight outgoing intent, so recording it wallet-side at prove would freeze its input
+    /// notes out of the user's balance for the whole prove-to-broadcast window — days to weeks
+    /// on the ZIP 318 schedule — in violation of the rule that the user always has full access
+    /// to their funds. The prove-to-broadcast reservation is the ADVISORY lock taken by
+    /// [`MigrationProver::lock_spent_notes`] (overridable, expiring with the transaction), and
+    /// the wallet-side record is written by the store's own broadcast seam, atomically with
+    /// handing the broadcastable bytes out (for `zcash_client_sqlite`, its
+    /// `take_transaction_for_broadcast`), which is also the moment its transaction-status
+    /// retrieval may begin without disclosing a never-broadcast txid.
+    ///
+    /// On an error the proof is lost with the value and `state` may or may not carry it (an
+    /// implementation applies it before writing); the caller should re-read the migration from
+    /// the store and retry the prove step, which is cheap relative to the ambiguity of guessing.
+    ///
+    /// [`prove_transfer`]: crate::engine::prove_transfer
+    /// [`prove_preparation`]: crate::engine::prove_preparation
+    fn store_proved_transaction(
+        &mut self,
+        state: &mut MigrationState,
+        proven: ProvedTransaction,
+    ) -> Result<(), Self::Error>;
 }
 
 /// A stable ordinal identifier for a migration transaction within a migration. This is a ROW KEY
@@ -150,7 +277,7 @@ pub trait PoolMigrationWrite: PoolMigrationRead {
 /// producing a new transaction with a new [`TxId`], so a consumer that keyed its own records on
 /// the [`TxId`] loses track of the transfer exactly when it most needs to follow it. Use the
 /// [`TxId`] to talk to the network about a transaction, and this id to talk about the transfer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MigrationTransferId(pub(crate) u32);
 
 impl MigrationTransferId {
@@ -269,8 +396,49 @@ pub enum MigrationTxState {
     Proved,
     /// Broadcast to the network, with its transaction id.
     Broadcast { txid: TxId },
-    /// Mined at the given height.
-    Mined { height: BlockHeight },
+    /// Mined at the given height, with the transaction id it was broadcast under.
+    Mined { txid: TxId, height: BlockHeight },
+}
+
+/// The opaque token identifying the holder of the wallet-side locks on a migration transaction's
+/// input notes.
+///
+/// This is the engine's mirror of `zcash_client_backend::wallet::LockOwner`, carried as its own
+/// type because this pool-agnostic engine must not depend on `zcash_client_backend` (only
+/// `wallet`-feature code does). The two are byte-identical and round-trip through
+/// [`from_bytes`](Self::from_bytes) / [`as_bytes`](Self::as_bytes); a wallet adapter converts at
+/// that boundary, and a store persists the bytes.
+///
+/// The token is not a secret: anything that can read the wallet database can read it. It exists so
+/// that one flow cannot release, or accidentally reuse, another's reservation, and so that a
+/// wallet can name the migration's own locks when it deliberately spends through them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MigrationLockOwner([u8; 32]);
+
+impl MigrationLockOwner {
+    /// Wrap raw token bytes, for a store reading a persisted lock owner back or a wallet adapter
+    /// converting from its own lock-owner type.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw token bytes, for a store persisting the lock owner or a wallet adapter converting to
+    /// its own lock-owner type.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for MigrationLockOwner {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<MigrationLockOwner> for [u8; 32] {
+    fn from(owner: MigrationLockOwner) -> Self {
+        owner.0
+    }
 }
 
 /// One transaction of a committed migration: its pre-signed PCZT plus the metadata the consuming
@@ -284,13 +452,13 @@ pub struct MigrationTransaction {
     /// What it does (a preparation transaction or a transfer).
     #[getset(get_copy = "pub")]
     pub(crate) kind: MigrationTxKind,
-    /// The unproven PCZT, serialized (`pczt::Pczt::serialize`): pre-signed, except while the
-    /// transaction awaits an external signature
-    /// ([`AwaitingSignature`](MigrationTxState::AwaitingSignature)), when these are the unsigned
-    /// bytes the signed PCZT replaces. Every transaction is built when the migration is
-    /// committed — one signing phase — so this is always present: the durable artifact the
-    /// application proves (installing its anchor and witnesses at that point; ZIP 374) and
-    /// broadcasts.
+    /// The serialized PCZT (`pczt::Pczt::serialize`), whose contents track the transaction's
+    /// lifecycle: unsigned bytes while the transaction awaits an external signature
+    /// ([`AwaitingSignature`](MigrationTxState::AwaitingSignature)), then the pre-signed PCZT
+    /// with anchors and witnesses still deferred (ZIP 374), then — once the application proves
+    /// it — the PROVEN PCZT, witnesses and anchors installed and proofs attached, ready to
+    /// broadcast. Every transaction is built when the migration is committed — one signing
+    /// phase — so this is always present.
     #[getset(get = "pub")]
     pub(crate) pczt: Vec<u8>,
     /// The transactions that must be mined before this one may be broadcast (the preparation layer
@@ -314,6 +482,65 @@ pub struct MigrationTransaction {
     /// (which waits on its dependencies rather than anchoring to a drawn boundary).
     #[getset(get_copy = "pub")]
     pub(crate) anchor_boundary: Option<BlockHeight>,
+    /// The id of the transaction this PCZT describes, derived once when it was built.
+    ///
+    /// Available from that moment, and fixed from there: the txid must be computed in order to
+    /// derive the signature hash, so it exists before there is anything to sign. Everything after
+    /// it — the signatures, and the anchor and witnesses ZIP 374 defers to proving — is
+    /// AUTHORIZING data, outside the effecting data the txid digest covers.
+    ///
+    /// Stored rather than re-derived, because every reader wants it and none should pay a PCZT
+    /// parse for it: the drive loop asks the wallet whether it has seen each transaction mine, and
+    /// [`MigrationState::mark_broadcast`] no longer has to be TOLD an id the state already holds.
+    /// Only [`rebuild_expired_transfer`] changes it, and only because a rebuild is a genuinely
+    /// different transaction.
+    #[getset(get_copy = "pub")]
+    pub(crate) txid: TxId,
+    /// The standing determination that this transaction is UNSATISFIABLE — its inputs can never
+    /// again all exist unspent on chain — as ONE value: the height of the chain state the
+    /// observation rests on, paired with WHAT was observed. `None` while no such determination
+    /// stands. Orthogonal to the lifecycle state (a `Proved` transfer keeps its proof and renders
+    /// as "proved, inputs spent"), mirroring how expiry is orthogonal to lifecycle.
+    ///
+    /// The height is the one the observation RESTS ON rather than the one it was recorded at,
+    /// which is what gives reorg truncation exact semantics: a rewind below it invalidates the
+    /// observation itself. The kind rides along so a wallet can say what killed a transaction
+    /// without re-consulting the oracle (whose answer would by then rest on a later chain state
+    /// anyway): a direct observation records its cause's [`kind`](UnsatisfiableCause::kind), a
+    /// mark applied by the dependency closure records
+    /// [`Inherited`](UnsatisfiableKind::Inherited). Holding them as one pair is what makes a
+    /// stamp without a kind — or a kind without a stamp — unrepresentable.
+    pub(crate) unsatisfiable: Option<(BlockHeight, UnsatisfiableKind)>,
+    /// The standing BROADCAST-FAILURE REPORT: the chain tip the application observed from the
+    /// node that REJECTED a broadcast of this transaction, or `None` while no rejection is
+    /// outstanding. Recorded by [`MigrationState::report_broadcast_failure`] and discharged by
+    /// the drive API once the wallet has scanned to that tip and could adjudicate the rejection.
+    ///
+    /// This is TESTIMONY, not evidence: another observer's report of chain state this wallet has
+    /// not seen. It never produces an [`unsatisfiable`](Self::unsatisfiable) mark — marks rest on
+    /// scanned state at or below an answer's `as_of_height`, which is what makes reorg truncation
+    /// exact — and it carries no cause, because the engine verifies a rejection through channels
+    /// it owns rather than trusting the node's stated reason. Its whole effect is to withhold the
+    /// transaction from the broadcast queue and to hold the drive loop at
+    /// [`Reevaluate`](crate::state::AdvanceStep::Reevaluate) until the wallet can answer.
+    #[getset(get_copy = "pub")]
+    pub(crate) broadcast_failure_at: Option<BlockHeight>,
+    /// The nullifiers of this transaction's REAL spends — the deferred-witness actions; the
+    /// padded dummy spends carry their own witnesses (ZIP 374) — extracted from the built PCZT
+    /// when the migration is committed, BEFORE any proof. Proving replaces the stored bytes
+    /// with the proven PCZT, whose real spends all carry installed witnesses and so are no
+    /// longer identifiable there; from commit onward this cache is therefore the SOLE
+    /// real-spend authority for the transaction's remaining life — consumers (the rebuild path,
+    /// the unsatisfiability machinery) read it and never re-derive from the stored bytes. It
+    /// also spares the feature-free state machine the `orchard`-gated `pczt` parsing.
+    ///
+    /// Raw `[u8; 32]` rather than `orchard::note::Nullifier`, for the same reason
+    /// [`lock_owner`](Self::lock_owner) holds an opaque token: the typed nullifier lives behind
+    /// this crate's optional `orchard` feature, while this state machine is `no_std` and
+    /// feature-free and must round-trip a committed migration without it. The conversion to the
+    /// typed form happens in the code that already depends on `orchard`, not here.
+    #[getset(get = "pub")]
+    pub(crate) spend_nullifiers: Vec<[u8; 32]>,
     /// The transaction's lifecycle state.
     #[getset(get_copy = "pub")]
     pub(crate) state: MigrationTxState,
@@ -323,17 +550,48 @@ pub struct MigrationTransaction {
     /// `LockOwner::new()` round-trip) — carried here as an opaque `[u8; 32]` rather than the typed
     /// `LockOwner` because this `orchard`-gated engine module must not depend on
     /// `zcash_client_backend` (only `wallet`-feature code does); the conversion to/from `LockOwner`
-    /// happens at that boundary, not here. The migration flow does not yet acquire locks, so every
-    /// transaction the engine itself builds carries `None`; a store still round-trips whatever a
-    /// caller sets.
+    /// happens at that boundary, not here.
+    ///
+    /// Set when the transaction is PROVED: [`prove_transfer`] and [`prove_preparation`] ask the
+    /// prover to lock the notes the transaction spends ([`MigrationProver::lock_spent_notes`]) and
+    /// record the token it returns here, so a transaction holds a lock exactly while it is proved
+    /// and awaiting broadcast. A transaction that is merely built and signed carries `None`, as
+    /// does one proved by a prover that models no lock state.
     #[getset(get_copy = "pub")]
-    pub(crate) lock_owner: Option<[u8; 32]>,
+    pub(crate) lock_owner: Option<MigrationLockOwner>,
 }
 
 impl MigrationTransaction {
+    /// The standing unsatisfiability mark: the height of the chain state the observation rests on
+    /// paired with what was observed, or `None` while this transaction is not determined
+    /// unsatisfiable. [`unsatisfiable_at`](Self::unsatisfiable_at) and
+    /// [`unsatisfiable_kind`](Self::unsatisfiable_kind) project its halves.
+    pub fn unsatisfiable(&self) -> Option<(BlockHeight, UnsatisfiableKind)> {
+        self.unsatisfiable
+    }
+
+    /// The height of the chain state a standing unsatisfiability observation rests on: the stamp
+    /// half of [`unsatisfiable`](Self::unsatisfiable), and the height a truncation must reach
+    /// below to clear the mark.
+    pub fn unsatisfiable_at(&self) -> Option<BlockHeight> {
+        self.unsatisfiable.map(|(at, _)| at)
+    }
+
+    /// WHY this transaction can never mine: the kind half of
+    /// [`unsatisfiable`](Self::unsatisfiable), which a wallet renders without re-consulting the
+    /// satisfiability oracle.
+    pub fn unsatisfiable_kind(&self) -> Option<UnsatisfiableKind> {
+        self.unsatisfiable.map(|(_, kind)| kind)
+    }
+
     /// Reassemble a stored migration transaction from its persisted parts, exactly as a store read
-    /// them back (the inverse of the accessors). The caller is responsible for having persisted a
-    /// consistent row.
+    /// them back (the inverse of the accessors). A store that persists the unsatisfiability mark's
+    /// halves in separate places must reject a row holding one without the other as corrupt on
+    /// read, rather than reconstitute a pair here from half of one.
+    ///
+    /// `broadcast_failure_at` is independent of that mark in both directions: a rejected
+    /// broadcast the wallet cannot yet explain carries no mark, and an adjudicated one carries a
+    /// mark and no report.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         id: MigrationTransferId,
@@ -343,8 +601,12 @@ impl MigrationTransaction {
         scheduled_height: BlockHeight,
         expiry_height: BlockHeight,
         anchor_boundary: Option<BlockHeight>,
+        txid: TxId,
         state: MigrationTxState,
-        lock_owner: Option<[u8; 32]>,
+        lock_owner: Option<MigrationLockOwner>,
+        unsatisfiable: Option<(BlockHeight, UnsatisfiableKind)>,
+        spend_nullifiers: Vec<[u8; 32]>,
+        broadcast_failure_at: Option<BlockHeight>,
     ) -> Self {
         Self {
             id,
@@ -354,8 +616,12 @@ impl MigrationTransaction {
             scheduled_height,
             expiry_height,
             anchor_boundary,
+            txid,
             state,
             lock_owner,
+            unsatisfiable,
+            spend_nullifiers,
+            broadcast_failure_at,
         }
     }
 }
@@ -369,24 +635,94 @@ pub enum MigrationStatus {
     Committed,
     /// Some transactions have been broadcast or mined.
     InProgress,
-    /// Every crossing has been mined.
+    /// Every crossing has been mined. Chain-derived — exactly as revocable as the chain it was
+    /// derived from — unlike the policy determinations `Failed` and `Superseded`.
     Complete,
     /// The migration failed and needs attention.
     Failed,
+    /// Superseded by a re-plan of the remaining balance: terminal, set by
+    /// [`MigrationState::mark_superseded`] as the consumer's response to a migration whose
+    /// remaining value must be carried by a new plan. Like `Failed`, a POLICY determination —
+    /// never revisited by chain state.
+    Superseded,
+    /// Abandoned at the user's request: terminal, set by [`MigrationState::mark_cancelled`] as the
+    /// consumer's response to a migration the user has chosen not to carry out. Like `Failed` and
+    /// `Superseded`, a POLICY determination — never revisited by chain state, unlike the
+    /// chain-derived `Complete`.
+    ///
+    /// Distinct from `Failed` on purpose: the two record different histories, and only this one
+    /// says the wallet was working as intended. Collapsing them would leave nothing able to tell a
+    /// deliberate abandonment from a migration that broke.
+    Cancelled,
 }
 
-impl AsRef<str> for MigrationStatus {
+impl MigrationStatus {
+    /// Every status, in lifecycle order. The enumeration a caller needs in order to talk about the
+    /// status SET rather than one status: a store expressing terminality as a query
+    /// (`WHERE status NOT IN (..)`) derives its list from here through [`is_terminal`], so the
+    /// database's notion of terminal cannot drift from this crate's.
+    ///
+    /// [`is_terminal`]: Self::is_terminal
+    pub const ALL: &'static [MigrationStatus] = &[
+        MigrationStatus::Planning,
+        MigrationStatus::Committed,
+        MigrationStatus::InProgress,
+        MigrationStatus::Complete,
+        MigrationStatus::Failed,
+        MigrationStatus::Superseded,
+        MigrationStatus::Cancelled,
+    ];
+
+    /// Whether this status is TERMINAL: the migration has finished, one way or another, and a new
+    /// migration may replace it. A non-terminal migration is still in progress.
+    ///
+    /// Written as an exhaustive match rather than a set lookup so that adding a status fails to
+    /// compile until its terminality is decided here. That decision is load-bearing well beyond
+    /// this function: it is what the commit guard admits a replacement on, and what a store
+    /// excludes from anchor-checkpoint retention.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            MigrationStatus::Planning
+            | MigrationStatus::Committed
+            | MigrationStatus::InProgress => false,
+            MigrationStatus::Complete
+            | MigrationStatus::Failed
+            | MigrationStatus::Superseded
+            | MigrationStatus::Cancelled => true,
+        }
+    }
+
+    /// The terminal statuses, for a caller that must name the whole set at once — a store
+    /// restricting a query to migrations that are still live, for instance. Derived from
+    /// [`is_terminal`](Self::is_terminal) over [`ALL`](Self::ALL) rather than listed again, so
+    /// there is one place where terminality is decided.
+    pub fn terminal() -> impl Iterator<Item = MigrationStatus> {
+        Self::ALL.iter().copied().filter(|s| s.is_terminal())
+    }
+
     /// The stable lowercase wire name of the status, as stored by a backend and parsed back with
-    /// [`TryFrom<&str>`](Self). Borrow-free: it returns a `&'static str`, so encoding a status
-    /// allocates nothing.
-    fn as_ref(&self) -> &str {
+    /// [`TryFrom<&str>`](Self): a `&'static str`, so a store can embed it in DDL or other
+    /// `'static` text — which the [`AsRef<str>`](AsRef) impl cannot provide, its return lifetime
+    /// being tied to `&self` by the trait's signature.
+    pub const fn wire_name(self) -> &'static str {
         match self {
             MigrationStatus::Planning => "planning",
             MigrationStatus::Committed => "committed",
             MigrationStatus::InProgress => "in_progress",
             MigrationStatus::Complete => "complete",
             MigrationStatus::Failed => "failed",
+            MigrationStatus::Superseded => "superseded",
+            MigrationStatus::Cancelled => "cancelled",
         }
+    }
+}
+
+impl AsRef<str> for MigrationStatus {
+    /// The stable lowercase wire name of the status ([`wire_name`](MigrationStatus::wire_name)),
+    /// for callers generic over `AsRef<str>`. Borrow-free: the delegate returns a `&'static str`,
+    /// so encoding a status allocates nothing.
+    fn as_ref(&self) -> &str {
+        self.wire_name()
     }
 }
 
@@ -411,6 +747,8 @@ impl TryFrom<&str> for MigrationStatus {
             "in_progress" => MigrationStatus::InProgress,
             "complete" => MigrationStatus::Complete,
             "failed" => MigrationStatus::Failed,
+            "superseded" => MigrationStatus::Superseded,
+            "cancelled" => MigrationStatus::Cancelled,
             _ => return Err(ParseMigrationStatusError),
         })
     }
@@ -444,11 +782,13 @@ impl fmt::Display for ParseMigrationTxStateError {
 }
 
 impl MigrationTxState {
-    /// The transaction id of a [`Broadcast`](Self::Broadcast) state (its stored payload), or `None`
-    /// for any other state.
+    /// The transaction id of a [`Broadcast`](Self::Broadcast) or [`Mined`](Self::Mined) state (its
+    /// stored payload), or `None` for any other state.
     pub fn broadcast_txid(&self) -> Option<[u8; 32]> {
         match self {
-            MigrationTxState::Broadcast { txid } => Some(*txid.as_ref()),
+            MigrationTxState::Broadcast { txid } | MigrationTxState::Mined { txid, .. } => {
+                Some(*txid.as_ref())
+            }
             _ => None,
         }
     }
@@ -457,15 +797,16 @@ impl MigrationTxState {
     /// other state.
     pub fn mined_height(&self) -> Option<BlockHeight> {
         match self {
-            MigrationTxState::Mined { height } => Some(*height),
+            MigrationTxState::Mined { height, .. } => Some(*height),
             _ => None,
         }
     }
 
     /// Reconstruct a state from a store: the lowercase discriminant produced by
-    /// [`AsRef<str>`](AsRef), plus the `broadcast` txid and `mined` height columns (each `None` for a
-    /// state that does not carry it). Errors on an unrecognized discriminant, or a `broadcast`/`mined`
-    /// discriminant whose payload column is absent.
+    /// [`AsRef<str>`](AsRef), plus the `broadcast`/`mined` txid and `mined` height columns (each
+    /// `None` for a state that does not carry it). Errors on an unrecognized discriminant, a
+    /// `broadcast` discriminant missing its txid, or a `mined` discriminant missing either payload
+    /// (a mined transaction is always broadcast under a txid first, so both are required together).
     pub fn from_stored(
         state: &str,
         txid: Option<[u8; 32]>,
@@ -479,6 +820,7 @@ impl MigrationTxState {
                 txid: TxId::from_bytes(txid.ok_or(ParseMigrationTxStateError)?),
             },
             "mined" => MigrationTxState::Mined {
+                txid: TxId::from_bytes(txid.ok_or(ParseMigrationTxStateError)?),
                 height: mined_height.ok_or(ParseMigrationTxStateError)?,
             },
             _ => return Err(ParseMigrationTxStateError),
@@ -516,6 +858,9 @@ pub struct MigrationState {
     /// so [`prove_transfer`] and the rebuild path reject the mismatch up front.
     #[getset(get_copy = "pub")]
     pub(crate) anchor_bucket_interval: crate::scheduling::AnchorBucketInterval,
+    /// The replan threshold stamped when this migration was committed.
+    #[getset(get_copy = "pub")]
+    pub(crate) replan_threshold: ReplanThreshold,
 }
 
 impl MigrationState {
@@ -527,6 +872,7 @@ impl MigrationState {
         preparation: PreparationPlan,
         transactions: Vec<MigrationTransaction>,
         anchor_bucket_interval: crate::scheduling::AnchorBucketInterval,
+        replan_threshold: ReplanThreshold,
     ) -> Self {
         Self {
             status,
@@ -534,6 +880,7 @@ impl MigrationState {
             preparation,
             transactions,
             anchor_bucket_interval,
+            replan_threshold,
         }
     }
 
@@ -575,16 +922,53 @@ impl MigrationState {
             .and_then(|crossing| self.crossing_values().get(crossing).copied())
     }
 
-    /// Replace transfer `id`'s stored PCZT with its proven bytes and move it to
-    /// [`Proved`](MigrationTxState::Proved). Called after [`prove_transfer`] installs the drawn
-    /// anchor and witnesses and proves the transaction, so the durable artifact becomes the proven,
-    /// ready-to-broadcast PCZT.
-    #[cfg(feature = "orchard")]
-    pub fn set_transaction_proved(&mut self, id: MigrationTransferId, proven_pczt: Vec<u8>) {
+    /// Replace transaction `id`'s stored PCZT with its proven bytes, record the lock owner its
+    /// spent notes were reserved under, and move it to [`Proved`](MigrationTxState::Proved), so
+    /// the artifact becomes the proven, ready-to-broadcast PCZT together with the token that
+    /// releases its reservation.
+    ///
+    /// In the production flow this is reached only through [`ProvedTransaction::apply`], inside
+    /// [`PoolMigrationWrite::store_proved_transaction`]: the proof travels from the prove step to
+    /// the store as a value, and the state records it in the same act that persists it.
+    ///
+    /// `lock_owner` is `None` when the prover took no locks (see
+    /// [`MigrationProver::lock_spent_notes`]). It is recorded in the same pass as the proven bytes
+    /// so a store write persists the artifact and its lock token together: a caller that persists
+    /// after proving can never end up with a proved transaction whose locks it can no longer name.
+    pub fn set_transaction_proved(
+        &mut self,
+        id: MigrationTransferId,
+        proven_pczt: Vec<u8>,
+        lock_owner: Option<MigrationLockOwner>,
+    ) {
         for tx in &mut self.transactions {
             if tx.id() == id {
                 tx.pczt = proven_pczt;
                 tx.state = MigrationTxState::Proved;
+                tx.lock_owner = lock_owner;
+                break;
+            }
+        }
+    }
+
+    /// Re-point transfer `id`'s drawn anchor boundary at `boundary`.
+    ///
+    /// The commit-time boundary is provisional for a dependency-funded transfer: it was drawn
+    /// before the funding preparation mined, from an estimate of when it would. [`prove_transfer`]
+    /// calls this when the preparation actually mined PAST that boundary — the funding note is not
+    /// in the boundary's tree state, so no witness can ever be computed there — replacing it with a
+    /// boundary re-drawn from the note's real creation height. Sound for a `Signed` transfer by
+    /// construction: the PCZT's anchor and witnesses are deferred to proving (ZIP 374), so the
+    /// stored artifact does not pin the boundary.
+    #[cfg(feature = "orchard")]
+    pub(crate) fn set_transfer_anchor_boundary(
+        &mut self,
+        id: MigrationTransferId,
+        boundary: BlockHeight,
+    ) {
+        for tx in &mut self.transactions {
+            if tx.id() == id {
+                tx.anchor_boundary = Some(boundary);
                 break;
             }
         }
@@ -770,6 +1154,18 @@ pub enum MigrationError<E> {
     Preparation(PrepError),
     /// The account has no migratable balance.
     NothingToMigrate,
+    /// The balance quantizes to at least one canonical part, but the wallet's current notes cannot
+    /// fund ANY part of that split, so this run defers the whole balance. Reconciliation only ever
+    /// drops parts of the canonical split (never substitutes smaller denominations — see
+    /// [`DenominationStrategy::plan`](crate::denomination::DenominationStrategy::plan)), so a
+    /// wallet whose notes cannot mint even the split's first part has no migratable decomposition
+    /// until its spendable balance changes. The reachable shape is a wallet so fragmented that
+    /// consolidating enough of it to mint even the split's largest part costs more in preparation
+    /// fees than the balance can cover. Unlike
+    /// [`NothingToMigrate`](Self::NothingToMigrate), this is NOT completion: value above the
+    /// residual threshold remains, and an application should report it as deferred (until the
+    /// spendable balance changes) rather than migrated.
+    UnfundableSplit,
     /// The backend's note values do not form a valid balance (their sum exceeds the maximum money
     /// supply).
     InvalidBalance(BalanceError),
@@ -786,6 +1182,9 @@ impl<E: fmt::Display> fmt::Display for MigrationError<E> {
             MigrationError::Backend(e) => write!(f, "wallet backend error: {e}"),
             MigrationError::Preparation(e) => write!(f, "cannot prepare the migration: {e}"),
             MigrationError::NothingToMigrate => f.write_str("no migratable balance"),
+            MigrationError::UnfundableSplit => f.write_str(
+                "the wallet's notes cannot fund any part of the balance's canonical split",
+            ),
             MigrationError::InvalidBalance(e) => write!(f, "invalid balance: {e}"),
             MigrationError::Fee(e) => write!(f, "fee computation failed: {e}"),
             MigrationError::Nu63NotActive => f.write_str("NU6.3 is not active on this network"),
@@ -799,6 +1198,7 @@ impl<E: core::error::Error + 'static> core::error::Error for MigrationError<E> {
             MigrationError::Backend(e) => Some(e),
             MigrationError::Preparation(e) => Some(e),
             MigrationError::NothingToMigrate => None,
+            MigrationError::UnfundableSplit => None,
             // `BalanceError` (and `FeeError`, which wraps it) implements `Error` only with
             // `zcash_protocol/std`; the Display text above carries their messages instead.
             MigrationError::InvalidBalance(_) => None,
@@ -816,9 +1216,6 @@ fn canonical_fees<P: zcash_protocol::consensus::Parameters>(
     params: &P,
     height: BlockHeight,
 ) -> Result<(Zatoshis, Zatoshis), zip317::FeeError> {
-    use crate::denomination::{DESTINATION_ACTIONS_PER_TRANSFER, SOURCE_ACTIONS_PER_TRANSFER};
-    use crate::preparation::PREP_TX_ACTIONS;
-
     let fee_rule = zip317::FeeRule::standard();
     let prep_tx_fee = fee_rule.fee_required(
         params,
@@ -837,8 +1234,8 @@ fn canonical_fees<P: zcash_protocol::consensus::Parameters>(
         core::iter::empty::<usize>(),
         0,
         0,
-        SOURCE_ACTIONS_PER_TRANSFER,
-        DESTINATION_ACTIONS_PER_TRANSFER,
+        CROSSING_SOURCE_ACTIONS,
+        CROSSING_DESTINATION_ACTIONS,
     )?;
     Ok((prep_tx_fee, transfer_fee_buffer))
 }
@@ -862,6 +1259,33 @@ pub fn plan_migration<P, B, R>(
     rng: &mut R,
 ) -> Result<MigrationPlan, MigrationError<B::Error>>
 where
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    plan_migration_with(
+        &crate::preparation::default_portfolio(),
+        params,
+        backend,
+        rng,
+    )
+}
+
+/// As [`plan_migration`], planning the preparation transactions against a chosen set of strategies
+/// rather than the ones the crate ships.
+///
+/// The choice reaches the whole plan, not only its preparation transactions: the denomination
+/// decomposition asks the preparation planner what it can mint at every step, so a portfolio that
+/// can build fewer transaction shapes yields different crossings as well as different
+/// preparations.
+pub fn plan_migration_with<Pf, P, B, R>(
+    portfolio: &Pf,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationPlan, MigrationError<B::Error>>
+where
+    Pf: crate::preparation::Portfolio,
     P: zcash_protocol::consensus::Parameters,
     B: MigrationBackend,
     R: RngCore + rand_core::CryptoRng,
@@ -890,16 +1314,17 @@ where
     let (prep_tx_fee, transfer_fee_buffer) =
         canonical_fees(params, commit_height).map_err(MigrationError::Fee)?;
 
-    // The preparation-layout capability the decomposition consults at each step: how many
+    // The preparation-layout capability the decomposition's reconciliation consults: how many
     // preparation transactions minting a candidate funding multiset takes, or `None` when the
-    // wallet's notes cannot mint it (so the split stops or steps down a denomination).
+    // wallet's notes cannot mint it (so the split drops its smallest part and asks again).
     let prep_tx_count = |funding: &[Zatoshis]| {
-        plan_preparation(&notes, funding, prep_tx_fee)
+        crate::preparation::plan_preparation_with(portfolio, &notes, funding, prep_tx_fee)
             .ok()
             .map(|plan| plan.transaction_count())
     };
     let denominations = plan_denominations(
         balance,
+        notes.len(),
         transfer_fee_buffer,
         prep_tx_fee,
         &prep_tx_count,
@@ -907,13 +1332,23 @@ where
     );
     let funding_notes = denominations.migration_outputs();
     if funding_notes.is_empty() {
-        return Err(MigrationError::NothingToMigrate);
+        // An empty plan is COMPLETION when the balance itself quantizes to nothing (only residual
+        // value remains), and DEFERRAL when the balance has a canonical split that this wallet's
+        // note values cannot fund; the two need different reporting, so they are distinct errors.
+        return Err(
+            if balance_has_canonical_split(balance, notes.len(), transfer_fee_buffer, prep_tx_fee) {
+                MigrationError::UnfundableSplit
+            } else {
+                MigrationError::NothingToMigrate
+            },
+        );
     }
 
-    // The decomposition verified this multiset against the preparation planner at every step, so
-    // this final planning pass succeeds by construction; the error path is kept for safety.
-    let preparation = plan_preparation(&notes, &funding_notes, prep_tx_fee)
-        .map_err(MigrationError::Preparation)?;
+    // The decomposition's reconciliation verified this multiset against the preparation planner,
+    // so this final planning pass succeeds by construction; the error path is kept for safety.
+    let preparation =
+        crate::preparation::plan_preparation_with(portfolio, &notes, &funding_notes, prep_tx_fee)
+            .map_err(MigrationError::Preparation)?;
 
     // Schedule the PREPARATION broadcasts: each transaction gets its own drawn height (temporal
     // decoupling — a burst of identically shaped transactions from one wallet is a linkable
@@ -1156,8 +1591,10 @@ impl MigrationRunEstimate {
 /// run.
 ///
 /// A zero (or fully sub-quantum) balance yields a zero-run estimate rather than an error, since this
-/// is a preview. `rng` is drawn from only by a randomized denomination strategy; the recommended
-/// canonical strategy ignores it.
+/// is a preview; so does a balance whose canonical split the wallet's notes cannot fund at all
+/// (what [`plan_migration`] reports as [`MigrationError::UnfundableSplit`]) — either way, whatever
+/// no run migrates is reported as the final residual. `rng` is drawn from only by a randomized
+/// denomination strategy; the recommended canonical strategy ignores it.
 pub fn estimate_migration_runs<P, B, R>(
     params: &P,
     backend: &B,
@@ -1200,6 +1637,7 @@ where
             };
             plan_denominations(
                 balance,
+                notes.len(),
                 transfer_fee_buffer,
                 prep_tx_fee,
                 &prep_tx_count,
@@ -1306,6 +1744,115 @@ pub trait MigrationCrypto {
     fn sign(&self, pczt: pczt::Pczt) -> Result<pczt::Pczt, Self::Error>;
 }
 
+/// A prover's typed failure: the one condition the engine handles — an input not among the
+/// unspent set — distinguished from everything else. This seam observes only MEMBERSHIP, which
+/// conflates "spent" with "not yet scanned"; the engine's dependency-coverage guard against
+/// `as_of` sharpens it into positive spend evidence or a retry.
+#[cfg(feature = "orchard")]
+#[derive(Debug)]
+pub enum ProveFailure<E> {
+    /// A spend's nullifier matched no unspent note, as of the wallet's fully-scanned height.
+    InputNotAvailable {
+        /// The nullifier whose note was not among the unspent set.
+        nullifier: [u8; 32],
+        /// The fully-scanned height the absence observation rests on.
+        as_of: BlockHeight,
+    },
+    /// Any other prover error.
+    Other(E),
+}
+
+/// The outcome of a prove attempt the engine HANDLED — an error return would invite blind
+/// retries of conditions that are not errors.
+#[cfg(feature = "orchard")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProveOutcome {
+    /// The proof was created. The carried [`ProvedTransaction`] is the proven PCZT awaiting its
+    /// persistence: hand it to [`PoolMigrationWrite::store_proved_transaction`], which records
+    /// the transaction `Proved` and persists — for a wallet-database-backed store, atomically
+    /// with the wallet's own record of the finalized transaction. Neither the in-memory state
+    /// nor the store says `Proved` until that call; there is no other way to discharge the
+    /// value.
+    Proved(ProvedTransaction),
+    /// An input was not available, and the wallet has not yet scanned past every dependency's
+    /// mined height: nothing can be concluded. No state change; retry after further sync.
+    NotYetProvable,
+    /// An input was not available with every dependency's mined height covered by the wallet's
+    /// scan — positive evidence of a spend. The transaction was marked unsatisfiable (with the
+    /// dependency closure recorded); `replan_required` is the derived accessor's value after
+    /// marking, so the caller can react without re-consulting the state.
+    MarkedUnsatisfiable {
+        /// [`MigrationState::replan_required`] as it stands after the mark.
+        replan_required: bool,
+    },
+}
+
+/// A successfully proved migration transaction awaiting its persistence: the proven PCZT — now
+/// carrying both signatures (installed at commit) and proofs, ready to broadcast — together with
+/// the id of the row it belongs to and the token its spent notes were reserved under.
+///
+/// Only a successful [`prove_transfer`] / [`prove_preparation`] produces one, and only
+/// [`PoolMigrationWrite::store_proved_transaction`] consumes one (through
+/// [`apply`](Self::apply), which a store implementation calls to record the proof on the state it
+/// persists). Carrying the proof OUT of the prove step rather than writing it into the state
+/// there is what makes "proved but never persisted to the wallet" unrepresentable: the state
+/// cannot say [`Proved`](MigrationTxState::Proved) until the store method that also owns the
+/// wallet-side record has run. It also keeps the prove seam free of any store borrow — a
+/// wallet-backed prover and a wallet-database store borrow the same wallet mutably, so they can
+/// only ever be used in sequence, never side by side in one call.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a proved transaction is not durable (and its wallet record does not exist) until \
+              it is handed to `PoolMigrationWrite::store_proved_transaction`"]
+pub struct ProvedTransaction {
+    id: MigrationTransferId,
+    pczt: Vec<u8>,
+    lock_owner: Option<MigrationLockOwner>,
+}
+
+impl ProvedTransaction {
+    /// The id of the migration transaction this proof belongs to.
+    pub fn id(&self) -> MigrationTransferId {
+        self.id
+    }
+
+    /// The proven PCZT's serialized bytes.
+    pub fn pczt(&self) -> &[u8] {
+        &self.pczt
+    }
+
+    /// The token the transaction's spent notes were reserved under at proving
+    /// ([`MigrationProver::lock_spent_notes`]), or `None` when the prover models no lock state.
+    ///
+    /// Carried with the proof so the artifact and its reservation are recorded — and persisted —
+    /// in the same act: a caller that persists after proving can never end up with a proved
+    /// transaction whose locks it can no longer name.
+    pub fn lock_owner(&self) -> Option<MigrationLockOwner> {
+        self.lock_owner
+    }
+
+    /// Record this proof on `state`: the proven PCZT replaces the stored bytes, the lock-owner
+    /// token is recorded beside it, and the transaction becomes
+    /// [`Proved`](MigrationTxState::Proved). This is the sole consumer of the value, called by
+    /// [`PoolMigrationWrite::store_proved_transaction`] implementations on the state they are
+    /// about to persist.
+    pub fn apply(self, state: &mut MigrationState) {
+        state.set_transaction_proved(self.id, self.pczt, self.lock_owner);
+    }
+
+    /// Reassemble a proved transaction from its parts, for exercising a store's
+    /// [`store_proved_transaction`](PoolMigrationWrite::store_proved_transaction) without
+    /// driving the whole prove pipeline. Test-only: production code obtains these exclusively
+    /// from [`prove_transfer`] / [`prove_preparation`].
+    #[cfg(any(test, feature = "test-dependencies"))]
+    pub fn from_parts(id: MigrationTransferId, pczt: Vec<u8>) -> Self {
+        Self {
+            id,
+            pczt,
+            lock_owner: None,
+        }
+    }
+}
+
 /// The proving seam for a migration transfer: install a transfer's deferred anchors and witnesses
 /// (ZIP 374) against the boundary its schedule drew, then prove it.
 ///
@@ -1336,11 +1883,20 @@ pub trait MigrationProver {
     /// Resolving the funding note's witness requires the boundary checkpoint to still exist in the
     /// wallet's commitment tree at proving time; a wallet backend keeps it alive through migration
     /// anchor-checkpoint retention (see issue #2700).
+    ///
+    /// Failure is typed: an implementation reports a spend whose nullifier matched no note in the
+    /// account's UNSPENT set as [`ProveFailure::InputNotAvailable`], carrying that nullifier and
+    /// the fully-scanned height the absence rests on, and every other failure as
+    /// [`ProveFailure::Other`]. The distinction matters because absence from the unspent set is
+    /// only a membership observation — a spent note and a note whose creator is not yet scanned
+    /// look alike — so the engine, not the prover, decides what it means (see [`prove_transfer`]).
+    /// The reported height must be one the observation genuinely rests on: it becomes the stamp a
+    /// resulting unsatisfiability mark is truncated against on a reorg.
     fn prove_transfer(
         &mut self,
         pczt: pczt::Pczt,
         anchor_boundary: BlockHeight,
-    ) -> Result<pczt::Pczt, Self::Error>;
+    ) -> Result<pczt::Pczt, ProveFailure<Self::Error>>;
 
     /// Prove a pre-signed PREPARATION transaction against a checkpoint at which its spent notes are
     /// witnessable.
@@ -1355,11 +1911,15 @@ pub trait MigrationProver {
     /// note — and produces only an Orchard bundle (no Ironwood output), so the implementation
     /// installs the anchor and every real spend's witness through the PCZT `Updater` role and proves
     /// the single Orchard bundle.
+    ///
+    /// Failure is typed exactly as for [`prove_transfer`](Self::prove_transfer): a spend absent
+    /// from the account's unspent set is [`ProveFailure::InputNotAvailable`] with the height that
+    /// observation rests on, anything else is [`ProveFailure::Other`].
     fn prove_preparation(
         &mut self,
         pczt: pczt::Pczt,
         anchor: BlockHeight,
-    ) -> Result<pczt::Pczt, Self::Error>;
+    ) -> Result<pczt::Pczt, ProveFailure<Self::Error>>;
 
     /// The anchor bucket grid the wallet backing this prover currently retains its durable anchor
     /// checkpoints on.
@@ -1369,6 +1929,44 @@ pub trait MigrationProver {
     /// mid-migration surfaces as [`ProveError::AnchorIntervalMismatch`] rather than as a bare
     /// missing checkpoint at witness-resolution time.
     fn anchor_bucket_interval(&self) -> crate::scheduling::AnchorBucketInterval;
+
+    /// Lock, on the wallet side, the notes `pczt` spends, so that ordinary note selection does not
+    /// hand them to another transaction while this one is proved and awaiting broadcast.
+    ///
+    /// [`prove_transfer`] and [`prove_preparation`] call this once the proof succeeds and record
+    /// the returned token on the transaction, so the window in which the locks are held is exactly
+    /// the window in which a broadcastable artifact exists that nothing else has yet invalidated:
+    /// a `Signed` transaction still has no proof and may never acquire one, and a `Broadcast` one
+    /// has already claimed its notes on the network.
+    ///
+    /// `pczt` is the transaction as STORED, with its witnesses still deferred, not the proven one
+    /// returned by the prove call. The two commit to the same spends, but an implementation that
+    /// picks out the real (non-padding) spends by their absent witnesses can only do so before
+    /// proving installs them.
+    ///
+    /// `lock_expiry_height` is the transaction's own
+    /// [`expiry_height`](MigrationTransaction::expiry_height): the notes are reserved for exactly
+    /// as long as the transaction that spends them can still be mined (ZIP 203), so a migration
+    /// that dies unbroadcast releases its claim on its own rather than stranding the balance.
+    ///
+    /// The locks are ADVISORY, which is what keeps the user in control: excluding them is only the
+    /// DEFAULT of note selection, and a wallet that wants to spend the migration's notes anyway
+    /// passes an owner-scoped override naming these tokens. The user is never blocked from
+    /// spending by a migration in flight; they are only steered away from it by default. The
+    /// migration discovers such a spend at its next prove or broadcast rather than being consulted
+    /// about it.
+    ///
+    /// Returns the opaque owner token the locks were taken under, recorded on the transaction as
+    /// [`MigrationTransaction::lock_owner`] so that a later cancel, or a restart, can release
+    /// exactly these locks. An implementation over a wallet that models no lock state (a test
+    /// mock, or a signing-only backend) returns `None`, and must do so deliberately: there is no
+    /// default, because silently taking no locks would leave a prover's migration inputs
+    /// spendable out from under it with nothing at the type level to say so.
+    fn lock_spent_notes(
+        &mut self,
+        pczt: &pczt::Pczt,
+        lock_expiry_height: BlockHeight,
+    ) -> Result<Option<MigrationLockOwner>, Self::Error>;
 }
 
 /// Why committing a migration's preparation failed.
@@ -1379,6 +1977,12 @@ pub enum CommitError<E> {
     Backend(E),
     /// Building a migration transaction failed. Carries the structured builder error.
     Build(crate::build::BuildError),
+    /// A built migration PCZT presents no well-formed set of real spends, so the real-spend
+    /// nullifier cache ([`MigrationTransaction::spend_nullifiers`]) cannot be extracted from it.
+    RealSpends(crate::pczt_spends::RealSpendError),
+    /// A built PCZT's transaction id could not be derived, so the transaction could not be
+    /// identified for the life of the migration.
+    TxId(crate::pczt_txid::TxIdError),
     /// Serializing a built migration PCZT (for storage or an external signer) failed.
     Serialize(pczt::EncodingError),
     /// NU6.3 is not active on this network, so there is no destination pool to migrate into. The
@@ -1412,6 +2016,12 @@ impl<E: fmt::Display> fmt::Display for CommitError<E> {
         match self {
             CommitError::Backend(e) => write!(f, "wallet backend error: {e}"),
             CommitError::Build(e) => write!(f, "building the migration failed: {e}"),
+            CommitError::RealSpends(e) => {
+                write!(f, "a built migration transaction has no real spends: {e}")
+            }
+            CommitError::TxId(e) => {
+                write!(f, "a built migration transaction has no derivable id: {e}")
+            }
             CommitError::Serialize(e) => {
                 write!(f, "serializing a migration transaction failed: {e:?}")
             }
@@ -1454,6 +2064,10 @@ pub enum ProveError<E> {
     /// A transfer carries no anchor boundary. Every transfer draws one at scheduling time, so this
     /// indicates a corrupt stored state rather than a normal condition.
     NoAnchorBoundary(MigrationTransferId),
+    /// The network parameters report no NU6.3 activation height, so no anchor boundary can be
+    /// re-drawn. A migration cannot be committed on such a network (its commit requires the same
+    /// height), so this indicates mismatched parameters rather than a normal condition.
+    Nu63NotActive,
     /// The wallet's anchor retention grid has changed since this migration was committed, so the
     /// boundaries its transfers anchored to are no longer retained and their checkpoints will have
     /// been pruned. The migration cannot be proved and must be re-planned under the current grid
@@ -1501,6 +2115,11 @@ impl<E: fmt::Display> fmt::Display for ProveError<E> {
                 "transfer {} has no drawn anchor boundary; the stored state is inconsistent",
                 u32::from(*id)
             ),
+            ProveError::Nu63NotActive => write!(
+                f,
+                "the network parameters report no NU6.3 activation height, so no anchor boundary \
+                 can be re-drawn"
+            ),
             ProveError::AnchorIntervalMismatch {
                 committed,
                 configured,
@@ -1512,7 +2131,7 @@ impl<E: fmt::Display> fmt::Display for ProveError<E> {
                 committed.block_count(),
                 configured.block_count()
             ),
-            ProveError::Parse(e) => write!(f, "parsing the stored PCZT failed: {e:?}"),
+            ProveError::Parse(e) => write!(f, "parsing the stored PCZT failed: {e}"),
             ProveError::Serialize(e) => write!(f, "serializing the proven PCZT failed: {e:?}"),
             ProveError::Prover(e) => write!(f, "proving the transfer failed: {e}"),
         }
@@ -1522,31 +2141,86 @@ impl<E: fmt::Display> fmt::Display for ProveError<E> {
 #[cfg(feature = "orchard")]
 impl<E: core::error::Error> core::error::Error for ProveError<E> {}
 
-/// Prove a pre-signed migration transfer against the boundary its schedule drew, moving it
-/// `Signed -> Proved`.
+/// Prove a pre-signed migration transfer against the boundary its schedule drew.
 ///
 /// This is the step that finally consults a transfer's PERSISTED
 /// [`anchor_boundary`](MigrationTransaction::anchor_boundary), drawn at scheduling time: it reads
 /// that boundary and hands the stored PCZT and the boundary to
 /// [`MigrationProver::prove_transfer`], which installs the Orchard source anchor and the funding
 /// note's witness against that boundary and the Ironwood destination anchor (through the PCZT
-/// `Updater` role), then proves both bundles. The proven PCZT replaces the stored one and the
-/// transaction becomes [`Proved`](MigrationTxState::Proved), ready to broadcast.
+/// `Updater` role), then proves both bundles. A successful proof is returned as
+/// [`ProveOutcome::Proved`]'s [`ProvedTransaction`], which the caller hands to
+/// [`PoolMigrationWrite::store_proved_transaction`] — the single step that records the
+/// transaction [`Proved`](MigrationTxState::Proved) and persists it, for a wallet-backed store
+/// atomically with the wallet's own record of the finalized transaction. Neither this function
+/// nor anything else moves the state to `Proved`.
 ///
 /// The CALLER decides WHEN to prove each transfer (once its funding note is mined and its drawn
-/// anchor boundary has settled — [`MigrationState::next_step`] surfaces this as
-/// [`AdvanceStep::Prove`](crate::state::AdvanceStep::Prove), typically at a sync wake-up well
-/// before the broadcast height); this function performs the proof for the one transfer `id`. It
-/// is idempotent only in the sense that a transaction not in [`Signed`](MigrationTxState::Signed)
-/// is rejected with [`ProveError::NotReady`] rather than re-proved.
+/// anchor boundary has settled — [`advance_migration`] surfaces this as [`AdvanceStep::Prove`],
+/// typically at a sync wake-up well before the broadcast height); this function performs the proof
+/// for the one transfer `id`. It is idempotent only in the sense that a transaction not in
+/// [`Signed`](MigrationTxState::Signed) is rejected with [`ProveError::NotReady`] rather than
+/// re-proved.
+///
+/// # The proving-time boundary re-draw
+///
+/// The persisted boundary is PROVISIONAL for a dependency-funded transfer: the schedule drew it
+/// before the funding preparation mined, from an estimate of when it would
+/// ([`EST_PREP_LAYER_MINING_BLOCKS`]), and preparations routinely out-mine that estimate — a
+/// wallet asleep through one broadcast window delays every layer behind it. A funding note mined
+/// PAST the drawn boundary does not exist in the boundary's tree state, so no witness can ever be
+/// computed there: proving against it defers forever rather than failing. ZIP 318 makes anchor
+/// selection a proving-time rule for exactly this reason, so before handing the boundary to the
+/// prover this function re-validates it against the funding preparations' REAL mined heights
+/// (from the migration's own state) and, when the funding note postdates it, re-draws the
+/// boundary from the note's actual creation height and `scanned_tip` — the chain tip the wallet
+/// has observed and can witness at — persisting the fresh draw on the row
+/// ([`MigrationState::set_transfer_anchor_boundary`]). The re-draw is sound for a `Signed`
+/// transfer by construction: the PCZT's anchor and witnesses are deferred to proving (ZIP 374),
+/// so nothing about the stored artifact pins the old boundary. When no grid boundary at or past
+/// the funding note's creation has settled within `scanned_tip` yet, there is nothing valid to
+/// draw and the answer is [`NotYetProvable`](ProveOutcome::NotYetProvable) — retry after further
+/// sync, exactly like any other not-yet-scanned condition. A transfer whose funding predates its
+/// boundary (including every direct-funded transfer, whose notes existed before the commit) keeps
+/// the boundary its schedule drew, so anchor cohorts are preserved wherever they are valid.
+///
+/// A prover that reports the funding note ABSENT from the account's unspent set
+/// ([`ProveFailure::InputNotAvailable`]) is not an error: absence is a membership observation
+/// that cannot by itself distinguish a SPENT input from one whose creating transaction the wallet
+/// has not scanned yet, so the engine sharpens it into a [`ProveOutcome`] by DEPENDENCY COVERAGE.
+/// If every transaction this one waits on is mined at or below the height the observation rests
+/// on, the input note was necessarily scanned and its absence is positive evidence of a spend:
+/// the observation is recorded (marking this transaction and, through the dependency closure,
+/// everything stranded behind it) and answered
+/// [`MarkedUnsatisfiable`](ProveOutcome::MarkedUnsatisfiable). Anything less — a dependency mined
+/// above that height, or an unmined one — concludes nothing and answers
+/// [`NotYetProvable`](ProveOutcome::NotYetProvable) with no state change; a false mark would
+/// strand live value behind an observation only a reorg can clear, so the conservative reading is
+/// always a retry.
+///
+/// The caller PERSISTS the outcome: a [`Proved`](ProveOutcome::Proved) answer through
+/// [`PoolMigrationWrite::store_proved_transaction`] (which consumes the carried proof), and a
+/// [`MarkedUnsatisfiable`](ProveOutcome::MarkedUnsatisfiable) one through
+/// [`PoolMigrationWrite::replace_migration`] — the marks and the closure changed, and an
+/// unpersisted mark would be lost on the next launch. (A boundary re-draw rides along with
+/// whichever of the two follows; a [`NotYetProvable`](ProveOutcome::NotYetProvable) answer after
+/// a re-draw is worth persisting for the same reason, though re-deriving it costs only a retry.)
+///
+/// [`advance_migration`]: crate::satisfiability::advance_migration
+/// [`AdvanceStep::Prove`]: crate::state::AdvanceStep::Prove
 #[cfg(feature = "orchard")]
-pub fn prove_transfer<P>(
+pub fn prove_transfer<C, P, R>(
+    params: &C,
     prover: &mut P,
     state: &mut MigrationState,
     id: MigrationTransferId,
-) -> Result<(), ProveError<P::Error>>
+    scanned_tip: BlockHeight,
+    rng: &mut R,
+) -> Result<ProveOutcome, ProveError<P::Error>>
 where
+    C: zcash_protocol::consensus::Parameters,
     P: MigrationProver,
+    R: RngCore + rand_core::CryptoRng,
 {
     let tx = state
         .transactions()
@@ -1559,9 +2233,12 @@ where
     if !matches!(tx.state(), MigrationTxState::Signed) {
         return Err(ProveError::NotReady(id));
     }
-    let anchor_boundary = tx
+    let drawn_boundary = tx
         .anchor_boundary()
         .ok_or(ProveError::NoAnchorBoundary(id))?;
+    // Owned copies so the redraw below can take the state mutably.
+    //let depends_on = tx.depends_on().to_vec();
+    //let pczt_bytes = tx.pczt().clone();
 
     // The stored boundary is only provable while the wallet still retains its checkpoint, which it
     // does only if it is still retaining on the grid the migration was committed under.
@@ -1574,18 +2251,148 @@ where
         });
     }
 
-    let pczt = pczt::Pczt::parse(tx.pczt()).map_err(ProveError::Parse)?;
-    let proven = prover
-        .prove_transfer(pczt, anchor_boundary)
-        .map_err(ProveError::Prover)?;
-    let bytes = proven.serialize().map_err(ProveError::Serialize)?;
+    // The funding note's actual creation height: the highest mined height among this transfer's
+    // dependencies (the preparations that mint its inputs). `None` for a direct-funded transfer —
+    // its notes existed before the commit, so the commit-time draw already respected them — and
+    // when no dependency is mined yet, in which case the prover's own input lookup answers.
+    let funding_creation = tx
+        .depends_on()
+        .iter()
+        .filter_map(|dep| {
+            state
+                .transactions()
+                .iter()
+                .find(|t| t.id() == *dep)
+                .and_then(|producer| producer.state().mined_height())
+        })
+        .max();
 
-    state.set_transaction_proved(id, bytes);
-    Ok(())
+    let new_anchor_boundary = match funding_creation {
+        // The funding note postdates the drawn boundary: it is not in that tree state and can
+        // never be witnessed there. Re-draw from reality (see the doc block above).
+        Some(funding_height) if funding_height > drawn_boundary => {
+            let nu63_activation = params
+                .activation_height(zcash_protocol::consensus::NetworkUpgrade::Nu6_3)
+                .ok_or(ProveError::Nu63NotActive)?;
+            match scheduling::draw_anchor_boundary(
+                committed,
+                nu63_activation,
+                funding_height,
+                scanned_tip,
+                rng,
+            ) {
+                Some(fresh) => Some(fresh),
+                // No boundary at or past the funding note's creation has settled yet: nothing
+                // valid to draw, retry after further sync.
+                None => return Ok(ProveOutcome::NotYetProvable),
+            }
+        }
+        _ => None,
+    };
+
+    // Read before the PCZT parse ends the borrow of `tx`: the locks on the spent notes live
+    // exactly as long as the transaction that spends them can still be mined.
+    let lock_expiry_height = tx.expiry_height();
+
+    let pczt = pczt::Pczt::parse(tx.pczt()).map_err(ProveError::Parse)?;
+    // Retained for the lock step below: proving installs the spend witnesses, which is exactly the
+    // marker `lock_spent_notes` reads to tell a real spend from a padding dummy.
+    let unproven = pczt.clone();
+    let anchor_boundary = if let Some(fresh) = new_anchor_boundary {
+        state.set_transfer_anchor_boundary(id, fresh);
+        fresh
+    } else {
+        drawn_boundary
+    };
+
+    match prover.prove_transfer(pczt, anchor_boundary) {
+        Ok(proven) => {
+            // The reservation is taken only once a broadcastable artifact exists: a proof that
+            // fails takes no locks, and a lock that fails (a rival owner: another flow committed
+            // to one of these notes first) discards the proof and leaves the transaction
+            // `Signed`.
+            let lock_owner = prover
+                .lock_spent_notes(&unproven, lock_expiry_height)
+                .map_err(ProveError::Prover)?;
+            let bytes = proven.serialize().map_err(ProveError::Serialize)?;
+            Ok(ProveOutcome::Proved(ProvedTransaction {
+                id,
+                pczt: bytes,
+                lock_owner,
+            }))
+        }
+        Err(ProveFailure::InputNotAvailable { nullifier, as_of }) => {
+            Ok(interpret_input_not_available(state, id, nullifier, as_of))
+        }
+        Err(ProveFailure::Other(e)) => Err(ProveError::Prover(e)),
+    }
+}
+
+/// Decide what a prover's membership-only "input not among the unspent set" observation means for
+/// the transaction `id`, and record it when it is conclusive.
+///
+/// The observation alone cannot distinguish a SPENT input from one whose creating transaction the
+/// wallet has not yet scanned. What separates the two is DEPENDENCY COVERAGE: if every transaction
+/// this one waits on is mined at a height the wallet has already scanned past (`<= as_of`), the
+/// input note was necessarily scanned, so its absence from the unspent set is positive evidence
+/// that it was spent. A transaction with no dependencies is covered trivially — it spends notes
+/// that were spendable when the migration was committed, hence long since scanned. Anything less
+/// (a dependency mined above `as_of`, or an UNMINED dependency, which means the drive layer
+/// offered this transaction before its inputs existed) concludes nothing: the conservative reading
+/// is a retry, never a mark, since a false mark strands live value behind a durable observation
+/// only a reorg can clear.
+///
+/// A conclusive observation is recorded through the ordinary satisfiability mutator
+/// ([`MigrationState::record_satisfiability`]), so it marks and closes over the dependency graph
+/// exactly as an oracle-driven one does. Its [`DuenessTargets`] argument judges expiry for the
+/// closure's expired sources, and the pair is degenerate here — the prover's `as_of` IS a scanned
+/// frontier, so `at(as_of + 1)` is the honest next-block judgment at the height this observation
+/// rests on, with no estimate to accelerate anything by.
+#[cfg(feature = "orchard")]
+fn interpret_input_not_available(
+    state: &mut MigrationState,
+    id: MigrationTransferId,
+    nullifier: [u8; 32],
+    as_of: BlockHeight,
+) -> ProveOutcome {
+    let txs = state.transactions();
+    let deps_covered = txs
+        .iter()
+        .find(|t| t.id() == id)
+        // A transaction the state does not hold is unreachable here — every caller locates it
+        // before proving — and reads as uncovered rather than panicking, the same conservative
+        // reading a dangling dependency gets below.
+        .is_some_and(|tx| {
+            tx.depends_on().iter().all(|dep| {
+                txs.iter()
+                    .find(|d| d.id() == *dep)
+                    .and_then(|d| d.state().mined_height())
+                    .is_some_and(|mined| mined <= as_of)
+            })
+        });
+    if !deps_covered {
+        return ProveOutcome::NotYetProvable;
+    }
+
+    state.record_satisfiability(
+        DuenessTargets::at(as_of + 1),
+        &[(
+            id,
+            StepSatisfiability::Unsatisfiable {
+                cause: UnsatisfiableCause::InputsSpent {
+                    nullifiers: vec![nullifier],
+                },
+                as_of_height: as_of,
+            },
+        )],
+    );
+    ProveOutcome::MarkedUnsatisfiable {
+        replan_required: state.replan_required(),
+    }
 }
 
 /// Prove a pre-signed migration PREPARATION transaction against a checkpoint at which its spent
-/// notes are witnessable, moving it `Signed -> Proved`.
+/// notes are witnessable.
 ///
 /// A preparation transaction carries no drawn
 /// [`anchor_boundary`](MigrationTransaction::anchor_boundary) (it anchors to its already-mined
@@ -1594,19 +2401,29 @@ where
 /// (for example the current chain tip). It hands the stored PCZT and the `anchor` to
 /// [`MigrationProver::prove_preparation`], which installs the Orchard source anchor and every real
 /// spend's witness against that checkpoint (through the PCZT `Updater` role) and proves the single
-/// Orchard bundle. The proven PCZT replaces the stored one and the transaction becomes
-/// [`Proved`](MigrationTxState::Proved), ready to broadcast.
+/// Orchard bundle. As for [`prove_transfer`], a successful proof is returned as
+/// [`ProveOutcome::Proved`]'s [`ProvedTransaction`], which the caller hands to
+/// [`PoolMigrationWrite::store_proved_transaction`]; nothing else moves the state to
+/// [`Proved`](MigrationTxState::Proved).
 ///
 /// A transaction not in [`Signed`](MigrationTxState::Signed) is rejected with
 /// [`ProveError::NotReady`] rather than re-proved; a transfer is rejected with
 /// [`ProveError::NotAPreparation`].
+///
+/// As for [`prove_transfer`], a prover reporting a spend ABSENT from the account's unspent set
+/// ([`ProveFailure::InputNotAvailable`]) is answered with a [`ProveOutcome`] rather than an error,
+/// under the same dependency-coverage rule — which a layer-0 preparation, depending on nothing,
+/// satisfies vacuously: the notes it spends were spendable when the migration was committed, hence
+/// long since scanned. The caller PERSISTS the outcome as for [`prove_transfer`], including after
+/// [`MarkedUnsatisfiable`](ProveOutcome::MarkedUnsatisfiable), which changed the marks and the
+/// dependency closure.
 #[cfg(feature = "orchard")]
 pub fn prove_preparation<P>(
     prover: &mut P,
     state: &mut MigrationState,
     id: MigrationTransferId,
     anchor: BlockHeight,
-) -> Result<(), ProveError<P::Error>>
+) -> Result<ProveOutcome, ProveError<P::Error>>
 where
     P: MigrationProver,
 {
@@ -1622,14 +2439,35 @@ where
         return Err(ProveError::NotReady(id));
     }
 
-    let pczt = pczt::Pczt::parse(tx.pczt()).map_err(ProveError::Parse)?;
-    let proven = prover
-        .prove_preparation(pczt, anchor)
-        .map_err(ProveError::Prover)?;
-    let bytes = proven.serialize().map_err(ProveError::Serialize)?;
+    // Read before the PCZT parse ends the borrow of `tx`: the locks on the spent notes live exactly
+    // as long as the preparation that spends them can still be mined.
+    let lock_expiry_height = tx.expiry_height();
 
-    state.set_transaction_proved(id, bytes);
-    Ok(())
+    let pczt = pczt::Pczt::parse(tx.pczt()).map_err(ProveError::Parse)?;
+    // Retained for the lock step below: proving installs the spend witnesses, which is exactly the
+    // marker `lock_spent_notes` reads to tell a real spend from a padding dummy.
+    let unproven = pczt.clone();
+    match prover.prove_preparation(pczt, anchor) {
+        Ok(proven) => {
+            // The reservation is taken only once a broadcastable artifact exists: a proof that
+            // fails takes no locks, and a lock that fails (a rival owner: another flow committed
+            // to one of these notes first) discards the proof and leaves the transaction
+            // `Signed`.
+            let lock_owner = prover
+                .lock_spent_notes(&unproven, lock_expiry_height)
+                .map_err(ProveError::Prover)?;
+            let bytes = proven.serialize().map_err(ProveError::Serialize)?;
+            Ok(ProveOutcome::Proved(ProvedTransaction {
+                id,
+                pczt: bytes,
+                lock_owner,
+            }))
+        }
+        Err(ProveFailure::InputNotAvailable { nullifier, as_of }) => {
+            Ok(interpret_input_not_available(state, id, nullifier, as_of))
+        }
+        Err(ProveFailure::Other(e)) => Err(ProveError::Prover(e)),
+    }
 }
 
 /// Why rebuilding an expired migration transfer failed.
@@ -1648,9 +2486,23 @@ pub enum RebuildError<E> {
     /// still valid, or it has already mined. Guards against reissuing a live transaction as a second,
     /// double-spending copy.
     NotExpired(MigrationTransferId),
+    /// The transfer's inputs can never again all exist unspent on chain: it is itself marked
+    /// [`unsatisfiable_at`](MigrationTransaction::unsatisfiable_at), or a transaction it depends on
+    /// is. A rebuild re-spends the SAME funding note under a fresh anchor and expiry, so it cannot
+    /// cure a missing input — nothing a rebuild produces could ever be mined either. The remedy is
+    /// the migration-level replan ([`AdvanceStep::Replan`]): mark the migration superseded and
+    /// re-plan its remaining balance.
+    ///
+    /// Reported in preference to [`NotExpired`](Self::NotExpired) and ahead of the expiry check,
+    /// because a dead transfer is usually also an expired one, and the more specific condition is
+    /// the one a caller must act on.
+    ///
+    /// [`AdvanceStep::Replan`]: crate::state::AdvanceStep::Replan
+    Unsatisfiable(MigrationTransferId),
     /// The stored migration state is internally inconsistent: the denomination plan carries no crossing or
-    /// funding value for this transfer's crossing index, or the transfer's stored PCZT is
-    /// malformed.
+    /// funding value for this transfer's crossing index, or the transfer's persisted nullifier
+    /// cache ([`MigrationTransaction::spend_nullifiers`]) does not hold exactly the one funding
+    /// nullifier a transfer spends.
     InconsistentPlan(alloc::string::String),
     /// The transfer's funding note — the EXACT note its expired PCZT spends, matched by nullifier
     /// among the wallet's spendable notes — is no longer available. It should still be unspent
@@ -1678,6 +2530,12 @@ pub enum RebuildError<E> {
     },
     /// Building the fresh transfer PCZT failed.
     Build(crate::build::BuildError),
+    /// The rebuilt transfer PCZT presents no well-formed set of real spends, so the real-spend
+    /// nullifier cache ([`MigrationTransaction::spend_nullifiers`]) cannot be refreshed from it.
+    RealSpends(crate::pczt_spends::RealSpendError),
+    /// A built PCZT's transaction id could not be derived, so the transaction could not be
+    /// identified for the life of the migration.
+    TxId(crate::pczt_txid::TxIdError),
     /// Serializing the rebuilt PCZT failed.
     Serialize(pczt::EncodingError),
     /// A wallet backend or signing operation failed.
@@ -1699,6 +2557,12 @@ impl<E: fmt::Display> fmt::Display for RebuildError<E> {
             RebuildError::NotExpired(id) => write!(
                 f,
                 "transaction {} has not expired; there is nothing to rebuild",
+                u32::from(*id)
+            ),
+            RebuildError::Unsatisfiable(id) => write!(
+                f,
+                "transfer {}'s inputs can never again all exist unspent, so no rebuild can revive \
+                 it; the migration must be re-planned",
                 u32::from(*id)
             ),
             RebuildError::InconsistentPlan(m) => {
@@ -1726,6 +2590,12 @@ impl<E: fmt::Display> fmt::Display for RebuildError<E> {
                 configured.block_count()
             ),
             RebuildError::Build(e) => write!(f, "rebuilding the transfer failed: {e}"),
+            RebuildError::RealSpends(e) => {
+                write!(f, "the rebuilt transfer has no real spends: {e}")
+            }
+            RebuildError::TxId(e) => {
+                write!(f, "the rebuilt transfer has no derivable id: {e}")
+            }
             RebuildError::Serialize(e) => {
                 write!(f, "serializing the rebuilt transfer failed: {e:?}")
             }
@@ -1743,12 +2613,12 @@ impl<E: core::error::Error> core::error::Error for RebuildError<E> {}
 /// unchanged denomination.
 ///
 /// A transfer can only be included in a block at or below its expiry height (ZIP 203); once the
-/// chain passes it, the pre-signed transaction is dead and
-/// [`next_step`](MigrationState::next_step) surfaces it as
-/// [`AdvanceStep::Rebuild`](crate::state::AdvanceStep::Rebuild). NOTHING of the expired artifact is
-/// reusable — the signature hash covers the expiry height, so its signatures cannot authorize any
-/// rescheduled copy. This is ZIP 318's expired-transaction handling: "a new transaction with a
-/// fresh anchor and expiry is constructed for the affected part, with its denomination unchanged".
+/// chain passes it, the pre-signed transaction is dead and [`advance_migration`] surfaces it as
+/// [`AdvanceStep::Rebuild`]. NOTHING of the expired artifact is reusable — the signature hash
+/// covers the expiry height, so its signatures cannot authorize any rescheduled copy. This is
+/// ZIP 318's expired-transaction handling: "a new transaction with a fresh anchor and expiry is
+/// constructed for the affected part, with its denomination unchanged".
+///
 /// This function performs that reconstruction: it reschedules the part from the current tip with a
 /// fresh memoryless delay, derives the new canonical expiry, draws a fresh boundary anchor, builds
 /// a new transfer PCZT against the same funding note and crossing value, signs it anew, and
@@ -1772,6 +2642,9 @@ impl<E: core::error::Error> core::error::Error for RebuildError<E> {}
 /// rather than this part rebuilt.
 ///
 /// The caller persists the updated state afterwards (`replace_migration`), exactly as after proving.
+///
+/// [`advance_migration`]: crate::satisfiability::advance_migration
+/// [`AdvanceStep::Rebuild`]: crate::state::AdvanceStep::Rebuild
 #[cfg(feature = "orchard")]
 pub fn rebuild_expired_transfer<P, B, R>(
     params: &P,
@@ -1819,7 +2692,7 @@ where
 }
 
 /// Shared body of [`rebuild_expired_transfer`] (with [`Signing::InProcess`]) and
-/// [`rebuild_expired_transfer_unsigned`] (with [`Signing::External`]). Returns the
+/// [`rebuild_expired_transfer_unsigned`] (which defers signing to an external signer). Returns the
 /// [`UnsignedMigrationTx`] for the external path, `None` for the in-process path.
 #[cfg(feature = "orchard")]
 fn rebuild_expired_transfer_inner<P, B, R>(
@@ -1862,6 +2735,23 @@ where
         MigrationTxKind::Transfer { crossing } => crossing,
         MigrationTxKind::Preparation { .. } => return Err(RebuildError::NotATransfer(id)),
     };
+    // A transfer whose inputs are gone is beyond rebuilding, and that is checked BEFORE expiry: a
+    // dead transfer is usually an expired one too, and answering `NotExpired` (or, worse,
+    // rebuilding) would send the caller down a remedy that cannot work. The rebuild re-spends the
+    // SAME funding note — recovered by identity from the nullifier cache below — so it cannot cure
+    // a missing input, and its own dead dependency would leave it re-anchored to notes that never
+    // arrive. `advance_migration` never surfaces such a transfer as `AdvanceStep::Rebuild`, but
+    // `expired_transactions` is public and a consumer may drive the rebuild from it directly, so
+    // the guard belongs here rather than only in the planning kernel.
+    let dead_dependency = tx.depends_on.iter().any(|d| {
+        state
+            .transactions
+            .iter()
+            .any(|t| t.id == *d && t.unsatisfiable.is_some())
+    });
+    if tx.unsatisfiable.is_some() || dead_dependency {
+        return Err(RebuildError::Unsatisfiable(id));
+    }
     // Only an expired, not-yet-mined transfer is rebuilt (the same condition the state machine reports
     // as expired): a still-valid or already-mined transfer is a typed error, not a silently reissued
     // double spend.
@@ -1883,7 +2773,7 @@ where
         .iter()
         .filter_map(|dep| state.transactions.iter().find(|t| t.id == *dep))
         .filter_map(|producer| match producer.state {
-            MigrationTxState::Mined { height } => Some(height),
+            MigrationTxState::Mined { height, .. } => Some(height),
             _ => None,
         })
         .max()
@@ -1904,27 +2794,19 @@ where
             RebuildError::InconsistentPlan(format!("no funding value for transfer {crossing}"))
         })?;
 
-    // Recover the funding note's IDENTITY from the expired PCZT itself: its one real spend (the
-    // action with no witness; ZIP 374 deferral leaves the padding dummy its arbitrary witness)
-    // reveals the nullifier of the exact note this part is funded by. Denominations repeat across
-    // a migration, so matching the wallet's spendable notes by value alone could grab a sibling
-    // transfer's funding note and turn the rebuilt transfer into a double-spend of that
-    // still-valid sibling.
-    let stored_pczt = pczt::Pczt::parse(&tx.pczt).map_err(|e| {
-        RebuildError::InconsistentPlan(format!("the stored transfer PCZT does not parse: {e:?}"))
-    })?;
-    let mut real_spend_nullifiers = stored_pczt
-        .orchard()
-        .actions()
-        .iter()
-        .filter(|a| a.spend().witness().is_none())
-        .map(|a| *a.spend().nullifier());
-    let funding_nullifier = match (real_spend_nullifiers.next(), real_spend_nullifiers.next()) {
-        (Some(nf), None) => nf,
+    // Recover the funding note's IDENTITY from the transaction's persisted nullifier cache: its
+    // one real spend's nullifier names the exact note this part is funded by. Denominations
+    // repeat across a migration, so matching the wallet's spendable notes by value alone could
+    // grab a sibling transfer's funding note and turn the rebuilt transfer into a double-spend of
+    // that still-valid sibling. The CACHE, not the stored PCZT, is the authority: proving
+    // replaces the stored bytes with the PROVEN PCZT, whose real spend carries an installed
+    // witness, so the deferred-witness rule no longer identifies it there — while the cache is
+    // extracted at commit (and refreshed below), before any proof.
+    let funding_nullifier = match tx.spend_nullifiers.as_slice() {
+        &[nf] => nf,
         _ => {
             return Err(RebuildError::InconsistentPlan(
-                "the stored transfer PCZT does not have exactly one real (unwitnessed) spend"
-                    .into(),
+                "the transfer's nullifier cache does not hold exactly one funding nullifier".into(),
             ));
         }
     };
@@ -1982,6 +2864,16 @@ where
         &mut *rng,
     )
     .map_err(RebuildError::Build)?;
+    // Refresh the nullifier cache from the rebuilt PCZT, for uniformity with the commit path; the
+    // rebuild spends the same funding note, so the cached value is in fact stable.
+    let spend_nullifiers: Vec<[u8; 32]> = crate::pczt_spends::real_spend_nullifiers(&pczt)
+        .map_err(RebuildError::RealSpends)?
+        .into_iter()
+        .map(|(_, nf)| nf.to_bytes())
+        .collect();
+    // The rebuilt transaction's own id, derived before signing consumes the PCZT (signing does
+    // not affect it — see `crate::pczt_txid`).
+    let txid = crate::pczt_txid::pczt_txid(&pczt).map_err(RebuildError::TxId)?;
     let (bytes, new_state, unsigned) = match signing {
         Signing::InProcess => {
             let signed = backend.sign(pczt).map_err(RebuildError::Backend)?;
@@ -1993,8 +2885,7 @@ where
             let unsigned = UnsignedMigrationTx {
                 id,
                 pczt: bytes.clone(),
-                actions: crate::denomination::SOURCE_ACTIONS_PER_TRANSFER
-                    + crate::denomination::DESTINATION_ACTIONS_PER_TRANSFER,
+                actions: CROSSING_SOURCE_ACTIONS + CROSSING_DESTINATION_ACTIONS,
             };
             (bytes, MigrationTxState::AwaitingSignature, Some(unsigned))
         }
@@ -2010,7 +2901,11 @@ where
     tx.scheduled_height = scheduled_height;
     tx.expiry_height = expiry_height;
     tx.anchor_boundary = Some(anchor_boundary);
+    // A rebuild is a genuinely DIFFERENT transaction — fresh anchor, fresh expiry, signed anew —
+    // so the stored id is replaced rather than carried over. This is the only place it changes.
+    tx.txid = txid;
     tx.state = new_state;
+    tx.spend_nullifiers = spend_nullifiers;
     Ok(unsigned)
 }
 
@@ -2107,8 +3002,6 @@ impl MigrationPlan {
         unsigned: Vec<UnsignedMigrationTx>,
         budget: SigningRoundBudget,
     ) -> Vec<Vec<UnsignedMigrationTx>> {
-        use alloc::collections::BTreeMap;
-
         let rounds = self.signing_rounds(budget);
         let mut round_of: BTreeMap<u32, usize> = BTreeMap::new();
         for (i, round) in rounds.iter().enumerate() {
@@ -2144,19 +3037,24 @@ fn finish_built_pczt<B>(
     backend: &mut B,
     pczt: ::pczt::Pczt,
     signing: Signing,
-) -> Result<(Vec<u8>, MigrationTxState), CommitError<<B as MigrationBackend>::Error>>
+) -> Result<(Vec<u8>, TxId, MigrationTxState), CommitError<<B as MigrationBackend>::Error>>
 where
     B: MigrationBackend + MigrationCrypto<Error = <B as MigrationBackend>::Error>,
 {
+    // Derived BEFORE signing, which is the only order that makes sense: signing needs the txid to
+    // build its signature hash, so the id exists ahead of either arm below and neither can change
+    // it. A migration built for an external signer is therefore as identifiable as one signed in
+    // process, and stays so once the returned signature is applied.
+    let txid = crate::pczt_txid::pczt_txid(&pczt).map_err(CommitError::TxId)?;
     match signing {
         Signing::InProcess => {
             let signed = backend.sign(pczt).map_err(CommitError::Backend)?;
             let bytes = signed.serialize().map_err(CommitError::Serialize)?;
-            Ok((bytes, MigrationTxState::Signed))
+            Ok((bytes, txid, MigrationTxState::Signed))
         }
         Signing::External => {
             let bytes = pczt.serialize().map_err(CommitError::Serialize)?;
-            Ok((bytes, MigrationTxState::AwaitingSignature))
+            Ok((bytes, txid, MigrationTxState::AwaitingSignature))
         }
     }
 }
@@ -2192,8 +3090,10 @@ struct MintedNote {
 /// ([`CommitError::MigrationInProgress`]): a committed migration is resumed from the store, or
 /// cancelled, never rebuilt over.
 ///
-/// `params` is the network, `target_height` the height the transactions are built at (post-NU6.3), and
-/// `rng` a cryptographically secure RNG.
+/// `params` is the network, `target_height` the height the transactions are built at (post-NU6.3),
+/// `rng` a cryptographically secure RNG, and `replan_threshold` the policy stamped on the committed
+/// migration (see [`MigrationState::replan_threshold`]) — pass [`ReplanThreshold::DEFAULT`] absent
+/// a specific policy.
 #[cfg(feature = "orchard")]
 pub fn commit_preparation<P, B, R>(
     params: &P,
@@ -2201,6 +3101,7 @@ pub fn commit_preparation<P, B, R>(
     backend: &mut B,
     plan: &MigrationPlan,
     rng: &mut R,
+    replan_threshold: ReplanThreshold,
 ) -> Result<MigrationState, CommitError<<B as MigrationBackend>::Error>>
 where
     P: zcash_protocol::consensus::Parameters + Clone,
@@ -2217,6 +3118,7 @@ where
         plan,
         rng,
         Signing::InProcess,
+        replan_threshold,
     )
     .map(|output| output.state)
 }
@@ -2233,8 +3135,10 @@ where
 /// `replace_migration`, and drive the broadcasts through the normal state machine (proving remains a
 /// consumer responsibility, at broadcast time).
 ///
-/// `params` is the network, `target_height` the height the transactions are built at (post-NU6.3), and
-/// `rng` a cryptographically secure RNG.
+/// `params` is the network, `target_height` the height the transactions are built at (post-NU6.3),
+/// `rng` a cryptographically secure RNG, and `replan_threshold` the policy stamped on the committed
+/// migration (see [`MigrationState::replan_threshold`]) — pass [`ReplanThreshold::DEFAULT`] absent
+/// a specific policy.
 #[cfg(feature = "orchard")]
 pub fn build_preparation_unsigned<P, B, R>(
     params: &P,
@@ -2242,6 +3146,7 @@ pub fn build_preparation_unsigned<P, B, R>(
     backend: &mut B,
     plan: &MigrationPlan,
     rng: &mut R,
+    replan_threshold: ReplanThreshold,
 ) -> Result<(MigrationState, Vec<UnsignedMigrationTx>), CommitError<<B as MigrationBackend>::Error>>
 where
     P: zcash_protocol::consensus::Parameters + Clone,
@@ -2251,8 +3156,16 @@ where
         + PoolMigrationWrite,
     R: RngCore + rand_core::CryptoRng,
 {
-    commit_preparation_inner(params, target_height, backend, plan, rng, Signing::External)
-        .map(|output| (output.state, output.unsigned))
+    commit_preparation_inner(
+        params,
+        target_height,
+        backend,
+        plan,
+        rng,
+        Signing::External,
+        replan_threshold,
+    )
+    .map(|output| (output.state, output.unsigned))
 }
 
 /// Shared body of [`commit_preparation`] (with [`Signing::InProcess`]) and
@@ -2266,6 +3179,7 @@ fn commit_preparation_inner<P, B, R>(
     plan: &MigrationPlan,
     rng: &mut R,
     signing: Signing,
+    replan_threshold: ReplanThreshold,
 ) -> Result<CommitOutput, CommitError<<B as MigrationBackend>::Error>>
 where
     P: zcash_protocol::consensus::Parameters + Clone,
@@ -2281,7 +3195,7 @@ where
     committer.build_transfers(plan)?;
     // `into_state` consumes the committer, releasing its `&mut backend` reborrow, so the store
     // write below can borrow `backend` again.
-    let output = committer.into_state(plan);
+    let output = committer.into_state(plan, replan_threshold);
     backend
         .replace_migration(&output.state)
         .map_err(CommitError::Backend)?;
@@ -2293,6 +3207,10 @@ where
 /// locate each transfer's spend in the wallet's Orchard commitment tree at proving time; a
 /// production consumer recovers them from its own scanned note store, so this entry point exists
 /// for tests (and downstream test harnesses) that drive real proving without a scanning wallet.
+///
+/// `replan_threshold` is the policy stamped on the committed migration (see
+/// [`MigrationState::replan_threshold`]) — pass [`ReplanThreshold::DEFAULT`] absent a specific
+/// policy; the other parameters are as [`commit_preparation`]'s.
 #[cfg(all(feature = "orchard", any(test, feature = "test-dependencies")))]
 pub fn commit_preparation_with_funding<P, B, R>(
     params: &P,
@@ -2300,6 +3218,7 @@ pub fn commit_preparation_with_funding<P, B, R>(
     backend: &mut B,
     plan: &MigrationPlan,
     rng: &mut R,
+    replan_threshold: ReplanThreshold,
 ) -> Result<(MigrationState, TransferFunding), CommitError<<B as MigrationBackend>::Error>>
 where
     P: zcash_protocol::consensus::Parameters + Clone,
@@ -2316,6 +3235,7 @@ where
         plan,
         rng,
         Signing::InProcess,
+        replan_threshold,
     )
     .map(|output| (output.state, output.transfer_funding))
 }
@@ -2421,8 +3341,6 @@ where
         prep_tx: &crate::preparation::PrepTransaction,
         layer: usize,
     ) -> Result<Vec<orchard::note::Note>, CommitError<<B as MigrationBackend>::Error>> {
-        use crate::preparation::PrepInput;
-
         let mut spends = Vec::with_capacity(prep_tx.inputs().len());
         for input in prep_tx.inputs() {
             match input {
@@ -2470,9 +3388,6 @@ where
         &mut self,
         plan: &MigrationPlan,
     ) -> Result<(), CommitError<<B as MigrationBackend>::Error>> {
-        use crate::build::build_prep_tx;
-        use crate::preparation::PrepOutput;
-
         for (layer, prep_layer) in plan.preparation().layers().iter().enumerate() {
             let mut this_layer_ids: Vec<MigrationTransferId> = Vec::with_capacity(prep_layer.len());
             for (index, prep_tx) in prep_layer.iter().enumerate() {
@@ -2536,7 +3451,15 @@ where
                     }
                 }
 
-                let (bytes, tx_state) = finish_built_pczt(self.backend, pczt, self.signing)?;
+                // Cache the real-spend nullifiers off the built PCZT before it is consumed by
+                // signing/serialization, so the feature-free state machine never re-parses the
+                // stored bytes.
+                let spend_nullifiers = crate::pczt_spends::real_spend_nullifiers(&pczt)
+                    .map_err(CommitError::RealSpends)?
+                    .into_iter()
+                    .map(|(_, nf)| nf.to_bytes())
+                    .collect();
+                let (bytes, txid, tx_state) = finish_built_pczt(self.backend, pczt, self.signing)?;
                 if matches!(self.signing, Signing::External) {
                     self.unsigned.push(UnsignedMigrationTx {
                         id,
@@ -2552,10 +3475,16 @@ where
                     scheduled_height,
                     expiry_height,
                     anchor_boundary: None,
+                    txid,
                     state: tx_state,
                     // The engine does not yet acquire locks; a later slice that draws a
                     // `LockOwner` for the commit would set this here.
                     lock_owner: None,
+                    // A freshly committed transaction carries no spent-input observation.
+                    unsatisfiable: None,
+                    spend_nullifiers,
+                    // Nor a rejected broadcast: it has not been broadcast at all.
+                    broadcast_failure_at: None,
                 });
             }
             self.layer_ids.push(this_layer_ids);
@@ -2595,8 +3524,6 @@ where
         &mut self,
         plan: &MigrationPlan,
     ) -> Result<(), CommitError<<B as MigrationBackend>::Error>> {
-        use crate::build::build_transfer_pczt;
-
         // Each transfer waits only for the preparation transaction that MINTS ITS OWN funding note
         // to be mined (recorded as that note's producer in `minted`), not for the whole last layer:
         // as soon as a transfer's own funding note is on-chain it may broadcast at its scheduled
@@ -2611,13 +3538,18 @@ where
         // cannot be proved (hence broadcast) before then. A funding note used directly from the
         // wallet has no producer, so that transfer's dependency set is empty.
 
-        // The boundary anchor each transfer will PROVE against is drawn here, at scheduling time,
-        // because the schedule fully determines it: the candidate set lies strictly above the NU6.3
-        // activation, at or after the height the funding notes exist on-chain (the last drawn
+        // A PROVISIONAL boundary anchor is drawn for each transfer here, at scheduling time, from
+        // what the schedule knows: the candidate set lies strictly above the NU6.3 activation, at
+        // or after the height the funding notes are ESTIMATED to exist on-chain (the last drawn
         // preparation height plus the mining margin — the estimate `plan_migration` floored the
         // schedule on), and strictly below the most recent boundary at the transfer's scheduled
-        // broadcast height. The anchor and the funding note's witness are installed against that
-        // boundary through the PCZT Updater role at proving time (ZIP 374); nothing here needs them.
+        // broadcast height. The estimate is not reality: a preparation that out-mines it leaves
+        // this boundary BELOW the funding note's actual creation height, where the note can never
+        // be witnessed — which is why `prove_transfer` re-validates the boundary against the
+        // funding preparation's real mined height at proving time and re-draws it there when the
+        // note postdates it (ZIP 318 anchor selection is a proving-time rule). The anchor and the
+        // funding note's witness are installed against the validated boundary through the PCZT
+        // Updater role at proving time (ZIP 374); nothing here needs them.
         //
         // `plan_migration` floors the first scheduled transfer on this same estimate, so every
         // transfer has a candidate boundary by construction; an empty draw therefore means the plan
@@ -2693,13 +3625,20 @@ where
                 self.rng,
             )
             .ok_or(CommitError::StalePlan)?;
-            let (bytes, tx_state) = finish_built_pczt(self.backend, pczt, self.signing)?;
+            // Cache the real-spend nullifiers off the built PCZT before it is consumed by
+            // signing/serialization, so the feature-free state machine never re-parses the
+            // stored bytes.
+            let spend_nullifiers = crate::pczt_spends::real_spend_nullifiers(&pczt)
+                .map_err(CommitError::RealSpends)?
+                .into_iter()
+                .map(|(_, nf)| nf.to_bytes())
+                .collect();
+            let (bytes, txid, tx_state) = finish_built_pczt(self.backend, pczt, self.signing)?;
             if matches!(self.signing, Signing::External) {
                 self.unsigned.push(UnsignedMigrationTx {
                     id,
                     pczt: bytes.clone(),
-                    actions: crate::denomination::SOURCE_ACTIONS_PER_TRANSFER
-                        + crate::denomination::DESTINATION_ACTIONS_PER_TRANSFER,
+                    actions: CROSSING_SOURCE_ACTIONS + CROSSING_DESTINATION_ACTIONS,
                 });
             }
             self.transactions.push(MigrationTransaction {
@@ -2710,10 +3649,16 @@ where
                 scheduled_height: schedule.broadcast_height(),
                 expiry_height: schedule.expiry_height(),
                 anchor_boundary: Some(anchor_boundary),
+                txid,
                 state: tx_state,
                 // The engine does not yet acquire locks; a later slice that draws a
                 // `LockOwner` for the commit would set this here.
                 lock_owner: None,
+                // A freshly committed transaction carries no spent-input observation.
+                unsatisfiable: None,
+                spend_nullifiers,
+                // Nor a rejected broadcast: it has not been broadcast at all.
+                broadcast_failure_at: None,
             });
             self.transfer_funding.push((id, note));
         }
@@ -2723,7 +3668,7 @@ where
     /// Assemble the committed [`MigrationState`] from the accumulated transactions and return it
     /// with the unsigned PCZTs and each transfer's funding note. Consuming `self` releases the
     /// `&mut backend` reborrow, so the caller can persist the state through the backend afterward.
-    fn into_state(self, plan: &MigrationPlan) -> CommitOutput {
+    fn into_state(self, plan: &MigrationPlan, replan_threshold: ReplanThreshold) -> CommitOutput {
         let state = MigrationState {
             status: MigrationStatus::Committed,
             denominations: plan.denominations().clone(),
@@ -2732,6 +3677,9 @@ where
             // Stamp the grid the transfers were anchored to, so a later reconfiguration of the
             // backend is detectable rather than silently invalidating them.
             anchor_bucket_interval: self.backend.scheduling_params().anchor_bucket_interval(),
+            // Stamp the replan policy in effect at commit, so every consumer of this migration
+            // applies the same threshold.
+            replan_threshold,
         };
         CommitOutput {
             state,
@@ -2758,19 +3706,353 @@ struct CommitOutput {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::{
+        denomination::{DENOM_CAP, MIGRATION_MAX_PREPARED_NOTES_PER_RUN},
+        satisfiability::{InputObservation, UnsatisfiableCause, classify_input_observations},
+        signing_rounds::{SigningRoundBudget, min_signing_rounds},
+        testing::{
+            arb_migration_state, arb_migration_tx_state, assert_empty_is_none,
+            assert_put_get_roundtrip, assert_update_transaction, first_transaction_id,
+        },
+    };
+    use proptest::proptest;
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
-    use zcash_protocol::value::COIN;
+    use zcash_protocol::{local_consensus::LocalNetwork, value::COIN};
 
-    use zcash_protocol::local_consensus::LocalNetwork;
+    /// Every `MigrationStatus` variant's wire name is pinned to its literal string, and
+    /// `TryFrom<&str>` recovers the variant from the name `AsRef<str>` produces for it. Pinning the
+    /// literal (rather than only round-tripping through the enum) is what catches a shared
+    /// writer/reader typo in the two impls, which a round trip generated from the enum itself
+    /// cannot. An unrecognized string is rejected.
+    #[test]
+    fn migration_status_wire_names_are_pinned() {
+        assert_eq!(MigrationStatus::Planning.as_ref(), "planning");
+        assert_eq!(MigrationStatus::Committed.as_ref(), "committed");
+        assert_eq!(MigrationStatus::InProgress.as_ref(), "in_progress");
+        assert_eq!(MigrationStatus::Complete.as_ref(), "complete");
+        assert_eq!(MigrationStatus::Failed.as_ref(), "failed");
+        assert_eq!(MigrationStatus::Superseded.as_ref(), "superseded");
+        assert_eq!(MigrationStatus::Cancelled.as_ref(), "cancelled");
 
-    use crate::preparation::FUNDING_OUTPUTS_PER_TX;
+        for status in MigrationStatus::ALL.iter().copied() {
+            assert_eq!(MigrationStatus::try_from(status.as_ref()), Ok(status));
+        }
+
+        assert!(MigrationStatus::try_from("not_a_status").is_err());
+    }
+
+    /// [`MigrationStatus::ALL`] really lists every variant, in the positions the exhaustive match
+    /// below assigns. This matters beyond tidiness: a store derives the set of terminal statuses by
+    /// filtering `ALL`, so a variant missing from it would be treated as non-terminal by every
+    /// query built that way, however carefully [`MigrationStatus::is_terminal`] was written.
+    ///
+    /// The match is exhaustive, so adding a variant fails to compile here until it is given a
+    /// position, and the assertions then check `ALL` agrees.
+    #[test]
+    fn migration_status_all_lists_every_variant() {
+        fn position(status: MigrationStatus) -> usize {
+            match status {
+                MigrationStatus::Planning => 0,
+                MigrationStatus::Committed => 1,
+                MigrationStatus::InProgress => 2,
+                MigrationStatus::Complete => 3,
+                MigrationStatus::Failed => 4,
+                MigrationStatus::Superseded => 5,
+                MigrationStatus::Cancelled => 6,
+            }
+        }
+        // Every entry sits where the match says it does. A variant omitted from `ALL` shifts each
+        // later entry off its position, so this catches the omission rather than the count alone.
+        for (i, status) in MigrationStatus::ALL.iter().copied().enumerate() {
+            assert_eq!(position(status), i, "{status:?} is out of place in ALL");
+        }
+        // And nothing is missing from the END, where a shift would leave the survivors in place.
+        assert_eq!(
+            MigrationStatus::ALL.len(),
+            position(MigrationStatus::Cancelled) + 1
+        );
+    }
+
+    /// The terminal set is exactly the four finished statuses, and `terminal()` agrees with
+    /// `is_terminal` (it is derived from it, so this pins the DERIVATION, and with it the set a
+    /// store excludes from anchor-checkpoint retention).
+    #[test]
+    fn migration_status_terminal_set_is_the_finished_statuses() {
+        let terminal: Vec<MigrationStatus> = MigrationStatus::terminal().collect();
+        assert_eq!(
+            terminal,
+            vec![
+                MigrationStatus::Complete,
+                MigrationStatus::Failed,
+                MigrationStatus::Superseded,
+                MigrationStatus::Cancelled,
+            ]
+        );
+        for status in MigrationStatus::ALL.iter().copied() {
+            assert_eq!(status.is_terminal(), terminal.contains(&status));
+        }
+    }
+
+    /// Every `UnsatisfiableKind` variant's wire name is pinned to its literal string, and
+    /// `TryFrom<&str>` recovers the variant from the name `AsRef<str>` produces for it — pinning
+    /// the literal is what catches a shared writer/reader typo. A name this build does not know is
+    /// rejected, so a store reports it as corruption rather than reading it as "unmarked".
+    #[test]
+    fn unsatisfiable_kind_wire_names_are_pinned() {
+        assert_eq!(UnsatisfiableKind::InputsSpent.as_ref(), "inputs_spent");
+        assert_eq!(
+            UnsatisfiableKind::InputsInvalidated.as_ref(),
+            "inputs_invalidated"
+        );
+        assert_eq!(
+            UnsatisfiableKind::AnchorInvalidated.as_ref(),
+            "anchor_invalidated"
+        );
+        assert_eq!(UnsatisfiableKind::Inherited.as_ref(), "inherited");
+
+        for kind in [
+            UnsatisfiableKind::InputsSpent,
+            UnsatisfiableKind::InputsInvalidated,
+            UnsatisfiableKind::AnchorInvalidated,
+            UnsatisfiableKind::Inherited,
+        ] {
+            assert_eq!(UnsatisfiableKind::try_from(kind.as_ref()), Ok(kind));
+        }
+
+        assert!(UnsatisfiableKind::try_from("not_a_kind").is_err());
+    }
+
+    /// Each cause maps to the kind a mark records for it, and `marks` agrees with `kind` by
+    /// construction: the drive loop's termination rests on the mark decision being made once, and
+    /// a cause that reports a kind but no mark (or the reverse) would break it. `Inherited` is
+    /// never a cause's kind — it names a mark the dependency closure applied, not one observed.
+    #[test]
+    fn unsatisfiable_cause_kind_agrees_with_marks() {
+        let cases = [
+            (
+                UnsatisfiableCause::InputsSpent {
+                    nullifiers: vec![[1; 32]],
+                },
+                Some(UnsatisfiableKind::InputsSpent),
+            ),
+            (
+                UnsatisfiableCause::InputsInvalidated { anchor: [2; 32] },
+                Some(UnsatisfiableKind::InputsInvalidated),
+            ),
+            (
+                UnsatisfiableCause::AnchorInvalidated,
+                Some(UnsatisfiableKind::AnchorInvalidated),
+            ),
+            (UnsatisfiableCause::Expired, None),
+        ];
+        for (cause, kind) in cases {
+            assert_eq!(cause.kind(), kind, "{cause:?}");
+            assert_eq!(
+                cause.marks(),
+                kind.is_some(),
+                "{cause:?}: marking and the recorded kind must agree"
+            );
+            assert_ne!(
+                cause.kind(),
+                Some(UnsatisfiableKind::Inherited),
+                "{cause:?}: Inherited names a closure-applied mark, never an observed cause"
+            );
+        }
+    }
+
+    /// A `Mined` state's txid round-trips through `from_stored` alongside its height, and a stored
+    /// `mined` row missing the txid payload is rejected rather than silently reconstructed
+    /// without it.
+    #[test]
+    fn mined_state_round_trips_with_txid() {
+        let txid = TxId::from_bytes([7; 32]);
+        let s = MigrationTxState::Mined {
+            txid,
+            height: BlockHeight::from_u32(10),
+        };
+        assert_eq!(s.as_ref(), "mined");
+        assert_eq!(
+            MigrationTxState::from_stored("mined", s.broadcast_txid(), s.mined_height()),
+            Ok(s)
+        );
+        // A mined row missing its txid does not reconstruct.
+        assert!(
+            MigrationTxState::from_stored("mined", None, Some(BlockHeight::from_u32(10))).is_err()
+        );
+    }
+
+    /// A `SeenSpent` observation dominates every other answer, including the other PERMANENT
+    /// input-level death: a recognized spend is the definitive on-chain fact, so it is the cause
+    /// reported even when a dead anchor is also observed (and even when the transaction has
+    /// expired besides).
+    #[test]
+    fn classify_seen_spent_dominates_invalidated() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            true,
+            &[
+                ([1; 32], InputObservation::Invalidated([9; 32])),
+                ([2; 32], InputObservation::SeenSpent),
+            ],
+        );
+        assert_eq!(
+            got,
+            StepSatisfiability::Unsatisfiable {
+                cause: UnsatisfiableCause::InputsSpent {
+                    nullifiers: vec![[2; 32]]
+                },
+                as_of_height,
+            }
+        );
+    }
+
+    /// An `Invalidated` observation dominates expiry: a rebuild (expiry's remedy) cannot cure
+    /// inputs that will never exist on chain, so the input-level cause is the one reported.
+    #[test]
+    fn classify_invalidated_dominates_expired() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            true,
+            &[
+                ([1; 32], InputObservation::Unknown),
+                ([2; 32], InputObservation::Invalidated([9; 32])),
+            ],
+        );
+        assert_eq!(
+            got,
+            StepSatisfiability::Unsatisfiable {
+                cause: UnsatisfiableCause::InputsInvalidated { anchor: [9; 32] },
+                as_of_height,
+            }
+        );
+    }
+
+    /// Expiry dominates an `Unknown` observation: a definite permanent obstruction outranks
+    /// "retry after further sync".
+    #[test]
+    fn classify_expired_dominates_unknown() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            true,
+            &[
+                ([1; 32], InputObservation::Unknown),
+                ([2; 32], InputObservation::Unspent),
+            ],
+        );
+        assert_eq!(
+            got,
+            StepSatisfiability::Unsatisfiable {
+                cause: UnsatisfiableCause::Expired,
+                as_of_height,
+            }
+        );
+    }
+
+    /// An `Unknown` observation dominates all-`Unspent`: until every input's note is known
+    /// unspent, the answer is "not yet", never "satisfiable".
+    #[test]
+    fn classify_unknown_dominates_unspent() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            false,
+            &[
+                ([1; 32], InputObservation::Unspent),
+                ([2; 32], InputObservation::Unknown),
+            ],
+        );
+        assert_eq!(got, StepSatisfiability::NotYetSatisfiable { as_of_height });
+    }
+
+    /// All inputs known unspent and the transaction unexpired: satisfiable, at the observation
+    /// height.
+    #[test]
+    fn classify_all_unspent_is_satisfiable() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            false,
+            &[
+                ([1; 32], InputObservation::Unspent),
+                ([2; 32], InputObservation::Unspent),
+            ],
+        );
+        assert_eq!(got, StepSatisfiability::Satisfiable { as_of_height });
+    }
+
+    /// A mixed observation set collects ALL seen-spent nullifiers, in the cache's order, not just
+    /// the first: the caller reports the complete set of dead inputs.
+    #[test]
+    fn classify_collects_every_spent_nullifier() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            false,
+            &[
+                ([1; 32], InputObservation::SeenSpent),
+                ([2; 32], InputObservation::Unspent),
+                ([3; 32], InputObservation::SeenSpent),
+            ],
+        );
+        assert_eq!(
+            got,
+            StepSatisfiability::Unsatisfiable {
+                cause: UnsatisfiableCause::InputsSpent {
+                    nullifiers: vec![[1; 32], [3; 32]]
+                },
+                as_of_height,
+            }
+        );
+    }
+
+    /// All four observation kinds at once, expired besides: `InputsSpent` still wins, pinning
+    /// every precedence comparison against the top of the order in a single case (the pairwise
+    /// tests above each pin one adjacent edge).
+    #[test]
+    fn classify_omnibus_seen_spent_tops_everything() {
+        let as_of_height = BlockHeight::from_u32(100);
+        let got = classify_input_observations(
+            as_of_height,
+            true,
+            &[
+                ([1; 32], InputObservation::Unspent),
+                ([2; 32], InputObservation::SeenSpent),
+                ([3; 32], InputObservation::Invalidated([9; 32])),
+                ([4; 32], InputObservation::Unknown),
+            ],
+        );
+        assert_eq!(
+            got,
+            StepSatisfiability::Unsatisfiable {
+                cause: UnsatisfiableCause::InputsSpent {
+                    nullifiers: vec![[2; 32]]
+                },
+                as_of_height,
+            }
+        );
+    }
+
+    /// The fold is TOTAL: empty observations and no expiry classify as satisfiable. Guarding
+    /// against an empty nullifier cache (which is corruption on a non-mined transaction, never
+    /// vacuous satisfiability) is the CALLER's obligation, per the function's contract.
+    #[test]
+    fn classify_empty_observations_unexpired_is_satisfiable() {
+        let as_of_height = BlockHeight::from_u32(100);
+        assert_eq!(
+            classify_input_observations(as_of_height, false, &[]),
+            StepSatisfiability::Satisfiable { as_of_height }
+        );
+    }
 
     /// A local network with NU6.3 active at a low height, matching the build test network, so the
     /// canonical fees and activation checks compute in planning tests.
-    fn test_net() -> LocalNetwork {
+    pub(crate) fn test_net() -> LocalNetwork {
         LocalNetwork {
             overwinter: Some(BlockHeight::from_u32(1)),
             sapling: Some(BlockHeight::from_u32(2)),
@@ -2787,20 +4069,8 @@ mod tests {
         }
     }
 
-    /// The canonical fees on the test network, computed exactly as `plan_migration` computes them.
-    fn test_fees() -> (Zatoshis, Zatoshis) {
-        canonical_fees(&test_net(), BlockHeight::from_u32(2_000_000))
-            .expect("the canonical fees compute")
-    }
-
-    /// A count-only preparation-layout stub for tests that exercise the split in isolation: one
-    /// padded transaction per [`FUNDING_OUTPUTS_PER_TX`] funding notes.
-    fn prep_tx_count_stub(notes: &[Zatoshis]) -> Option<usize> {
-        Some(notes.len().div_ceil(FUNDING_OUTPUTS_PER_TX))
-    }
-
     /// A minimal in-memory backend: a fixed set of note values and a chain tip.
-    struct MockBackend {
+    pub(crate) struct MockBackend {
         notes: Vec<Zatoshis>,
         tip: BlockHeight,
         stored: Option<MigrationState>,
@@ -2808,7 +4078,7 @@ mod tests {
     }
 
     impl MockBackend {
-        fn new(notes: Vec<u64>, tip: u32) -> Self {
+        pub(crate) fn new(notes: Vec<u64>, tip: u32) -> Self {
             MockBackend {
                 notes: notes
                     .into_iter()
@@ -2841,7 +4111,26 @@ mod tests {
         type Error = core::convert::Infallible;
 
         fn get_migration(&self) -> Result<Option<MigrationState>, Self::Error> {
-            Ok(self.stored.clone())
+            // Pending-only, per the trait contract: a terminal state is history.
+            Ok(self.stored.clone().filter(|s| !s.is_terminal()))
+        }
+
+        fn check_step_satisfiability(
+            &self,
+            _tx: &MigrationTransaction,
+            _settle: ReorgSettleDepth,
+        ) -> Result<StepSatisfiability, Self::Error> {
+            // This mock models a wallet whose environment never obstructs a step; tests that
+            // exercise the oracle configure the `zcash_pool_migration_memory` mocks instead.
+            Ok(StepSatisfiability::Satisfiable {
+                as_of_height: self.tip,
+            })
+        }
+
+        /// This mock models a wallet whose scan has seen nothing mine; the drive loop's promotion
+        /// is exercised against the `satisfiability` module's own store.
+        fn mined_height(&self, _txid: TxId) -> Result<Option<BlockHeight>, Self::Error> {
+            Ok(None)
         }
     }
 
@@ -2862,6 +4151,16 @@ mod tests {
                 tx.state = state;
             }
             Ok(())
+        }
+
+        /// The contract's no-wallet-tables form: apply the proof and persist the state alone.
+        fn store_proved_transaction(
+            &mut self,
+            state: &mut MigrationState,
+            proven: ProvedTransaction,
+        ) -> Result<(), Self::Error> {
+            proven.apply(state);
+            self.replace_migration(state)
         }
     }
 
@@ -2956,6 +4255,24 @@ mod tests {
         ));
     }
 
+    /// A split the wallet cannot fund is DEFERRAL, not completion: the balance clears the smallest
+    /// self-funding note plus its fee reserve, so it quantizes to a nonempty canonical split, but
+    /// consolidating the wallet's dust costs more in preparation fees than the balance can cover —
+    /// 120 notes of 10,000 zatoshi need at least eight consolidation transactions (15 inputs each)
+    /// whose fees alone exceed half the balance, so no preparation can mint even the split's only
+    /// part. The plan reports [`MigrationError::UnfundableSplit`] so an application can
+    /// distinguish "deferred until the spendable balance changes" from
+    /// [`MigrationError::NothingToMigrate`]'s "only residual value remains".
+    #[test]
+    fn a_split_the_wallet_cannot_fund_defers_rather_than_completes() {
+        let backend = MockBackend::new(vec![10_000; 120], 2_000_000);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        assert!(matches!(
+            plan_migration(&test_net(), &backend, &mut rng),
+            Err(MigrationError::UnfundableSplit)
+        ));
+    }
+
     /// A typical balance migrates in a single run, whose entry carries BOTH the denomination side
     /// (migratable value and crossing count) and the note-preparation side (layers and transactions),
     /// and the aggregates match the single run.
@@ -2998,7 +4315,6 @@ mod tests {
     /// cap of 50 * 10,000 ZEC in 50 notes, and the aggregate crossings sum the per-run counts.
     #[test]
     fn whale_migrates_over_several_runs() {
-        use crate::denomination::{DENOM_CAP, MIGRATION_MAX_PREPARED_NOTES_PER_RUN};
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let whale = MockBackend::new(vec![1_200_000 * COIN], 2_000_000);
         let est = estimate_migration_runs(&test_net(), &whale, &mut rng)
@@ -3019,9 +4335,11 @@ mod tests {
         assert_eq!(est.total_crossings(), summed);
     }
 
-    /// The estimate depends on the wallet's NOTE STRUCTURE, not just its total value: the same balance
-    /// held as one note versus as many small notes migrates the same value in one run, but the
-    /// fragmented wallet costs strictly more note-preparation work (consolidation).
+    /// The estimate depends on the wallet's NOTE STRUCTURE, not just its total value: the same
+    /// balance held as one note versus as many small notes costs strictly more note-preparation
+    /// work when fragmented (consolidation), and may take more runs — the canonical split reserves
+    /// preparation fees optimistically, and a wallet whose real preparation costs more pays for it
+    /// by deferring the smallest parts to a later run rather than by publishing a different split.
     #[test]
     fn estimate_depends_on_wallet_note_structure() {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
@@ -3033,7 +4351,11 @@ mod tests {
             estimate_migration_runs(&test_net(), &fragmented, &mut rng).expect("estimates");
 
         assert_eq!(est_one.run_count(), 1);
-        assert_eq!(est_frag.run_count(), 1);
+        // The fragmented wallet's true consolidation fees exceed the optimistic reserve, so the
+        // split's smallest parts defer to a second run (the estimate is deterministic: seeded RNG,
+        // fixed wallet). A planner change that moves this is a behavior change to re-derive, not
+        // noise to tolerate.
+        assert_eq!(est_frag.run_count(), 2);
         assert!(
             est_frag.total_prep_transactions() > est_one.total_prep_transactions(),
             "a fragmented wallet needs more preparation: {} vs {}",
@@ -3048,9 +4370,6 @@ mod tests {
     /// match the optimal packer. Rounds are summed per run (they cannot span runs).
     #[test]
     fn signing_rounds_follow_the_signer_budget() {
-        use crate::signing_rounds::{SigningRoundBudget, min_signing_rounds};
-        use core::num::NonZeroU32;
-
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         // A whale, so there are several runs, each with several transactions.
         let whale = MockBackend::new(vec![1_200_000 * COIN], 2_000_000);
@@ -3087,84 +4406,53 @@ mod tests {
         }
     }
 
+    /// The in-crate mock store answers the same three questions every store is held to: an empty
+    /// store reports nothing, a written migration reads back unchanged, and a transaction-state
+    /// update persists.
+    ///
+    /// Drawn from [`arb_migration_state`] and asserted through the shared conformance suite rather
+    /// than written out by hand: no particular field value is what makes any of these true, so
+    /// pinning one only narrows what the round-trip is exercised over — and a hand-written fixture
+    /// silently stops covering fields the persisted types later grow.
     #[test]
     fn stores_loads_and_updates_a_migration() {
-        let mut backend = MockBackend::new(Vec::new(), 0);
-        assert!(backend.get_migration().unwrap().is_none());
-
-        let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let (prep_tx_fee, transfer_buffer) = test_fees();
-        let denominations = crate::denomination::plan_denominations(
-            Zatoshis::from_u64(100 * COIN).expect("test balance is valid"),
-            transfer_buffer,
-            prep_tx_fee,
-            &prep_tx_count_stub,
-            &mut rng,
-        );
-        let tx = MigrationTransaction {
-            id: MigrationTransferId(0),
-            kind: MigrationTxKind::Transfer { crossing: 0 },
-            pczt: vec![1, 2, 3], // a stand-in for the serialized pre-signed PCZT
-            depends_on: Vec::new(),
-            scheduled_height: BlockHeight::from_u32(2_000_100),
-            expiry_height: BlockHeight::from_u32(2_069_220),
-            anchor_boundary: None,
-            state: MigrationTxState::Signed,
-            lock_owner: None,
-        };
-        let state = MigrationState {
-            status: MigrationStatus::Committed,
-            denominations,
-            preparation: crate::preparation::PreparationPlan::from_parts(Vec::new(), Vec::new()),
-            transactions: vec![tx],
-            anchor_bucket_interval: crate::scheduling::AnchorBucketInterval::ZIP_318,
-        };
-        backend.replace_migration(&state).unwrap();
-
-        // The stored transactions round-trip, and a state update persists.
-        let loaded = backend
-            .get_migration()
-            .unwrap()
-            .expect("a migration is stored");
-        assert_eq!(loaded.status, MigrationStatus::Committed);
-        assert_eq!(loaded.transactions, state.transactions);
-
-        backend
-            .update_transaction(
-                MigrationTransferId(0),
-                MigrationTxState::Mined {
-                    height: BlockHeight::from_u32(2_000_105),
-                },
-            )
-            .unwrap();
-        let loaded = backend.get_migration().unwrap().unwrap();
-        assert_eq!(
-            loaded.transactions[0].state,
-            MigrationTxState::Mined {
-                height: BlockHeight::from_u32(2_000_105)
+        proptest!(|(
+            state in arb_migration_state(),
+            new_state in arb_migration_tx_state(),
+        )| {
+            let mut backend = MockBackend::new(Vec::new(), 0);
+            assert_empty_is_none(&backend);
+            assert_put_get_roundtrip(&mut backend, &state);
+            if let Some(id) = first_transaction_id(&state) {
+                assert_update_transaction(&mut backend, &state, id, new_state);
             }
-        );
+        });
     }
 }
 
 #[cfg(all(test, feature = "orchard"))]
 mod commit_tests {
     use super::*;
+    use crate::{
+        build::{
+            sign_pczt,
+            test_util::{
+                TARGET_HEIGHT, account_derivation, assert_every_spend_is_identifiable,
+                regtest_network, single_note_witness, spend_signability, spending_key,
+            },
+        },
+        denomination::DenominationPlan,
+        preparation::{PREP_TX_ACTIONS, plan_preparation},
+        scheduling::{AnchorBucketInterval, SchedulingParams},
+    };
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
-    use zcash_protocol::value::COIN;
+    use zcash_protocol::{
+        consensus::{NetworkUpgrade, Parameters as _},
+        value::COIN,
+    };
 
     use orchard::keys::{FullViewingKey, SpendAuthorizingKey};
-
-    use crate::build::sign_pczt;
-    use crate::build::test_util::{
-        TARGET_HEIGHT, account_derivation, assert_every_spend_is_identifiable, regtest_network,
-        single_note_witness, spend_signability, spending_key,
-    };
-    use crate::denomination::{
-        DESTINATION_ACTIONS_PER_TRANSFER, DenominationPlan, SOURCE_ACTIONS_PER_TRANSFER,
-    };
-    use crate::preparation::{PREP_TX_ACTIONS, plan_preparation};
 
     /// The canonical fees on the regtest network at the build height, computed exactly as
     /// `plan_migration` computes them.
@@ -3189,6 +4477,9 @@ mod commit_tests {
         stored: Option<MigrationState>,
         tip: BlockHeight,
         sched_params: crate::scheduling::SchedulingParams,
+        /// Every anchor boundary handed to [`MigrationProver::prove_transfer`], in call order —
+        /// what the proving-time re-draw tests assert against.
+        prove_anchors: Vec<BlockHeight>,
     }
 
     impl CommitMock {
@@ -3209,6 +4500,7 @@ mod commit_tests {
                 stored: None,
                 tip: BlockHeight::from_u32(2_000_000),
                 sched_params: crate::scheduling::SchedulingParams::ZIP_318,
+                prove_anchors: Vec::new(),
             }
         }
     }
@@ -3237,7 +4529,26 @@ mod commit_tests {
         type Error = core::convert::Infallible;
 
         fn get_migration(&self) -> Result<Option<MigrationState>, Self::Error> {
-            Ok(self.stored.clone())
+            // Pending-only, per the trait contract: a terminal state is history.
+            Ok(self.stored.clone().filter(|s| !s.is_terminal()))
+        }
+
+        fn check_step_satisfiability(
+            &self,
+            _tx: &MigrationTransaction,
+            _settle: ReorgSettleDepth,
+        ) -> Result<StepSatisfiability, Self::Error> {
+            // This mock models a wallet whose environment never obstructs a step; tests that
+            // exercise the oracle configure the `zcash_pool_migration_memory` mocks instead.
+            Ok(StepSatisfiability::Satisfiable {
+                as_of_height: self.tip,
+            })
+        }
+
+        /// This mock models a wallet whose scan has seen nothing mine; the drive loop's promotion
+        /// is exercised against the `satisfiability` module's own store.
+        fn mined_height(&self, _txid: TxId) -> Result<Option<BlockHeight>, Self::Error> {
+            Ok(None)
         }
     }
 
@@ -3258,6 +4569,16 @@ mod commit_tests {
                 tx.state = state;
             }
             Ok(())
+        }
+
+        /// The contract's no-wallet-tables form: apply the proof and persist the state alone.
+        fn store_proved_transaction(
+            &mut self,
+            state: &mut MigrationState,
+            proven: ProvedTransaction,
+        ) -> Result<(), Self::Error> {
+            proven.apply(state);
+            self.replace_migration(state)
         }
     }
 
@@ -3281,22 +4602,51 @@ mod commit_tests {
         }
     }
 
+    /// Install a stand-in witness on every still-deferred spend of `pczt`, mimicking the one
+    /// structural effect of real proving the engine itself can observe: a PROVEN PCZT carries no
+    /// unwitnessed spends, so the deferred-witness rule no longer identifies its real spends.
+    /// The path is arbitrary (a single-leaf tree), exactly like the builder's dummy witnesses;
+    /// anchors and proofs need the commitment tree the mock does not model, and nothing in the
+    /// engine inspects them.
+    fn install_stand_in_witnesses(pczt: pczt::Pczt) -> pczt::Pczt {
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::tree::{MerkleHashOrchard, MerklePath};
+
+        let witnesses: Vec<(usize, MerklePath)> = crate::pczt_spends::real_spend_nullifiers(&pczt)
+            .expect("an unproven migration PCZT has real spends")
+            .into_iter()
+            .map(|(index, _)| {
+                let auth_path = core::array::from_fn(|level| {
+                    MerkleHashOrchard::empty_root(Level::from(level as u8))
+                });
+                (index, MerklePath::from_parts(0, auth_path))
+            })
+            .collect();
+        pczt::roles::updater::Updater::new(pczt)
+            .set_orchard_spend_witnesses(witnesses)
+            .expect("the stand-in witnesses install on the deferred spends")
+            .finish()
+    }
+
     impl MigrationProver for CommitMock {
         type Error = core::convert::Infallible;
 
         fn prove_transfer(
             &mut self,
             pczt: pczt::Pczt,
-            _anchor_boundary: BlockHeight,
-        ) -> Result<pczt::Pczt, Self::Error> {
+            anchor_boundary: BlockHeight,
+        ) -> Result<pczt::Pczt, ProveFailure<Self::Error>> {
+            self.prove_anchors.push(anchor_boundary);
             // A stand-in for proving. A real prover resolves the funding note's witness against
-            // `anchor_boundary`, installs the Orchard source and Ironwood destination anchors
-            // through the PCZT `Updater` role, and runs the Orchard + Ironwood provers. Resolving
-            // the funding note requires commitment-tree access this mock does not model, so it
-            // returns the PCZT unchanged; the engine's `prove_transfer` orchestration (reading and
-            // passing the persisted `anchor_boundary`, and the Signed -> Proved transition) is what
-            // the tests exercise.
-            Ok(pczt)
+            // `anchor_boundary`, installs it and the Orchard source and Ironwood destination
+            // anchors through the PCZT `Updater` role, and runs the Orchard + Ironwood provers.
+            // Resolving the real witness requires commitment-tree access this mock does not
+            // model, so it installs only a stand-in witness on each deferred spend
+            // ([`install_stand_in_witnesses`]) — enough that the stored proven bytes, like real
+            // proven bytes, no longer identify their real spends by deferred witness. The
+            // engine's `prove_transfer` orchestration (reading and passing the persisted
+            // `anchor_boundary`, and the Signed -> Proved transition) is what the tests exercise.
+            Ok(install_stand_in_witnesses(pczt))
         }
 
         fn anchor_bucket_interval(&self) -> crate::scheduling::AnchorBucketInterval {
@@ -3307,12 +4657,24 @@ mod commit_tests {
             &mut self,
             pczt: pczt::Pczt,
             _anchor: BlockHeight,
-        ) -> Result<pczt::Pczt, Self::Error> {
+        ) -> Result<pczt::Pczt, ProveFailure<Self::Error>> {
             // A stand-in for proving, as `prove_transfer` above: a real prover installs the Orchard
             // anchor and every spend's witness and runs the Orchard prover (see
-            // `WalletMigrationProver`). This mock models no commitment tree, so it returns the PCZT
-            // unchanged; the engine's `prove_preparation` orchestration is what the tests exercise.
-            Ok(pczt)
+            // `WalletMigrationProver`). This mock models no commitment tree, so it installs only
+            // the stand-in witnesses; the engine's `prove_preparation` orchestration is what the
+            // tests exercise.
+            Ok(install_stand_in_witnesses(pczt))
+        }
+
+        /// This mock models no note-lock state, so it reserves nothing and reports no owner; a
+        /// transaction it proves therefore carries `lock_owner == None`. The prove-step tests
+        /// below exercise the engine's orchestration, not the reservation.
+        fn lock_spent_notes(
+            &mut self,
+            _pczt: &pczt::Pczt,
+            _lock_expiry_height: BlockHeight,
+        ) -> Result<Option<MigrationLockOwner>, Self::Error> {
+            Ok(None)
         }
     }
 
@@ -3347,6 +4709,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
         assert_eq!(state.status, MigrationStatus::Committed);
@@ -3417,6 +4780,31 @@ mod commit_tests {
                 }
             }
         }
+
+        // Every committed transaction caches its real-spend nullifiers, matching the
+        // deferred-witness identification the prover uses (ZIP 374: dummies carry witnesses).
+        for tx in &state.transactions {
+            let parsed = pczt::Pczt::parse(&tx.pczt).expect("stored PCZT parses");
+            let expected: Vec<[u8; 32]> = crate::pczt_spends::real_spend_nullifiers(&parsed)
+                .expect("a committed transaction's stored PCZT has real spends")
+                .into_iter()
+                .map(|(_, nf)| nf.to_bytes())
+                .collect();
+            assert_eq!(tx.spend_nullifiers, expected);
+            // The cache is non-empty by an independent count: a transfer spends exactly its one
+            // funding note, and a preparation transaction spends at least one note.
+            match tx.kind {
+                MigrationTxKind::Transfer { .. } => assert_eq!(
+                    tx.spend_nullifiers.len(),
+                    1,
+                    "a transfer's one real spend is its funding note"
+                ),
+                MigrationTxKind::Preparation { .. } => assert!(
+                    !tx.spend_nullifiers.is_empty(),
+                    "a preparation transaction has at least one real spend"
+                ),
+            }
+        }
         assert!(backend.get_migration().unwrap().is_some());
     }
 
@@ -3450,6 +4838,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration for external signing");
         assert!(
@@ -3477,6 +4866,7 @@ mod commit_tests {
             &mut anonymous,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration for external signing");
         let unidentifiable = anonymous_state
@@ -3497,14 +4887,16 @@ mod commit_tests {
     /// canonical expiry and re-signed against the same funding note, its denomination unchanged, and
     /// moved back to `Signed` ready to prove and broadcast on the new schedule (ZIP 318 error
     /// handling). A wallet holding exactly one funding note funds the transfer DIRECTLY (no
-    /// preparation), so the note stays spendable for the rebuild to re-resolve by value.
+    /// preparation), so the note stays spendable for the rebuild to re-resolve by value. The extra
+    /// fee-sized note covers the quantizer's optimistic preparation reserve, so the funding note
+    /// itself stays an exact match; the reserve is released as change once no preparation runs.
     #[test]
     fn rebuild_expired_transfer_reschedules_and_resigns_in_place() {
         let seed = 99u64;
         let params = regtest_network(true);
         let buffer = u64::from(commit_test_fees().1);
         let funding_note = COIN + buffer; // one 1-ZEC crossing plus its fee buffer
-        let mut backend = CommitMock::new(seed, &[funding_note]);
+        let mut backend = CommitMock::new(seed, &[funding_note, u64::from(prep_fee())]);
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
@@ -3527,6 +4919,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
         assert_eq!(state.transactions.len(), 1);
@@ -3542,7 +4935,9 @@ mod commit_tests {
         backend.tip = old.expiry_height + 1;
         let target = backend.chain_tip_height().unwrap() + 1;
         assert!(
-            state.expired_transactions(target).contains(&id),
+            state
+                .expired_transactions(DuenessTargets::at(target))
+                .contains(&id),
             "the transfer has expired at the new tip"
         );
 
@@ -3567,6 +4962,13 @@ mod commit_tests {
             "a fresh, later canonical expiry"
         );
         assert_ne!(new.pczt, old.pczt, "a freshly built and re-signed PCZT");
+        // The refreshed nullifier cache equals the expired transaction's: rebuilding re-funds the
+        // transfer with the same note IDENTITY, and a note's nullifier is schedule-independent.
+        assert!(!new.spend_nullifiers.is_empty());
+        assert_eq!(
+            new.spend_nullifiers, old.spend_nullifiers,
+            "the same funding note yields the same real-spend nullifier"
+        );
         // The fresh anchor boundary is on the grid and within the rebuilt schedule's candidate set.
         let boundary = u32::from(
             new.anchor_boundary
@@ -3586,7 +4988,90 @@ mod commit_tests {
         );
 
         // It is no longer expired at the tip it was rebuilt against.
-        assert!(!state.expired_transactions(target).contains(&id));
+        assert!(
+            !state
+                .expired_transactions(DuenessTargets::at(target))
+                .contains(&id)
+        );
+    }
+
+    /// A transfer that was PROVED before it expired is still rebuildable. Proving replaces the
+    /// stored bytes with the proven PCZT, whose real spend carries an installed witness, so the
+    /// deferred-witness rule no longer identifies the funding note there — the rebuild must read
+    /// the persisted nullifier cache instead. This is exactly the resumed-wallet scenario in
+    /// which broadcast windows lapse after proving; were the rebuild to fail here, `next_step`
+    /// would keep surfacing the same `Rebuild` for a permanently failing call (a livelock).
+    #[test]
+    fn rebuild_reads_the_nullifier_cache_for_a_proved_transfer() {
+        let seed = 101u64;
+        let params = regtest_network(true);
+        let buffer = u64::from(commit_test_fees().1);
+        let mut backend = CommitMock::new(seed, &[COIN + buffer, u64::from(prep_fee())]);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let mut state = commit_preparation(
+            &params,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut backend,
+            &plan,
+            &mut rng,
+            ReplanThreshold::DEFAULT,
+        )
+        .expect("commits the migration");
+        assert_eq!(state.transactions.len(), 1, "one directly funded transfer");
+        let id = state.transactions[0].id;
+
+        // Prove the transfer and discharge the proof through the store, as a consumer does: the
+        // PROVEN bytes replace the stored ones, and their real spend now carries a witness, so it
+        // is no longer identifiable from the bytes.
+        match prove_transfer(
+            &params,
+            &mut backend,
+            &mut state,
+            id,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut rng,
+        )
+        .expect("proves the transfer")
+        {
+            ProveOutcome::Proved(proven) => backend
+                .store_proved_transaction(&mut state, proven)
+                .expect("stores the proof"),
+            other => panic!("expected a proof, got {other:?}"),
+        }
+        let old = state.transactions[0].clone();
+        assert!(matches!(old.state, MigrationTxState::Proved));
+        let proven = pczt::Pczt::parse(&old.pczt).expect("the proven PCZT parses");
+        assert!(
+            matches!(
+                crate::pczt_spends::real_spend_nullifiers(&proven),
+                Err(crate::pczt_spends::RealSpendError::NoRealSpends)
+            ),
+            "a proven PCZT's real spends are not identifiable by deferred witness"
+        );
+
+        // The proof went unused: the broadcast window lapsed and the transfer expired.
+        backend.tip = old.expiry_height + 1;
+        let target = backend.chain_tip_height().unwrap() + 1;
+        assert!(
+            state
+                .expired_transactions(DuenessTargets::at(target))
+                .contains(&id)
+        );
+
+        // The rebuild recovers the funding note from the persisted nullifier cache.
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 2);
+        rebuild_expired_transfer(&params, &backend, &mut state, id, &mut rng)
+            .expect("rebuilds the expired proved transfer");
+        let new = &state.transactions[0];
+        assert_eq!(new.state, MigrationTxState::Signed);
+        assert!(!new.spend_nullifiers.is_empty());
+        assert_eq!(
+            new.spend_nullifiers, old.spend_nullifiers,
+            "the rebuilt transfer spends the same funding note"
+        );
     }
 
     /// The nullifier of the one real spend (the action with no witness; ZIP 374 deferral leaves
@@ -3613,9 +5098,12 @@ mod commit_tests {
         let seed = 103u64;
         let params = regtest_network(true);
         let buffer = u64::from(commit_test_fees().1);
-        let funding_note = COIN + buffer;
-        // TWO identical-denomination funding notes: two transfers of the same funding value.
-        let mut backend = CommitMock::new(seed, &[funding_note, funding_note]);
+        // TWO identical-denomination funding notes: two transfers of the same funding value. The
+        // canonical split emits equal parts only where the digit expansion repeats a denomination,
+        // so a 4 ZEC balance (`2 + 2`) is the smallest whole-ZEC shape with two equal crossings.
+        let funding_note = 2 * COIN + buffer;
+        let mut backend =
+            CommitMock::new(seed, &[funding_note, funding_note, u64::from(prep_fee())]);
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
@@ -3626,6 +5114,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
         // Direct funding: two transfers, no preparation transactions.
@@ -3671,7 +5160,7 @@ mod commit_tests {
         let params = regtest_network(true);
         let buffer = u64::from(commit_test_fees().1);
         let funding_note = COIN + buffer;
-        let mut backend = CommitMock::new(seed, &[funding_note]);
+        let mut backend = CommitMock::new(seed, &[funding_note, u64::from(prep_fee())]);
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
@@ -3682,6 +5171,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
         let tx = state.transactions[0].clone();
@@ -3712,7 +5202,7 @@ mod commit_tests {
         let params = regtest_network(true);
         let buffer = u64::from(commit_test_fees().1);
         let funding_note = COIN + buffer;
-        let mut backend = CommitMock::new(seed, &[funding_note]);
+        let mut backend = CommitMock::new(seed, &[funding_note, u64::from(prep_fee())]);
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
@@ -3723,6 +5213,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("builds the migration unsigned");
         // Sign out of band and apply, exactly as the external-signing caller does.
@@ -3753,7 +5244,7 @@ mod commit_tests {
         assert_eq!(*unsigned_rebuild.pczt(), rebuilt.pczt);
         assert_eq!(
             unsigned_rebuild.actions(),
-            SOURCE_ACTIONS_PER_TRANSFER + DESTINATION_ACTIONS_PER_TRANSFER
+            CROSSING_SOURCE_ACTIONS + CROSSING_DESTINATION_ACTIONS
         );
         let parsed = pczt::Pczt::parse(&rebuilt.pczt).expect("the rebuilt PCZT parses");
         assert_eq!(
@@ -3798,7 +5289,7 @@ mod commit_tests {
         let seed = 101u64;
         let params = regtest_network(true);
         let buffer = u64::from(commit_test_fees().1);
-        let mut backend = CommitMock::new(seed, &[COIN + buffer]);
+        let mut backend = CommitMock::new(seed, &[COIN + buffer, u64::from(prep_fee())]);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
         let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
@@ -3808,6 +5299,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
         let id = state.transactions[0].id;
@@ -3833,6 +5325,92 @@ mod commit_tests {
         assert!(matches!(
             rebuild_expired_transfer(&params, &backend, &mut state, id, &mut rng),
             Err(RebuildError::NotATransfer(rejected)) if rejected == id
+        ));
+    }
+
+    /// A transfer whose inputs can never again all exist unspent is beyond rebuilding, and is
+    /// refused SPECIFICALLY: the rebuild re-spends the same funding note, so a fresh anchor and
+    /// expiry cure nothing, and the caller must re-plan instead. The guard runs ahead of the
+    /// expiry check, so a marked transfer reports `Unsatisfiable` whether or not it has expired —
+    /// a dead transfer is usually an expired one too, and `NotExpired` would send the caller down
+    /// a remedy that cannot work. A marked DEPENDENCY disqualifies an unmarked transfer the same
+    /// way: the rebuild would re-anchor to inputs that never arrive.
+    #[test]
+    fn rebuild_rejects_an_unsatisfiable_transfer_or_dependency() {
+        let seed = 109u64;
+        let params = regtest_network(true);
+        let buffer = u64::from(commit_test_fees().1);
+        let mut backend = CommitMock::new(seed, &[COIN + buffer, u64::from(prep_fee())]);
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let plan = plan_migration(&params, &backend, &mut rng).expect("a fundable balance plans");
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let mut state = commit_preparation(
+            &params,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut backend,
+            &plan,
+            &mut rng,
+            ReplanThreshold::DEFAULT,
+        )
+        .expect("commits the migration");
+        assert_eq!(state.transactions.len(), 1, "one directly funded transfer");
+        let id = state.transactions[0].id;
+        let mark = BlockHeight::from_u32(TARGET_HEIGHT);
+
+        // Marked while still UNEXPIRED: the specific condition wins over `NotExpired`.
+        state.transactions[0].unsatisfiable = Some((mark, UnsatisfiableKind::InputsSpent));
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 2);
+        assert!(matches!(
+            rebuild_expired_transfer(&params, &backend, &mut state, id, &mut rng),
+            Err(RebuildError::Unsatisfiable(rejected)) if rejected == id
+        ));
+
+        // Marked AND expired — the ordinary shape of a dead transfer, and the one a consumer
+        // driving from `expired_transactions` would hand to the rebuild. Still refused, rather
+        // than rebuilt against a note the wallet has seen spent.
+        backend.tip = state.transactions[0].expiry_height + 1;
+        let target = backend.chain_tip_height().unwrap() + 1;
+        assert!(
+            state
+                .expired_transactions(DuenessTargets::at(target))
+                .contains(&id),
+            "the marked transfer is also expired, as a dead transfer usually is"
+        );
+        let before = state.transactions[0].clone();
+        assert!(matches!(
+            rebuild_expired_transfer(&params, &backend, &mut state, id, &mut rng),
+            Err(RebuildError::Unsatisfiable(rejected)) if rejected == id
+        ));
+        assert_eq!(
+            state.transactions[0], before,
+            "a refused rebuild leaves the transfer untouched"
+        );
+
+        // An UNMARKED expired transfer whose producer is marked: the funding note it would
+        // re-spend is minted by a transaction that can never mine.
+        state.transactions[0].unsatisfiable = None;
+        let producer_id = MigrationTransferId::new(77);
+        state.transactions[0].depends_on = vec![producer_id];
+        state.transactions.push(MigrationTransaction::from_parts(
+            producer_id,
+            MigrationTxKind::Preparation { layer: 0, index: 0 },
+            Vec::new(),
+            Vec::new(),
+            BlockHeight::from_u32(0),
+            BlockHeight::from_u32(0),
+            None,
+            TxId::from_bytes([7; 32]),
+            MigrationTxState::Broadcast {
+                txid: TxId::from_bytes([7; 32]),
+            },
+            None,
+            Some((mark, UnsatisfiableKind::InputsSpent)),
+            vec![[7u8; 32]],
+            None,
+        ));
+        assert!(matches!(
+            rebuild_expired_transfer(&params, &backend, &mut state, id, &mut rng),
+            Err(RebuildError::Unsatisfiable(rejected)) if rejected == id
         ));
     }
 
@@ -3906,7 +5484,6 @@ mod commit_tests {
         // Floor the transfer schedule so every transfer has a candidate anchor boundary above
         // the estimated last-preparation mining height, exactly as `plan_migration` floors it.
         let nu63_activation = {
-            use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
             regtest_network(true)
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .expect("NU6.3 is active on the test network")
@@ -3937,6 +5514,7 @@ mod commit_tests {
             stored: None,
             tip: BlockHeight::from_u32(2_000_000),
             sched_params: crate::scheduling::SchedulingParams::ZIP_318,
+            prove_anchors: Vec::new(),
         };
         let params = regtest_network(true);
         let prep_count = plan.preparation().transaction_count();
@@ -3950,6 +5528,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
         assert_eq!(state.transactions.len(), prep_count + transfer_count);
@@ -3989,9 +5568,14 @@ mod commit_tests {
             .map(|t| t.scheduled_height)
             .max()
             .expect("the committed migration has transactions");
-        match state.next_step(target) {
-            crate::state::AdvanceStep::Prove { id, .. }
-            | crate::state::AdvanceStep::Broadcast { id } => {
+        match state.next_step(DuenessTargets::at(target), &[]) {
+            crate::state::AdvanceStep::Prove { transactions } => {
+                assert!(
+                    transactions.iter().all(|t| layer0_ids.contains(&t.id())),
+                    "layer 0 proves first"
+                )
+            }
+            crate::state::AdvanceStep::Broadcast { id } => {
                 assert!(layer0_ids.contains(&id), "layer 0 broadcasts first")
             }
             other => panic!("expected a broadcast step, got {other:?}"),
@@ -4005,9 +5589,14 @@ mod commit_tests {
             .filter(|t| matches!(t.kind, MigrationTxKind::Preparation { layer: 1, .. }))
             .map(|t| t.id)
             .collect();
-        match state.next_step(target) {
-            crate::state::AdvanceStep::Prove { id, .. }
-            | crate::state::AdvanceStep::Broadcast { id } => {
+        match state.next_step(DuenessTargets::at(target), &[]) {
+            crate::state::AdvanceStep::Prove { transactions } => {
+                assert!(
+                    transactions.iter().all(|t| layer1_ids.contains(&t.id())),
+                    "layer 1 proves once layer 0 mines"
+                )
+            }
+            crate::state::AdvanceStep::Broadcast { id } => {
                 assert!(
                     layer1_ids.contains(&id),
                     "layer 1 broadcasts once layer 0 mines"
@@ -4018,9 +5607,14 @@ mod commit_tests {
         for id in &layer1_ids {
             state.mark_mined(*id, BlockHeight::from_u32(2_000_020));
         }
-        match state.next_step(target) {
-            crate::state::AdvanceStep::Prove { id, .. }
-            | crate::state::AdvanceStep::Broadcast { id } => {
+        match state.next_step(DuenessTargets::at(target), &[]) {
+            step @ (crate::state::AdvanceStep::Prove { .. }
+            | crate::state::AdvanceStep::Broadcast { .. }) => {
+                let id = match &step {
+                    crate::state::AdvanceStep::Prove { transactions } => transactions[0].id(),
+                    crate::state::AdvanceStep::Broadcast { id } => *id,
+                    _ => unreachable!(),
+                };
                 let tx = state
                     .transactions
                     .iter()
@@ -4056,6 +5650,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
 
@@ -4129,6 +5724,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng2,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
 
@@ -4172,9 +5768,21 @@ mod commit_tests {
         let mut height = 2_000_000u32;
         for layer in 0..layer_count {
             let ids = layer_ids(&state, layer);
-            match state.next_step(target) {
-                crate::state::AdvanceStep::Prove { id, .. }
-                | crate::state::AdvanceStep::Broadcast { id } => assert!(
+            match state.next_step(DuenessTargets::at(target), &[]) {
+                // The batch carries EVERYTHING provable: the newly unblocked layer, and any
+                // transfer whose funding producer has already mined. What the dependency walk
+                // guarantees is that no LATER preparation layer proves before its predecessor
+                // mines.
+                crate::state::AdvanceStep::Prove {
+                    transactions: named,
+                } => assert!(
+                    named.iter().all(|t| {
+                        matches!(t.kind(), MigrationTxKind::Transfer { .. })
+                            || ids.contains(&t.id())
+                    }),
+                    "layer {layer} (with any ready transfers) is proved once its predecessor has mined"
+                ),
+                crate::state::AdvanceStep::Broadcast { id } => assert!(
                     ids.contains(&id),
                     "layer {layer} is proved or broadcast once its predecessor has mined"
                 ),
@@ -4202,9 +5810,14 @@ mod commit_tests {
                 state.mark_mined(*id, BlockHeight::from_u32(height));
             }
         }
-        match state.next_step(target) {
-            crate::state::AdvanceStep::Prove { id, .. }
-            | crate::state::AdvanceStep::Broadcast { id } => {
+        match state.next_step(DuenessTargets::at(target), &[]) {
+            step @ (crate::state::AdvanceStep::Prove { .. }
+            | crate::state::AdvanceStep::Broadcast { .. }) => {
+                let id = match &step {
+                    crate::state::AdvanceStep::Prove { transactions } => transactions[0].id(),
+                    crate::state::AdvanceStep::Broadcast { id } => *id,
+                    _ => unreachable!(),
+                };
                 let tx = state.transactions.iter().find(|t| t.id == id).unwrap();
                 assert!(
                     matches!(tx.kind, MigrationTxKind::Transfer { .. }),
@@ -4231,6 +5844,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("builds the migration unsigned");
         assert_eq!(unsigned.len(), state.transactions.len());
@@ -4241,9 +5855,8 @@ mod commit_tests {
         // Rounds are consecutive prefixes bounded by the action budget; a preparation is
         // PREP_TX_ACTIONS actions, so a budget of one preparation plus one transfer splits the
         // list without ever exceeding the budget (every round is non-empty and within budget).
-        let budget_actions = PREP_TX_ACTIONS
-            + crate::denomination::SOURCE_ACTIONS_PER_TRANSFER
-            + crate::denomination::DESTINATION_ACTIONS_PER_TRANSFER;
+        let budget_actions =
+            PREP_TX_ACTIONS + CROSSING_SOURCE_ACTIONS + CROSSING_DESTINATION_ACTIONS;
         let budget = crate::signing_rounds::SigningRoundBudget::new(
             core::num::NonZeroU32::new(budget_actions as u32).unwrap(),
         );
@@ -4293,6 +5906,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("builds the migration unsigned");
 
@@ -4368,6 +5982,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
 
@@ -4379,6 +5994,7 @@ mod commit_tests {
                 &mut backend,
                 &plan,
                 &mut rng,
+                ReplanThreshold::DEFAULT,
             ),
             Err(CommitError::MigrationInProgress)
         ));
@@ -4394,6 +6010,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("replaces a terminal migration");
     }
@@ -4417,6 +6034,7 @@ mod commit_tests {
                 &mut backend,
                 &plan,
                 &mut rng,
+                ReplanThreshold::DEFAULT,
             ),
             Err(CommitError::StalePlan)
         ));
@@ -4440,6 +6058,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
 
@@ -4458,8 +6077,23 @@ mod commit_tests {
             })
             .expect("a committed migration has transfers");
 
-        // Proving reads the persisted boundary, proves, and advances Signed -> Proved.
-        prove_transfer(&mut backend, &mut state, transfer_id).expect("proves the due transfer");
+        // Proving reads the persisted boundary and proves; discharging the returned proof through
+        // the store is what advances Signed -> Proved.
+        match prove_transfer(
+            &params,
+            &mut backend,
+            &mut state,
+            transfer_id,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut rng,
+        )
+        .expect("proves the due transfer")
+        {
+            ProveOutcome::Proved(proven) => backend
+                .store_proved_transaction(&mut state, proven)
+                .expect("stores the proof"),
+            other => panic!("expected a proof, got {other:?}"),
+        }
         let proved = state
             .transactions
             .iter()
@@ -4472,7 +6106,14 @@ mod commit_tests {
 
         // An already-proved transfer is not re-proved.
         assert!(matches!(
-            prove_transfer(&mut backend, &mut state, transfer_id),
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                transfer_id,
+                BlockHeight::from_u32(TARGET_HEIGHT),
+                &mut rng,
+            ),
             Err(ProveError::NotReady(_))
         ));
 
@@ -4485,9 +6126,203 @@ mod commit_tests {
             .expect("a committed migration has preparation transactions")
             .id;
         assert!(matches!(
-            prove_transfer(&mut backend, &mut state, prep_id),
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                prep_id,
+                BlockHeight::from_u32(TARGET_HEIGHT),
+                &mut rng,
+            ),
             Err(ProveError::NotATransfer(_))
         ));
+    }
+
+    /// Shared prologue of the proving-time re-draw tests: a committed single-note migration and
+    /// its first dependency-funded transfer — the shape the commit-time estimate can betray —
+    /// with the transfer's id, its funding preparation's id, and the boundary the schedule drew.
+    fn committed_with_prep_funded_transfer(
+        seed: u64,
+    ) -> (
+        CommitMock,
+        MigrationState,
+        MigrationTransferId,
+        MigrationTransferId,
+        BlockHeight,
+    ) {
+        let (mut backend, plan) = single_note_setup(seed, 78 * COIN);
+        let params = regtest_network(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let state = commit_preparation(
+            &params,
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut backend,
+            &plan,
+            &mut rng,
+            ReplanThreshold::DEFAULT,
+        )
+        .expect("commits the migration");
+
+        let (transfer_id, producer_id, drawn_boundary) = state
+            .transactions
+            .iter()
+            .find_map(
+                |t| match (&t.kind, t.depends_on.first(), t.anchor_boundary) {
+                    (MigrationTxKind::Transfer { .. }, Some(dep), Some(boundary)) => {
+                        Some((t.id, *dep, boundary))
+                    }
+                    _ => None,
+                },
+            )
+            .expect("a single-note migration funds its transfers from minted preparation notes");
+        (backend, state, transfer_id, producer_id, drawn_boundary)
+    }
+
+    /// A funding preparation that mined PAST the transfer's drawn boundary makes that boundary
+    /// permanently unwitnessable — the note is not in its tree state — so proving re-draws the
+    /// boundary from the note's REAL creation height and hands the prover the fresh one, persisting
+    /// it on the row. This is the field shape that wedged a live migration: the commit-time draw
+    /// trusted `EST_PREP_LAYER_MINING_BLOCKS` and the preparations out-mined it.
+    #[test]
+    fn prove_transfer_redraws_a_boundary_the_funding_note_postdates() {
+        let (mut backend, mut state, transfer_id, producer_id, drawn_boundary) =
+            committed_with_prep_funded_transfer(23);
+        let step = state.anchor_bucket_interval().block_count().get();
+
+        // The preparation mines 30 blocks PAST the drawn boundary (the estimate was short), and
+        // the wallet has scanned far enough past the mined height for a fresh boundary to have
+        // settled.
+        let funding_mined = drawn_boundary + 30;
+        state.mark_mined(producer_id, funding_mined);
+        let scanned_tip = funding_mined + 2 * step;
+
+        let params = regtest_network(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(24);
+        assert!(matches!(
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                transfer_id,
+                scanned_tip,
+                &mut rng,
+            )
+            .expect("proves the transfer against the re-drawn boundary"),
+            ProveOutcome::Proved(_)
+        ));
+
+        let &[proved_against] = backend.prove_anchors.as_slice() else {
+            panic!("exactly one prove call reaches the prover");
+        };
+        assert!(
+            proved_against >= funding_mined,
+            "the re-drawn boundary ({proved_against}) is at or past the funding note's creation \
+             ({funding_mined}) — the old one ({drawn_boundary}) could never witness it"
+        );
+        assert!(
+            proved_against < scanned_tip,
+            "the re-drawn boundary is one the wallet has scanned and can witness at"
+        );
+        assert!(
+            state.anchor_bucket_interval().is_boundary(proved_against),
+            "the re-drawn boundary stays on the anchor bucket grid"
+        );
+        assert_eq!(
+            state
+                .transactions
+                .iter()
+                .find(|t| t.id == transfer_id)
+                .expect("the transfer is present")
+                .anchor_boundary,
+            Some(proved_against),
+            "the fresh boundary is persisted on the row"
+        );
+    }
+
+    /// With the funding note mined past the drawn boundary but NO fresh grid boundary settled at
+    /// or past it yet, there is nothing valid to draw: the answer is `NotYetProvable` — retry
+    /// after further sync — never a prove attempt against the impossible stored boundary.
+    #[test]
+    fn redraw_reports_not_yet_provable_until_a_boundary_past_the_funding_settles() {
+        let (mut backend, mut state, transfer_id, producer_id, drawn_boundary) =
+            committed_with_prep_funded_transfer(29);
+
+        // The preparation out-mined the boundary, but the wallet's scan stands exactly at the
+        // mined height: every settled grid boundary is behind the funding note.
+        let funding_mined = drawn_boundary + 30;
+        state.mark_mined(producer_id, funding_mined);
+
+        let params = regtest_network(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(30);
+        assert_eq!(
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                transfer_id,
+                funding_mined,
+                &mut rng,
+            )
+            .expect("nothing to draw is a retry, not an error"),
+            ProveOutcome::NotYetProvable
+        );
+        assert!(
+            backend.prove_anchors.is_empty(),
+            "the impossible stored boundary is never handed to the prover"
+        );
+        assert_eq!(
+            state
+                .transactions
+                .iter()
+                .find(|t| t.id == transfer_id)
+                .expect("the transfer is present")
+                .anchor_boundary,
+            Some(drawn_boundary),
+            "the stored boundary is untouched until a valid draw exists"
+        );
+    }
+
+    /// A boundary the funding note PREDATES is healthy — the note is in its tree state — and is
+    /// NOT re-drawn: the commit-time draw stands, so anchor cohorts survive wherever they are
+    /// valid.
+    #[test]
+    fn prove_transfer_keeps_a_boundary_the_funding_note_predates() {
+        let (mut backend, mut state, transfer_id, producer_id, drawn_boundary) =
+            committed_with_prep_funded_transfer(31);
+        let step = state.anchor_bucket_interval().block_count().get();
+
+        // The preparation mined BEFORE the drawn boundary, as the schedule assumed.
+        state.mark_mined(producer_id, drawn_boundary - 1);
+
+        let params = regtest_network(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(32);
+        assert!(matches!(
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                transfer_id,
+                drawn_boundary + 2 * step,
+                &mut rng,
+            )
+            .expect("proves the transfer against the drawn boundary"),
+            ProveOutcome::Proved(_)
+        ));
+        assert_eq!(
+            backend.prove_anchors,
+            vec![drawn_boundary],
+            "the healthy drawn boundary is handed to the prover unchanged"
+        );
+        assert_eq!(
+            state
+                .transactions
+                .iter()
+                .find(|t| t.id == transfer_id)
+                .expect("the transfer is present")
+                .anchor_boundary,
+            Some(drawn_boundary),
+            "no re-draw was persisted"
+        );
     }
 
     /// A committed migration records the anchor bucket grid it was scheduled against, and both the
@@ -4498,9 +6333,6 @@ mod commit_tests {
     /// checkpoint at witness-resolution time.
     #[test]
     fn a_changed_anchor_grid_is_rejected_rather_than_left_unprovable() {
-        use crate::scheduling::{AnchorBucketInterval, SchedulingParams};
-        use core::num::NonZeroU32;
-
         let seed = 7u64;
         let (mut backend, plan) = single_note_setup(seed, 78 * COIN);
         let params = regtest_network(true);
@@ -4511,6 +6343,7 @@ mod commit_tests {
             &mut backend,
             &plan,
             &mut rng,
+            ReplanThreshold::DEFAULT,
         )
         .expect("commits the migration");
 
@@ -4535,8 +6368,16 @@ mod commit_tests {
             .id;
 
         // Proving reports the mismatch instead of resolving a boundary the wallet no longer retains.
+        let mut prove_rng = ChaCha8Rng::seed_from_u64(seed + 3);
         assert!(matches!(
-            prove_transfer(&mut backend, &mut state, transfer_id),
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                transfer_id,
+                BlockHeight::from_u32(TARGET_HEIGHT),
+                &mut prove_rng,
+            ),
             Err(ProveError::AnchorIntervalMismatch {
                 committed: c,
                 configured: g,
@@ -4557,7 +6398,319 @@ mod commit_tests {
 
         // Restoring the committed grid makes the migration provable again.
         backend.sched_params = SchedulingParams::ZIP_318;
-        prove_transfer(&mut backend, &mut state, transfer_id)
-            .expect("the transfer proves once the grid matches again");
+        assert!(matches!(
+            prove_transfer(
+                &params,
+                &mut backend,
+                &mut state,
+                transfer_id,
+                BlockHeight::from_u32(TARGET_HEIGHT),
+                &mut prove_rng,
+            )
+            .expect("the transfer proves once the grid matches again"),
+            ProveOutcome::Proved(_)
+        ));
+    }
+
+    /// The `FailingProver`'s "anything else went wrong" error, which the engine must pass through
+    /// untouched.
+    #[derive(Debug, PartialEq, Eq)]
+    struct MockProveError;
+
+    impl fmt::Display for MockProveError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("the mock prover failed")
+        }
+    }
+
+    /// A prover that never proves, standing in for one whose wallet cannot locate a spend's note:
+    /// it reports [`ProveFailure::InputNotAvailable`] for the configured nullifier and backing
+    /// height, or [`ProveFailure::Other`] when none is configured. It answers the anchor-grid
+    /// question with the grid these tests commit under, so a transfer reaches the prove call rather
+    /// than being turned back by the grid guard.
+    struct FailingProver {
+        input_not_available: Option<([u8; 32], BlockHeight)>,
+    }
+
+    impl FailingProver {
+        fn input_not_available(nullifier: [u8; 32], as_of: u32) -> Self {
+            FailingProver {
+                input_not_available: Some((nullifier, BlockHeight::from_u32(as_of))),
+            }
+        }
+
+        fn other() -> Self {
+            FailingProver {
+                input_not_available: None,
+            }
+        }
+
+        fn failure(&self) -> ProveFailure<MockProveError> {
+            match self.input_not_available {
+                Some((nullifier, as_of)) => ProveFailure::InputNotAvailable { nullifier, as_of },
+                None => ProveFailure::Other(MockProveError),
+            }
+        }
+    }
+
+    impl MigrationProver for FailingProver {
+        type Error = MockProveError;
+
+        fn prove_transfer(
+            &mut self,
+            _pczt: pczt::Pczt,
+            _anchor_boundary: BlockHeight,
+        ) -> Result<pczt::Pczt, ProveFailure<Self::Error>> {
+            Err(self.failure())
+        }
+
+        fn prove_preparation(
+            &mut self,
+            _pczt: pczt::Pczt,
+            _anchor: BlockHeight,
+        ) -> Result<pczt::Pczt, ProveFailure<Self::Error>> {
+            Err(self.failure())
+        }
+
+        fn anchor_bucket_interval(&self) -> crate::scheduling::AnchorBucketInterval {
+            crate::scheduling::SchedulingParams::ZIP_318.anchor_bucket_interval()
+        }
+
+        /// Never reached: every prove call above fails first, which is precisely the ordering
+        /// these tests pin — a failed proof takes no locks.
+        fn lock_spent_notes(
+            &mut self,
+            _pczt: &pczt::Pczt,
+            _lock_expiry_height: BlockHeight,
+        ) -> Result<Option<MigrationLockOwner>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    /// A freshly committed migration over one wallet note: its state, one layer-0 preparation
+    /// transaction (which depends on nothing), and the transfers that preparation funds.
+    fn committed_for_prove_failures() -> (
+        MigrationState,
+        MigrationTransferId,
+        Vec<MigrationTransferId>,
+    ) {
+        let seed = 7u64;
+        let (mut backend, plan) = single_note_setup(seed, 78 * COIN);
+        let mut rng = ChaCha8Rng::seed_from_u64(seed + 1);
+        let state = commit_preparation(
+            &regtest_network(true),
+            BlockHeight::from_u32(TARGET_HEIGHT),
+            &mut backend,
+            &plan,
+            &mut rng,
+            ReplanThreshold::DEFAULT,
+        )
+        .expect("commits the migration");
+
+        let prep_id = state
+            .transactions
+            .iter()
+            .find(|t| matches!(t.kind, MigrationTxKind::Preparation { .. }))
+            .expect("a committed migration has preparation transactions")
+            .id;
+        assert!(
+            state
+                .transactions
+                .iter()
+                .all(|t| t.depends_on.is_empty() || t.depends_on == vec![prep_id]),
+            "this fixture has a single preparation layer, so every dependent waits on it alone"
+        );
+        let transfer_ids: Vec<MigrationTransferId> = state
+            .transactions
+            .iter()
+            .filter(|t| matches!(t.kind, MigrationTxKind::Transfer { .. }))
+            .map(|t| t.id)
+            .collect();
+        assert!(!transfer_ids.is_empty());
+        (state, prep_id, transfer_ids)
+    }
+
+    fn stamp(state: &MigrationState, id: MigrationTransferId) -> Option<BlockHeight> {
+        state
+            .transactions
+            .iter()
+            .find(|t| t.id == id)
+            .expect("the transaction is present")
+            .unsatisfiable_at()
+    }
+
+    /// A prover reporting an input ABSENT from the unspent set, with every dependency's mined
+    /// height inside the wallet's scan, is positive evidence that the input was spent: the engine
+    /// records it through the ordinary satisfiability mutator instead of surfacing an error, so
+    /// the transaction is marked at the observation's height and the dependency closure strands
+    /// its dependents at the same stamp. A layer-0 preparation depends on nothing, which is
+    /// coverage vacuously: the notes it spends were spendable when the migration was committed.
+    #[test]
+    fn prove_input_not_available_with_deps_covered_marks_unsatisfiable() {
+        let (mut state, prep_id, transfer_ids) = committed_for_prove_failures();
+        let nullifier = state
+            .transactions
+            .iter()
+            .find(|t| t.id == prep_id)
+            .expect("the preparation is present")
+            .spend_nullifiers[0];
+        const AS_OF: u32 = 1_500_000;
+
+        let mut prover = FailingProver::input_not_available(nullifier, AS_OF);
+        let outcome = prove_preparation(
+            &mut prover,
+            &mut state,
+            prep_id,
+            BlockHeight::from_u32(AS_OF),
+        )
+        .expect("an unavailable input is handled, not surfaced as an error");
+
+        let ProveOutcome::MarkedUnsatisfiable { replan_required } = outcome else {
+            panic!("expected the observation to be recorded, got {outcome:?}");
+        };
+        // The payload is the derived accessor's value AFTER marking, so a caller can act on it
+        // without re-consulting the state.
+        assert_eq!(replan_required, state.replan_required());
+        assert!(
+            replan_required,
+            "the whole migration's transfer value is stranded behind the one preparation"
+        );
+        assert_eq!(stamp(&state, prep_id), Some(BlockHeight::from_u32(AS_OF)));
+        for id in transfer_ids {
+            assert_eq!(
+                stamp(&state, id),
+                Some(BlockHeight::from_u32(AS_OF)),
+                "the closure strands every transfer the dead preparation funds"
+            );
+        }
+        // The preparation kept its lifecycle state: unsatisfiability is orthogonal to it, and no
+        // proof was produced.
+        assert!(matches!(
+            state
+                .transactions
+                .iter()
+                .find(|t| t.id == prep_id)
+                .expect("the preparation is present")
+                .state,
+            MigrationTxState::Signed
+        ));
+    }
+
+    /// With a dependency mined ABOVE the height the observation rests on, the input's absence is
+    /// equally consistent with a note the wallet has not scanned yet: nothing is concluded and
+    /// nothing is marked. One block further of scan — the dependency's mined height exactly — and
+    /// the same observation becomes conclusive, which pins the coverage comparison at its
+    /// boundary.
+    #[test]
+    fn prove_input_not_available_with_a_dep_above_as_of_concludes_nothing() {
+        let (mut state, prep_id, transfer_ids) = committed_for_prove_failures();
+        let transfer_id = transfer_ids[0];
+        let nullifier = state
+            .transactions
+            .iter()
+            .find(|t| t.id == transfer_id)
+            .expect("the transfer is present")
+            .spend_nullifiers[0];
+        const MINED: u32 = 1_500_000;
+        state.mark_mined(prep_id, BlockHeight::from_u32(MINED));
+
+        // Far enough past the dependency's mined height that the proving-time boundary re-draw
+        // (if the mined height out-ran the drawn boundary) has a settled candidate to pick.
+        let scanned_tip = BlockHeight::from_u32(MINED + 288);
+        let params = regtest_network(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(41);
+
+        let mut prover = FailingProver::input_not_available(nullifier, MINED - 1);
+        assert_eq!(
+            prove_transfer(
+                &params,
+                &mut prover,
+                &mut state,
+                transfer_id,
+                scanned_tip,
+                &mut rng,
+            )
+            .expect("an unavailable input is handled, not surfaced as an error"),
+            ProveOutcome::NotYetProvable
+        );
+        assert_eq!(stamp(&state, transfer_id), None, "nothing is marked");
+        assert_eq!(stamp(&state, prep_id), None);
+
+        // Scanned exactly as far as the dependency's mined height, the input was necessarily
+        // scanned, so its absence is conclusive.
+        let mut prover = FailingProver::input_not_available(nullifier, MINED);
+        assert!(matches!(
+            prove_transfer(
+                &params,
+                &mut prover,
+                &mut state,
+                transfer_id,
+                scanned_tip,
+                &mut rng,
+            )
+            .expect("an unavailable input is handled, not surfaced as an error"),
+            ProveOutcome::MarkedUnsatisfiable { .. }
+        ));
+        assert_eq!(
+            stamp(&state, transfer_id),
+            Some(BlockHeight::from_u32(MINED))
+        );
+    }
+
+    /// An UNMINED dependency means the drive layer offered this transaction before its inputs
+    /// could exist: the absence says nothing about a spend, so it is read conservatively as a
+    /// retry rather than as evidence.
+    #[test]
+    fn prove_input_not_available_with_an_unmined_dep_concludes_nothing() {
+        let (mut state, prep_id, transfer_ids) = committed_for_prove_failures();
+        let transfer_id = transfer_ids[0];
+
+        let mut prover = FailingProver::input_not_available([9; 32], 1_500_000);
+        assert_eq!(
+            prove_transfer(
+                &regtest_network(true),
+                &mut prover,
+                &mut state,
+                transfer_id,
+                BlockHeight::from_u32(TARGET_HEIGHT),
+                &mut ChaCha8Rng::seed_from_u64(42),
+            )
+            .expect("an unavailable input is handled, not surfaced as an error"),
+            ProveOutcome::NotYetProvable
+        );
+        assert_eq!(stamp(&state, transfer_id), None);
+        assert_eq!(stamp(&state, prep_id), None);
+    }
+
+    /// Every other prover failure is still an error, carried through untouched: only the one
+    /// condition the engine can interpret is handled.
+    #[test]
+    fn prove_other_prover_failures_still_surface_as_errors() {
+        let (mut state, prep_id, transfer_ids) = committed_for_prove_failures();
+        let transfer_id = transfer_ids[0];
+
+        let mut prover = FailingProver::other();
+        assert!(matches!(
+            prove_transfer(
+                &regtest_network(true),
+                &mut prover,
+                &mut state,
+                transfer_id,
+                BlockHeight::from_u32(TARGET_HEIGHT),
+                &mut ChaCha8Rng::seed_from_u64(43),
+            ),
+            Err(ProveError::Prover(MockProveError))
+        ));
+        assert!(matches!(
+            prove_preparation(
+                &mut prover,
+                &mut state,
+                prep_id,
+                BlockHeight::from_u32(TARGET_HEIGHT)
+            ),
+            Err(ProveError::Prover(MockProveError))
+        ));
+        assert_eq!(stamp(&state, transfer_id), None);
+        assert_eq!(stamp(&state, prep_id), None);
     }
 }

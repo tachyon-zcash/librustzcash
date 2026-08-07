@@ -3189,6 +3189,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3200,7 +3206,7 @@ dependencies = [
 
 [[package]]
 name = "pczt"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "blake2b_simd",
  "bls12_381",
@@ -3214,6 +3220,7 @@ dependencies = [
  "orchard",
  "pasta_curves",
  "postcard",
+ "proptest",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "redjubjub",
@@ -7233,7 +7240,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_backend"
-version = "0.24.0-rc.6"
+version = "0.24.0-rc.7"
 dependencies = [
  "ambassador",
  "arti-client",
@@ -7308,7 +7315,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_client_sqlite"
-version = "0.22.0-rc.6"
+version = "0.22.0-rc.8"
 dependencies = [
  "ambassador",
  "assert_matches",
@@ -7329,6 +7336,7 @@ dependencies = [
  "nonempty",
  "orchard",
  "pasta_curves",
+ "pastey",
  "pczt",
  "proptest",
  "prost",
@@ -7454,8 +7462,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_pool_migration"
-version = "0.1.0-rc.5"
+version = "0.1.0-rc.7"
 dependencies = [
+ "blake2b_simd",
  "corez",
  "getset",
  "incrementalmerkletree",
@@ -7552,7 +7561,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "corez",
  "document-features",

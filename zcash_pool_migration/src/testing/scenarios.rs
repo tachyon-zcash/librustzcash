@@ -226,6 +226,16 @@ pub const MIGRATION_SCENARIOS: &[MigrationScenario] = {
         COIN / 10,
         COIN / 10,
     ];
+    // One 10 ZEC balance held four ways. The crossing values are supposed to be a function of the
+    // BALANCE (canonical quantization), but the preparation planner has to mint each funding note
+    // out of the wallet's actual notes, and the split is reconciled against that inline. These four
+    // rows pin how far the note shape moves the result; see
+    // `note_shape_changes_the_split_of_a_ten_zec_balance` in `tests/engine_plan.rs` for the
+    // crossing-by-crossing comparison.
+    const TEN_AS_ONE: &[u64] = &[10 * COIN];
+    const ONE_PLUS_NINE: &[u64] = &[COIN, 9 * COIN];
+    const TWO_PLUS_EIGHT: &[u64] = &[2 * COIN, 8 * COIN];
+    const FIVE_PLUS_FIVE: &[u64] = &[5 * COIN, 5 * COIN];
     // Columns: label, source notes, preparations, transfers (quanta), Keystone rounds, migrated.
     &[
         // Single-note balances.
@@ -250,7 +260,7 @@ pub const MIGRATION_SCENARIOS: &[MigrationScenario] = {
             710 * H,
         ),
         // Many-note shapes, consolidated across preparation layers.
-        s("exchange, ten 5 ZEC notes", TEN_FIVES, 2, 3, 1, 4_500 * H),
+        s("exchange, ten 5 ZEC notes", TEN_FIVES, 1, 5, 1, 4_900 * H),
         // Five preparations (80 actions) plus eleven transfers (33 actions) is 113 actions: the
         // only scenario that needs a second Keystone round.
         s(
@@ -272,11 +282,133 @@ pub const MIGRATION_SCENARIOS: &[MigrationScenario] = {
         s(
             "whale plus dust, 40 ZEC and a six-note dust tail",
             WHALE_DUST,
-            4,
+            1,
             6,
             1,
             4_033 * H,
         ),
+        // The same 10 ZEC balance, four note shapes, which now agree: one preparation
+        // transaction spending whichever notes the wallet holds, and the same nine canonical
+        // crossings. These rows exist to keep them agreeing.
+        s("10 ZEC in a single note", TEN_AS_ONE, 1, 9, 1, 999 * H),
+        s("10 ZEC as 1 + 9", ONE_PLUS_NINE, 1, 9, 1, 999 * H),
+        s("10 ZEC as 2 + 8", TWO_PLUS_EIGHT, 1, 9, 1, 999 * H),
+        s("10 ZEC as 5 + 5", FIVE_PLUS_FIVE, 1, 9, 1, 999 * H),
+    ]
+};
+
+/// The crossing values one [`MigrationScenario`] publishes, for the note-shape family: the same
+/// balance held several ways.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoteShapeSplit {
+    /// The [`MigrationScenario::label`] this row is the split of.
+    pub scenario_label: &'static str,
+    /// The crossing values published, in units of 0.01 ZEC (the minimum denomination), in the
+    /// order the planner emits them.
+    pub crossings: &'static [u64],
+    /// The number of preparation transactions that mint them.
+    pub preparations: usize,
+}
+
+/// What each 10 ZEC note shape publishes.
+///
+/// Canonical quantization of the migratable 9.99 ZEC is `500, 200, 200, 50, 20, 20, 5, 2, 2` in
+/// units of 0.01 ZEC. Every shape publishes exactly that, in one preparation transaction: the
+/// split is a function of the BALANCE, and the rows are here to keep it one.
+pub const NOTE_SHAPE_SPLITS: &[NoteShapeSplit] = {
+    const fn s(
+        scenario_label: &'static str,
+        crossings: &'static [u64],
+        preparations: usize,
+    ) -> NoteShapeSplit {
+        NoteShapeSplit {
+            scenario_label,
+            crossings,
+            preparations,
+        }
+    }
+    /// The canonical split of 9.99 ZEC, which every shape below publishes.
+    const CANONICAL: &[u64] = &[500, 200, 200, 50, 20, 20, 5, 2, 2];
+    &[
+        s("10 ZEC in a single note", CANONICAL, 1),
+        s("10 ZEC as 1 + 9", CANONICAL, 1),
+        s("10 ZEC as 2 + 8", CANONICAL, 1),
+        s("10 ZEC as 5 + 5", CANONICAL, 1),
+    ]
+};
+
+/// One row of the note-shape budget sweep: a [`MigrationScenario`] (named by its `scenario_label`)
+/// evaluated for a signer whose per-round capacity is `budget_actions`, and the number of signing
+/// interactions that signer needs. The budget is a QUERY parameter of a plan, so the same migration
+/// is priced for every signer without re-planning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoteShapeBudgetCase {
+    /// The [`MigrationScenario::label`] this row prices (the wallet's note shape).
+    pub scenario_label: &'static str,
+    /// The signer's per-round budget, in total Orchard actions.
+    pub budget_actions: u32,
+    /// The expected number of signing rounds (the optimal `MinRounds` packing).
+    pub expected_rounds: usize,
+}
+
+/// What the note shape costs the USER AT THE SIGNER: one 10 ZEC balance, four note shapes, priced
+/// for five signer budgets.
+///
+/// Every shape plans one preparation transaction and nine crossings, so every shape is
+/// `1 * 16 + 9 * 3 = 43` actions and the four rows of any budget agree. That agreement is the
+/// property: the wallet's note shape does not change how many times its owner is asked to sign.
+///
+/// Each row is hand-derived from the two-item-size packing (16-action preparations, 3-action
+/// transfers) and cross-checked against `min_signing_rounds` by the test that replays it.
+pub const NOTE_SHAPE_BUDGET_ROUNDS: &[NoteShapeBudgetCase] = {
+    const fn b(
+        scenario_label: &'static str,
+        budget_actions: u32,
+        expected_rounds: usize,
+    ) -> NoteShapeBudgetCase {
+        NoteShapeBudgetCase {
+            scenario_label,
+            budget_actions,
+            expected_rounds,
+        }
+    }
+    // The budgets swept, named from the real constants rather than magic numbers. `MIN` is the
+    // smallest budget any signer must support (one preparation transaction, with no room left for a
+    // transfer); `TIGHT` and `MODEST` stand for devices between that floor and a Keystone.
+    const MIN: u32 = SigningRoundBudget::minimum_feasible().get();
+    const TIGHT: u32 = 2 * PREPARATION_ACTIONS; // 32: two preparations, or one plus five transfers
+    const MODEST: u32 = 3 * PREPARATION_ACTIONS; // 48: three preparations, or sixteen transfers
+    const KEYSTONE: u32 = SigningRoundBudget::KEYSTONE.max_actions();
+    const DEFAULT: u32 = SigningRoundBudget::DEFAULT.max_actions();
+    const ONE_NOTE: &str = "10 ZEC in a single note";
+    const ONE_PLUS_NINE: &str = "10 ZEC as 1 + 9";
+    const TWO_PLUS_EIGHT: &str = "10 ZEC as 2 + 8";
+    const FIVE_PLUS_FIVE: &str = "10 ZEC as 5 + 5";
+    &[
+        // At the floor the preparation fills a round alone and transfers pack five to a round:
+        // 1 + ceil(9/5).
+        b(ONE_NOTE, MIN, 3),
+        b(ONE_PLUS_NINE, MIN, 3),
+        b(TWO_PLUS_EIGHT, MIN, 3),
+        b(FIVE_PLUS_FIVE, MIN, 3),
+        // 32 actions: the preparation plus five transfers is 31, leaving four transfers over.
+        b(ONE_NOTE, TIGHT, 2),
+        b(ONE_PLUS_NINE, TIGHT, 2),
+        b(TWO_PLUS_EIGHT, TIGHT, 2),
+        b(FIVE_PLUS_FIVE, TIGHT, 2),
+        // 48 actions and up: the whole run is 43, so one interaction.
+        b(ONE_NOTE, MODEST, 1),
+        b(ONE_PLUS_NINE, MODEST, 1),
+        b(TWO_PLUS_EIGHT, MODEST, 1),
+        b(FIVE_PLUS_FIVE, MODEST, 1),
+        b(ONE_NOTE, KEYSTONE, 1),
+        b(ONE_PLUS_NINE, KEYSTONE, 1),
+        b(TWO_PLUS_EIGHT, KEYSTONE, 1),
+        b(FIVE_PLUS_FIVE, KEYSTONE, 1),
+        b(ONE_NOTE, DEFAULT, 1),
+        b(ONE_PLUS_NINE, DEFAULT, 1),
+        b(TWO_PLUS_EIGHT, DEFAULT, 1),
+        b(FIVE_PLUS_FIVE, DEFAULT, 1),
     ]
 };
 

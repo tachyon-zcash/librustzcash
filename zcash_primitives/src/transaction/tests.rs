@@ -8,7 +8,8 @@ use {
         testing::arb_tx, transparent, txid::TxIdDigester,
     },
     ::transparent::{
-        address::Script, sighash::SighashType, sighash::TransparentAuthorizingContext,
+        address::Script,
+        sighash::{SighashType, TransparentAuthorizingContext},
     },
     alloc::vec::Vec,
     blake2b_simd::Hash as Blake2bHash,
@@ -18,24 +19,22 @@ use {
 };
 
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
-use crate::transaction::{
-    TransactionDigest,
-    txid::{BlockTxCommitmentDigester, hash_sapling_spends},
+use {
+    crate::transaction::{
+        TransactionDigest,
+        sighash_v6::v6_signature_hash,
+        txid::{BlockTxCommitmentDigester, hash_sapling_spends},
+    },
+    blake2b_simd::Params,
+    ff::PrimeField,
+    // Only the `not(nu7)` tests below drive proptest strategies by hand; upstream keeps these
+    // in the ungated block because it never lints with `zcash_unstable = "nu7"`.
+    proptest::{strategy::ValueTree, test_runner::TestRunner},
+    zcash_protocol::value::ZatBalance,
 };
 
-#[cfg(all(test, not(zcash_unstable = "nu7")))]
-use crate::transaction::sighash_v6::v6_signature_hash;
 #[cfg(all(test, zcash_unstable = "nu7", feature = "zip-233"))]
 use crate::transaction::sighash_v6::v6_signature_hash;
-
-#[cfg(all(test, not(zcash_unstable = "nu7")))]
-use blake2b_simd::Params;
-
-#[cfg(all(test, not(zcash_unstable = "nu7")))]
-use ff::PrimeField;
-
-#[cfg(all(test, not(zcash_unstable = "nu7")))]
-use zcash_protocol::value::ZatBalance;
 
 #[cfg(any(test, feature = "test-dependencies"))]
 pub mod data;
@@ -166,8 +165,6 @@ fn v6_empty_orchard_txid_uses_v6_orchard_personalization() {
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
 #[test]
 fn v6_branch_reconstruction_preserves_ironwood_bundle() {
-    use proptest::test_runner::TestRunner;
-
     let mut runner = TestRunner::default();
     let ironwood_bundle = test_ironwood_bundle(&mut runner);
     let tx = TransactionData::from_parts_v6(
@@ -232,8 +229,6 @@ fn test_anchor(byte: u8) -> orchard::Anchor {
 fn test_orchard_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> orchard::Bundle<orchard::bundle::Authorized, ZatBalance> {
-    use proptest::strategy::ValueTree;
-
     let bundle = crate::transaction::components::orchard::testing::arb_bundle(1)
         .new_tree(runner)
         .unwrap()
@@ -248,8 +243,6 @@ fn test_orchard_bundle(
 fn test_ironwood_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> orchard::Bundle<orchard::bundle::Authorized, ZatBalance> {
-    use proptest::strategy::ValueTree;
-
     let bundle = crate::transaction::components::orchard::testing::arb_bundle(1)
         .new_tree(runner)
         .unwrap()
@@ -285,8 +278,6 @@ fn test_sapling_anchor(byte: u8) -> bls12_381::Scalar {
 fn test_sapling_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> sapling::Bundle<sapling::bundle::Authorized, ZatBalance> {
-    use proptest::strategy::ValueTree;
-
     let bundle_strategy =
         crate::transaction::components::sapling::testing::arb_bundle_for_version(TxVersion::V6);
 
@@ -305,8 +296,6 @@ fn test_sapling_bundle(
 fn test_sapling_output_only_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> sapling::Bundle<sapling::bundle::Authorized, ZatBalance> {
-    use proptest::strategy::ValueTree;
-
     let bundle_strategy =
         crate::transaction::components::sapling::testing::arb_bundle_for_version(TxVersion::V6);
 

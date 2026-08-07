@@ -1,8 +1,6 @@
 //! Functions for initializing the various databases.
 
-use std::borrow::BorrowMut;
-use std::fmt;
-use std::rc::Rc;
+use std::{borrow::BorrowMut, fmt, rc::Rc};
 
 use rand_core::RngCore;
 use regex::Regex;
@@ -764,10 +762,12 @@ mod tests {
         super::WalletMigrationError,
         crate::wallet::{self, PoolType, pool_code},
         zcash_address::test_vectors,
-        zcash_client_backend::data_api::WalletWrite,
+        zcash_client_backend::data_api::{AccountBirthday, AccountSource, WalletRead, WalletWrite},
+        zcash_primitives::block::BlockHash,
         zip32::DiversifierIndex,
     };
 
+    use regex::Regex;
     #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     use zcash_protocol::value::Zatoshis;
 
@@ -780,24 +780,29 @@ mod tests {
         Ok(result)
     }
 
+    /// A schema statement's text with each parenthesis and comma surrounded by whitespace and every
+    /// run of whitespace (including newlines) collapsed to a single space, so that two statements
+    /// are compared for what they declare rather than how they were laid out.
+    ///
+    /// The comma is punctuation for the same reason the parentheses are, and it is load-bearing
+    /// here: SQLite's `ALTER TABLE ... ADD COLUMN` splices the new definition into the stored text
+    /// just before the closing parenthesis, so a repaired schema separates its last two columns
+    /// with `\n        , ` where the `CREATE TABLE` that states the same shape writes `,\n`.
+    fn normalize_sql(s: &str) -> String {
+        let re = Regex::new(r"\s+").unwrap();
+        let re_punct = Regex::new(r"([(),])").unwrap();
+        re.replace_all(&re_punct.replace_all(s, " $1 "), " ")
+            .trim()
+            .to_string()
+    }
+
     #[test]
     fn verify_schema() {
         let st = TestBuilder::new()
             .with_data_store_factory(TestDbFactory::default())
             .build();
 
-        use regex::Regex;
-        let re = Regex::new(r"\s+").unwrap();
-        let re_paren = Regex::new(r"([\(\)])").unwrap();
-
-        // Surround each opening or closing parenthesis character with whitespace, and then
-        // replace each occurrence of any amount of whitespace (including newlines) with a single
-        // space.
-        let normalize = |s: &str| -> String {
-            re.replace_all(&re_paren.replace_all(s, " $1 "), " ")
-                .trim()
-                .to_string()
-        };
+        let normalize = normalize_sql;
 
         let expected_tables = vec![
             db::TABLE_ACCOUNTS,
@@ -815,6 +820,7 @@ mod tests {
             db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_DIRECT_FUNDING,
             db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_INPUTS,
             db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_OUTPUTS,
+            db::TABLE_ORCHARD_IRONWOOD_MIGRATION_SPEND_NULLIFIERS,
             db::TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTION_DEPS,
             db::TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTIONS,
             db::TABLE_ORCHARD_IRONWOOD_MIGRATIONS,
@@ -922,6 +928,7 @@ mod tests {
             db::view_ironwood_shard_scan_ranges(st.network()),
             db::view_ironwood_shard_unscanned_ranges(),
             db::VIEW_IRONWOOD_SHARDS_SCAN_STATE.to_owned(),
+            db::view_migration_transactions(),
             db::view_orchard_shard_scan_ranges(st.network()),
             db::view_orchard_shard_unscanned_ranges(),
             db::VIEW_ORCHARD_SHARDS_SCAN_STATE.to_owned(),
@@ -931,6 +938,7 @@ mod tests {
             db::view_sapling_shard_unscanned_ranges(),
             db::VIEW_SAPLING_SHARDS_SCAN_STATE.to_owned(),
             db::VIEW_TRANSACTIONS.to_owned(),
+            db::VIEW_TRANSACTIONS_WITH_PENDING_MIGRATIONS.to_owned(),
             db::VIEW_TX_OUTPUTS.to_owned(),
         ];
 
@@ -946,6 +954,76 @@ mod tests {
             let actual: String = row.get(0).unwrap();
             assert_eq!(normalize(&actual), normalize(&expected_views[expected_idx]));
             expected_idx += 1;
+        }
+    }
+
+    /// The pool-migration store's canonical DDL and the schema the migrations actually leave behind
+    /// are the same schema.
+    ///
+    /// They are written twice on purpose: `orchard_ironwood_migration_tables` is published, so it
+    /// creates its tables from a frozen copy of the DDL it shipped with — down to naming the
+    /// transfer ordinal `tx_id`, which `orchard_ironwood_migration_unsatisfiability` then renames —
+    /// while the store's DDL states the shape those migrations converge on, and is what the
+    /// fixtures that build a store without running any migration create. `verify_schema` above pins
+    /// the constants compared here to the migration path, so this equates the two descriptions:
+    /// were the canonical DDL to drift, a store built by a fixture would answer questions about a
+    /// schema no wallet has.
+    #[test]
+    fn canonical_pool_migration_ddl_matches_the_migration_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pool_migration::orchard_ironwood::init_migration_tables(&conn).unwrap();
+
+        let expected = [
+            (
+                "orchard_ironwood_migrations",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATIONS,
+            ),
+            (
+                "orchard_ironwood_migration_crossing_values",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_CROSSING_VALUES,
+            ),
+            (
+                "orchard_ironwood_migration_prep_inputs",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_INPUTS,
+            ),
+            (
+                "orchard_ironwood_migration_prep_outputs",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_OUTPUTS,
+            ),
+            (
+                "orchard_ironwood_migration_prep_direct_funding",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_DIRECT_FUNDING,
+            ),
+            (
+                "orchard_ironwood_migration_transactions",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTIONS,
+            ),
+            (
+                "orchard_ironwood_migration_transaction_deps",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTION_DEPS,
+            ),
+            (
+                "orchard_ironwood_migration_spend_nullifiers",
+                db::TABLE_ORCHARD_IRONWOOD_MIGRATION_SPEND_NULLIFIERS,
+            ),
+            (
+                "idx_orchard_ironwood_migration_tx_due",
+                db::INDEX_ORCHARD_IRONWOOD_MIGRATION_TX_DUE,
+            ),
+            (
+                "idx_orchard_ironwood_migrations_account",
+                db::INDEX_ORCHARD_IRONWOOD_MIGRATIONS_ACCOUNT,
+            ),
+        ];
+
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE name = ? AND sql IS NOT NULL")
+            .unwrap();
+        for (name, expected) in expected {
+            let actual: String = stmt
+                .query_row([name], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("the canonical DDL creates {name}: {e}"));
+            assert_eq!(normalize_sql(&actual), normalize_sql(expected));
         }
     }
 
@@ -1458,9 +1536,6 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn account_produces_expected_ua_sequence() {
-        use zcash_client_backend::data_api::{AccountBirthday, AccountSource, WalletRead};
-        use zcash_primitives::block::BlockHash;
-
         let network = Network::MainNetwork;
         let data_file = NamedTempFile::new().unwrap();
         let mut db_data =

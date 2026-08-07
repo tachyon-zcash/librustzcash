@@ -159,16 +159,25 @@ use {
         bundle::{OutPoint, TxOut},
         keys::{IncomingViewingKey as _, NonHardenedChildIndex, TransparentKeyScope},
     },
+    ReceiverRequirement::*,
+    rusqlite::types::Value,
+    std::rc::Rc,
     zcash_client_backend::{data_api::DecryptedTransaction, wallet::WalletTransparentOutput},
 };
 
 #[cfg(feature = "orchard")]
 use zcash_client_backend::data_api::{IRONWOOD_SHARD_HEIGHT, ORCHARD_SHARD_HEIGHT};
 
+use FindAccountForAddressError as E;
 #[cfg(feature = "zcashd-compat")]
 use {
     crate::wallet::encoding::{decode_legacy_account_index, encode_legacy_account_index},
     zcash_keys::keys::zcashd,
+};
+#[cfg(feature = "transparent-key-import")]
+use {
+    ::transparent::address::TransparentAddress,
+    zcash_script::{descriptor::sh, script::Evaluable},
 };
 
 pub mod commitment_tree;
@@ -688,7 +697,6 @@ pub(crate) fn add_account<P: consensus::Parameters>(
         TransparentKeyScope::INTERNAL,
         TransparentKeyScope::EPHEMERAL,
     ] {
-        use ReceiverRequirement::*;
         transparent::generate_gap_addresses(
             conn,
             params,
@@ -871,8 +879,6 @@ fn import_standalone_transparent_pubkey_inner<P: consensus::Parameters>(
     account_id: AccountRef,
     pubkey: secp256k1::PublicKey,
 ) -> Result<usize, SqliteClientError> {
-    use ::transparent::address::TransparentAddress;
-
     let existing_import_account = conn
         .query_row(
             "SELECT accounts.uuid AS account_uuid
@@ -940,10 +946,6 @@ pub(crate) fn import_standalone_transparent_script<P: consensus::Parameters>(
     account_uuid: AccountUuid,
     redeem_script: zcash_script::script::Redeem,
 ) -> Result<(), SqliteClientError> {
-    use ::transparent::address::TransparentAddress;
-    use zcash_script::descriptor::sh;
-    use zcash_script::script::Evaluable;
-
     // Resolve the account up front so an unknown account is reported explicitly, rather than
     // inferred from a zero-row INSERT below.
     let account_id = get_account_ref(conn, account_uuid)?;
@@ -1056,7 +1058,6 @@ pub(crate) fn get_next_available_address<P: consensus::Parameters, C: Clock>(
         // transparent gap limit.
         #[cfg(feature = "transparent-inputs")]
         {
-            use ReceiverRequirement::*;
             // First, ensure that we have pre-generated as many addresses as we can.
             transparent::generate_gap_addresses(
                 conn,
@@ -1249,8 +1250,6 @@ pub(crate) fn find_account_for_address<P: consensus::Parameters>(
     params: &P,
     address: &Address,
 ) -> Result<Option<AccountUuid>, FindAccountForAddressError<SqliteClientError>> {
-    use FindAccountForAddressError as E;
-
     let addr_str = address.encode(params);
     // For a UA the transparent receiver (if any) may match the cached column; for non-UA
     // addresses the same string serves both roles (the `cached_transparent_receiver_address`
@@ -1318,8 +1317,6 @@ fn find_account_for_shielded_address<P: consensus::Parameters>(
     address: &Address,
     shielded_flag: ReceiverFlags,
 ) -> Result<Option<AccountUuid>, FindAccountForAddressError<SqliteClientError>> {
-    use FindAccountForAddressError as E;
-
     // The address may be a receiver embedded in a stored UA. Query candidate UAs via
     // `receiver_flags` and verify at the Rust level.
     let mut stmt = conn
@@ -1361,8 +1358,6 @@ fn find_account_for_unified_address_algebraic<P: consensus::Parameters>(
     params: &P,
     unified_address: &UnifiedAddress,
 ) -> Result<Option<AccountUuid>, FindAccountForAddressError<SqliteClientError>> {
-    use FindAccountForAddressError as E;
-
     // Ask each account's UIVK whether it derived any receiver of the UA. This finds every
     // UA that any account in the wallet could have produced, whether or not it was
     // previously exposed.
@@ -1596,9 +1591,6 @@ pub(crate) fn involved_accounts(
     conn: &rusqlite::Connection,
     tx_refs: impl IntoIterator<Item = TxRef>,
 ) -> Result<HashSet<(AccountRef, AccountUuid, Option<TransparentKeyScope>)>, SqliteClientError> {
-    use rusqlite::types::Value;
-    use std::rc::Rc;
-
     let mut stmt = conn.prepare_cached(
         "SELECT account_id, accounts.uuid, key_scope
          FROM v_address_uses
@@ -3380,60 +3372,68 @@ pub(crate) fn block_metadata<P: consensus::Parameters>(
     .and_then(|meta_row| meta_row.map(|r| parse_block_metadata(params, r)).transpose())
 }
 
+/// Returns the height to which the wallet is FULLY scanned (every block from the wallet birthday
+/// through it has been scanned), or `None` if no contiguous scanned range reaches down to the
+/// birthday (including for a wallet with no accounts). This is the height-only computation behind
+/// [`block_fully_scanned`], separated so callers that need no block metadata (and hold no network
+/// parameters) can share it rather than replicate it.
+pub(crate) fn fully_scanned_height(
+    conn: &rusqlite::Connection,
+) -> Result<Option<BlockHeight>, rusqlite::Error> {
+    let Some(birthday_height) = wallet_birthday(conn)? else {
+        return Ok(None);
+    };
+    // We assume that the only way we get a contiguous range of block heights in the `blocks` table
+    // starting with the birthday block, is if all scanning operations have been performed on those
+    // blocks. This holds because the `blocks` table is only altered by `WalletDb::put_blocks` via
+    // `put_block`, and the effective combination of intra-range linear scanning and the nullifier
+    // map ensures that we discover all wallet-related information within the contiguous range.
+    //
+    // We also assume that every contiguous range of block heights in the `blocks` table has a
+    // single matching entry in the `scan_queue` table with priority "Scanned". This requires no
+    // bugs in the scan queue update logic, which we have had before. However, a bug here would
+    // mean that we return a more conservative fully-scanned height, which likely just causes a
+    // performance regression.
+    //
+    // The fully-scanned height is therefore the last height that falls within the first range in
+    // the scan queue with priority "Scanned".
+    let calc_fully_scanned_height = |row: &rusqlite::Row| {
+        let block_range_start = BlockHeight::from_u32(row.get(0)?);
+        let block_range_end = BlockHeight::from_u32(row.get(1)?);
+
+        // If the start of the earliest scanned range is greater than
+        // the birthday height, then there is an unscanned range between
+        // the wallet birthday and that range, so there is no fully
+        // scanned height.
+        Ok(if block_range_start <= birthday_height {
+            // Scan ranges are end-exclusive.
+            Some(block_range_end - 1)
+        } else {
+            None
+        })
+    };
+    Ok(conn
+        .query_row(
+            "SELECT block_range_start, block_range_end
+            FROM scan_queue
+            WHERE priority = :priority
+            ORDER BY block_range_start ASC
+            LIMIT 1",
+            named_params![":priority": priority_code(&ScanPriority::Scanned)],
+            calc_fully_scanned_height,
+        )
+        .optional()?
+        .flatten())
+}
+
 #[tracing::instrument(skip_all)]
 pub(crate) fn block_fully_scanned<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
     params: &P,
 ) -> Result<Option<BlockMetadata>, SqliteClientError> {
-    if let Some(birthday_height) = wallet_birthday(conn)? {
-        // We assume that the only way we get a contiguous range of block heights in the `blocks` table
-        // starting with the birthday block, is if all scanning operations have been performed on those
-        // blocks. This holds because the `blocks` table is only altered by `WalletDb::put_blocks` via
-        // `put_block`, and the effective combination of intra-range linear scanning and the nullifier
-        // map ensures that we discover all wallet-related information within the contiguous range.
-        //
-        // We also assume that every contiguous range of block heights in the `blocks` table has a
-        // single matching entry in the `scan_queue` table with priority "Scanned". This requires no
-        // bugs in the scan queue update logic, which we have had before. However, a bug here would
-        // mean that we return a more conservative fully-scanned height, which likely just causes a
-        // performance regression.
-        //
-        // The fully-scanned height is therefore the last height that falls within the first range in
-        // the scan queue with priority "Scanned".
-        let calc_fully_scanned_height = |row: &rusqlite::Row| {
-            let block_range_start = BlockHeight::from_u32(row.get(0)?);
-            let block_range_end = BlockHeight::from_u32(row.get(1)?);
-
-            // If the start of the earliest scanned range is greater than
-            // the birthday height, then there is an unscanned range between
-            // the wallet birthday and that range, so there is no fully
-            // scanned height.
-            Ok(if block_range_start <= birthday_height {
-                // Scan ranges are end-exclusive.
-                Some(block_range_end - 1)
-            } else {
-                None
-            })
-        };
-        let fully_scanned_height = match conn
-            .query_row(
-                "SELECT block_range_start, block_range_end
-                FROM scan_queue
-                WHERE priority = :priority
-                ORDER BY block_range_start ASC
-                LIMIT 1",
-                named_params![":priority": priority_code(&ScanPriority::Scanned)],
-                calc_fully_scanned_height,
-            )
-            .optional()?
-        {
-            Some(Some(h)) => h,
-            _ => return Ok(None),
-        };
-
-        block_metadata(conn, params, fully_scanned_height)
-    } else {
-        Ok(None)
+    match fully_scanned_height(conn)? {
+        Some(height) => block_metadata(conn, params, height),
+        None => Ok(None),
     }
 }
 
@@ -3521,12 +3521,14 @@ pub(crate) fn get_max_height_hash(
     .optional()
 }
 
+/// Returns the [`TxRef`] of the stored transaction row, so a caller can attach further
+/// per-transaction facts (e.g. its ZIP 318 classification) in the same database transaction.
 pub(crate) fn store_transaction_to_be_sent<P: consensus::Parameters>(
     conn: &rusqlite::Transaction,
     params: &P,
     #[cfg(feature = "transparent-inputs")] gap_limits: &GapLimits,
     sent_tx: &SentTransaction<AccountUuid>,
-) -> Result<(), SqliteClientError> {
+) -> Result<TxRef, SqliteClientError> {
     let tx_ref = put_tx_data(
         conn,
         sent_tx.tx(),
@@ -3766,7 +3768,7 @@ pub(crate) fn store_transaction_to_be_sent<P: consensus::Parameters>(
         queue_tx_status(conn, sent_tx.tx().txid())?;
     }
 
-    Ok(())
+    Ok(tx_ref)
 }
 
 pub(crate) fn set_transaction_status<P: consensus::Parameters>(
@@ -4411,6 +4413,16 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
             named_params![":block_height": u32::from(truncation_height)],
         )?;
     }
+
+    // Roll every stored pool migration back with the wallet. A migration's marks and mined heights
+    // are chain-derived exactly as the wallet's own scanned state is, and must not be able to
+    // outlive it: an unsatisfiability mark resting on a rolled-back observation would strand live
+    // value behind evidence that no longer exists, and a transaction still recorded mined above the
+    // truncation would keep its dependents unblocked. The truncation is the only moment at which
+    // either is noticeable, so it is driven here rather than left to the consumer to remember, and
+    // it runs in the same transaction, at the height actually ACHIEVED — which a caller that asked
+    // for a lower one never sees.
+    crate::pool_migration::orchard_ironwood::truncate_to_height(conn, truncation_height)?;
 
     Ok(truncation_height)
 }
@@ -5145,6 +5157,39 @@ pub(crate) fn put_tx_data(
         .map_err(SqliteClientError::from)
 }
 
+/// Records how a transaction classifies against ZIP 318.
+///
+/// The column defaults to the code for "not classified", so a row this was never called for
+/// reports as unclassified rather than as a decision that the transaction is not a migration
+/// transaction. Rows written before this column existed keep that default, and need the
+/// transaction rescanned before they can be labelled.
+///
+/// `tx_ref` must name an existing row. An `UPDATE` matching nothing is not a SQLite error, so
+/// without the row-count check below this would report success having written nothing, and the
+/// transaction would afterwards read as never classified — indistinguishable from one that was
+/// never a candidate, which is the distinction the "not classified" code exists to preserve.
+pub(crate) fn put_zip318_classification(
+    conn: &rusqlite::Connection,
+    tx_ref: TxRef,
+    classification: zcash_protocol::zip318::Zip318Classification,
+) -> Result<(), SqliteClientError> {
+    let rows_affected = conn.execute(
+        "UPDATE transactions SET zip318_kind = :zip318_kind WHERE id_tx = :id_tx",
+        named_params![
+            ":zip318_kind": classification.to_code(),
+            ":id_tx": tx_ref.0,
+        ],
+    )?;
+    if rows_affected != 1 {
+        return Err(SqliteClientError::CorruptedData(format!(
+            "ZIP 318 classification names transaction {}, which does not exist",
+            tx_ref.0,
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TxQueryType {
     Status,
@@ -5321,8 +5366,7 @@ fn delete_retrieval_queue_entry(
     Ok(())
 }
 
-// A utility function for creation of parameters for use in `insert_sent_output`
-// and `put_sent_output`
+// A utility function for creation of parameters for use in `put_sent_output`
 fn recipient_params<P: consensus::Parameters>(
     conn: &Connection,
     _params: &P,
@@ -5423,6 +5467,10 @@ fn flag_previously_received_change(
 }
 
 /// Records information about a transaction output that your wallet created.
+///
+/// Upserting, via [`put_sent_output`]: re-storing a transaction the wallet already recorded —
+/// a flow that obtains a transaction's bytes, dies before submitting them, and is handed the
+/// same transaction again — overwrites that output's row instead of failing on it.
 pub(crate) fn insert_sent_output<P: consensus::Parameters>(
     conn: &rusqlite::Transaction,
     params: &P,
@@ -5430,32 +5478,16 @@ pub(crate) fn insert_sent_output<P: consensus::Parameters>(
     from_account_uuid: AccountUuid,
     output: &SentTransactionOutput<AccountUuid>,
 ) -> Result<(), SqliteClientError> {
-    let mut stmt_insert_sent_output = conn.prepare_cached(
-        "INSERT INTO sent_notes (
-            transaction_id, output_pool, output_index, from_account_id,
-            to_address, to_account_id, value, memo)
-         VALUES (
-            :transaction_id, :output_pool, :output_index, :from_account_id,
-            :to_address, :to_account_id, :value, :memo)",
-    )?;
-
-    let (from_account_id, to_address, to_account_id, pool_type) =
-        recipient_params(conn, params, from_account_uuid, output.recipient())?;
-    let sql_args = named_params![
-        ":transaction_id": tx_ref.0,
-        ":output_pool": &pool_code(pool_type),
-        ":output_index": &i64::try_from(output.output_index()).unwrap(),
-        ":from_account_id": from_account_id.0,
-        ":to_address": &to_address,
-        ":to_account_id": to_account_id.map(|a| a.0),
-        ":value": &i64::from(ZatBalance::from(output.value())),
-        ":memo": memo_repr(output.memo())
-    ];
-
-    stmt_insert_sent_output.execute(sql_args)?;
-    flag_previously_received_change(conn, tx_ref)?;
-
-    Ok(())
+    put_sent_output(
+        conn,
+        params,
+        from_account_uuid,
+        tx_ref,
+        output.output_index(),
+        output.recipient(),
+        output.value(),
+        output.memo(),
+    )
 }
 
 /// Records information about a transaction output that your wallet created, from the constituent
@@ -5892,7 +5924,10 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{
+        collections::HashSet,
+        num::{NonZeroU8, NonZeroU32},
+    };
 
     use rusqlite::{Connection, named_params};
     use sapling::zip32::ExtendedSpendingKey;
@@ -5901,12 +5936,22 @@ mod tests {
     use zcash_client_backend::data_api::{
         Account as _, AccountSource, TransactionDataRequest, TransactionStatus, WalletRead,
         WalletWrite,
-        testing::{AddressType, DataStoreFactory, FakeCompactOutput, TestBuilder, TestState},
+        chain::{ChainState, CommitmentTreeRoot},
+        error::RewindError,
+        testing::{
+            AddressType, DataStoreFactory, FakeCompactOutput, InitialChainState, TestBuilder,
+            TestState, pool::ShieldedPoolTester, sapling::SaplingPoolTester,
+        },
         wallet::ConfirmationsPolicy,
     };
     use zcash_keys::keys::UnifiedAddressRequest;
     use zcash_primitives::block::BlockHash;
-    use zcash_protocol::{TxId, consensus::BlockHeight, value::Zatoshis};
+    use zcash_protocol::{
+        TxId,
+        consensus::{BlockHeight, NetworkUpgrade, Parameters},
+        value::Zatoshis,
+        zip318::{Zip318Classification, Zip318TxKind},
+    };
 
     use crate::{
         AccountUuid,
@@ -5916,12 +5961,18 @@ mod tests {
 
     use super::{
         KeyScope, ShieldedPool, TxQueryType, TxRef, account_birthday,
-        flag_previously_received_change, min_shared_checkpoint_height, queue_tx_retrieval,
-        select_truncation_height,
+        flag_previously_received_change, min_shared_checkpoint_height, put_zip318_classification,
+        queue_tx_retrieval, select_truncation_height,
     };
 
+    use incrementalmerkletree::frontier::Frontier;
     #[cfg(feature = "orchard")]
-    use {crate::testing::db::TestDb, zcash_protocol::local_consensus::LocalNetwork};
+    use {
+        crate::testing::db::TestDb, ::orchard::tree::MerkleHashOrchard,
+        incrementalmerkletree::Hashable as _, shardtree::error::ShardTreeError,
+        zcash_client_backend::data_api::WalletCommitmentTrees,
+        zcash_protocol::local_consensus::LocalNetwork,
+    };
 
     fn connection_with_checkpoint_tables() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -6286,18 +6337,6 @@ mod tests {
 
     #[test]
     fn rewound_birthday_does_not_falsely_report_complete_recovery() {
-        use std::num::NonZeroU8;
-
-        use incrementalmerkletree::frontier::Frontier;
-        use zcash_client_backend::data_api::{
-            chain::{ChainState, CommitmentTreeRoot},
-            testing::{InitialChainState, pool::ShieldedPoolTester, sapling::SaplingPoolTester},
-        };
-        use zcash_protocol::{
-            ShieldedPool,
-            consensus::{NetworkUpgrade, Parameters},
-        };
-
         // Configure a prior chain state with three complete sapling subtrees plus a
         // partial frontier. The subtree roots are imported into `tree_shards` (with
         // their `subtree_end_height` populated, per the wallet invariant), but the
@@ -6442,18 +6481,6 @@ mod tests {
 
     #[test]
     fn rewound_birthday_recovery_denominator_includes_imported_subtrees() {
-        use std::num::NonZeroU8;
-
-        use incrementalmerkletree::frontier::Frontier;
-        use zcash_client_backend::data_api::{
-            chain::{ChainState, CommitmentTreeRoot},
-            testing::{InitialChainState, pool::ShieldedPoolTester, sapling::SaplingPoolTester},
-        };
-        use zcash_protocol::{
-            ShieldedPool,
-            consensus::{NetworkUpgrade, Parameters},
-        };
-
         // Same imported-subtrees + small scanned tail setup as the previous
         // rewound-birthday test. In addition to checking that recovery is
         // not falsely reported as 100% complete, this test asserts that the
@@ -6614,18 +6641,6 @@ mod tests {
 
     #[test]
     fn recover_until_above_chain_tip_does_not_overshoot_tip_size() {
-        use std::num::NonZeroU8;
-
-        use incrementalmerkletree::frontier::Frontier;
-        use zcash_client_backend::data_api::{
-            chain::{ChainState, CommitmentTreeRoot},
-            testing::{InitialChainState, pool::ShieldedPoolTester, sapling::SaplingPoolTester},
-        };
-        use zcash_protocol::{
-            ShieldedPool,
-            consensus::{NetworkUpgrade, Parameters},
-        };
-
         // Reproduces the wild scenario in which one of the wallet's accounts has
         // `recover_until_height` slightly above the current chain tip (e.g. UFVK1
         // was registered with `recover_until` a few blocks past the then chain
@@ -6773,9 +6788,6 @@ mod tests {
     /// `reset_account_birthdays` to acknowledge the lowering.
     #[test]
     fn rewind_to_chain_state_below_all_birthdays_with_empty_reset_returns_error() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{WalletWrite, chain::ChainState, error::RewindError};
-
         let mut st = TestBuilder::new()
             .with_data_store_factory(TestDbFactory::default())
             .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -6805,9 +6817,6 @@ mod tests {
     /// proceeds and the listed account's birthday is lowered to the new floor.
     #[test]
     fn rewind_to_chain_state_below_all_birthdays_with_account_in_reset_succeeds() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{WalletWrite, chain::ChainState};
-
         let mut st = TestBuilder::new()
             .with_data_store_factory(TestDbFactory::default())
             .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -6839,9 +6848,6 @@ mod tests {
     /// error via `RewindError::DataSource(CorruptedData)`.
     #[test]
     fn rewind_to_chain_state_with_unknown_uuid_in_reset_returns_data_source_error() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{WalletWrite, chain::ChainState, error::RewindError};
-
         let mut st = TestBuilder::new()
             .with_data_store_factory(TestDbFactory::default())
             .with_account_from_sapling_activation(BlockHash([0; 32]))
@@ -6938,9 +6944,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_to_chain_state_with_empty_ironwood_tree_succeeds() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::chain::ChainState;
-
         let (mut st, start_height) = wallet_with_scanned_blocks();
 
         // Simulate the post-migration state: the Ironwood tables exist but are empty, even
@@ -6982,9 +6985,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_to_chain_state_with_empty_orchard_tree_succeeds() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::chain::ChainState;
-
         let (mut st, start_height) = wallet_with_scanned_blocks();
 
         // Simulate the post-migration state: the Orchard tables exist but are empty, even
@@ -7019,9 +7019,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_to_chain_state_with_straddling_ironwood_checkpoints_errors() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{chain::ChainState, error::RewindError};
-
         let (mut st, start_height) = wallet_with_scanned_blocks();
         let target_height = start_height + 2;
 
@@ -7055,10 +7052,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_to_chain_state_with_lagging_ironwood_tree_succeeds() {
-        use shardtree::error::ShardTreeError;
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{WalletCommitmentTrees, chain::ChainState};
-
         let (mut st, start_height) = wallet_with_scanned_blocks();
 
         // Simulate an in-progress NU6.3 rescan: truncate *only* the Ironwood tree back to an
@@ -7106,9 +7099,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_to_chain_state_with_tip_only_ironwood_tree_empties_it() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::chain::ChainState;
-
         let (mut st, start_height) = wallet_with_scanned_blocks();
         let target_height = start_height + 2;
 
@@ -7151,9 +7141,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_to_chain_state_with_witness_destroying_truncation_errors() {
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{chain::ChainState, error::RewindError};
-
         let mut st = TestBuilder::new()
             .with_data_store_factory(TestDbFactory::default())
             .with_block_cache(BlockCache::new())
@@ -7215,14 +7202,6 @@ mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn rewind_preserves_ironwood_subtree_roots_at_or_below_target() {
-        use ::orchard::tree::MerkleHashOrchard;
-        use incrementalmerkletree::Hashable as _;
-        use std::collections::HashSet;
-        use zcash_client_backend::data_api::{
-            WalletCommitmentTrees,
-            chain::{ChainState, CommitmentTreeRoot},
-        };
-
         let (mut st, start_height) = wallet_with_scanned_blocks();
         let target_height = start_height + 2;
 
@@ -7535,6 +7514,92 @@ mod tests {
         assert!(
             !is_change(&tx, pool),
             "an external-scope note must not be reclassified as change"
+        );
+    }
+
+    /// A ZIP 318 classification write must name a transaction that exists.
+    ///
+    /// `UPDATE ... WHERE id_tx = ?` matching no row is not a SQLite error, so without an explicit
+    /// row-count check this reports success having written nothing. That failure is invisible
+    /// afterwards: the transaction reads as the "not classified" default, which is exactly the
+    /// value a transaction nothing ever looked at reads as. The whole point of that code being a
+    /// real value rather than NULL is to keep "we never looked" distinct from "we looked and it is
+    /// not a migration transaction", and a silently dropped write collapses the two.
+    #[test]
+    fn put_zip318_classification_rejects_an_unknown_transaction() {
+        // Placeholders for columns this never reads; they exist to satisfy the table's NOT NULL
+        // constraints, so any well-formed value will do.
+        const TXID: [u8; 32] = [7; 32];
+        const OBSERVED_HEIGHT: i64 = 0;
+
+        const PRESENT: i64 = 1;
+        /// A row id no transaction has, standing in for a `TxRef` that has outlived its row.
+        const ABSENT: i64 = 404;
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        let conn = st.wallet_mut().conn_mut();
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, min_observed_height)
+             VALUES (:id_tx, :txid, :min_observed_height)",
+            named_params! {
+                ":id_tx": PRESENT,
+                ":txid": &TXID[..],
+                ":min_observed_height": OBSERVED_HEIGHT,
+            },
+        )
+        .unwrap();
+
+        let classification = Zip318Classification::Conforms(Zip318TxKind::Transfer);
+
+        // Control: naming a row that exists writes it, so the rejection below is about the missing
+        // row and not about the write path being broken outright.
+        put_zip318_classification(conn, TxRef(PRESENT), classification).unwrap();
+        let stored: i64 = conn
+            .query_row(
+                "SELECT zip318_kind FROM transactions WHERE id_tx = :id_tx",
+                named_params! { ":id_tx": PRESENT },
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            classification.to_code(),
+            "naming an existing transaction records the classification",
+        );
+
+        // Re-classifying a transaction that is ALREADY classified must remain allowed, and this is
+        // the case the row-count check is most at risk of breaking. Both writers into this column
+        // legitimately run over the same row: proving classifies a migration transaction when it
+        // stores it, and the enhance path re-derives the same answer once it mines. A check that
+        // counted rows whose value actually changed rather than rows matched would reject that
+        // second, identical write as if it had named a missing transaction.
+        put_zip318_classification(conn, TxRef(PRESENT), classification)
+            .expect("re-writing an unchanged classification is not a missing row");
+
+        // The same holds when the value does change, which is what a re-classification looks like
+        // when the later writer has strictly more evidence than the earlier one.
+        let refined = Zip318Classification::Nonconforming;
+        put_zip318_classification(conn, TxRef(PRESENT), refined)
+            .expect("re-writing a different classification is not a missing row");
+        let stored: i64 = conn
+            .query_row(
+                "SELECT zip318_kind FROM transactions WHERE id_tx = :id_tx",
+                named_params! { ":id_tx": PRESENT },
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            refined.to_code(),
+            "the later classification replaces the earlier one",
+        );
+
+        assert_matches!(
+            put_zip318_classification(conn, TxRef(ABSENT), classification),
+            Err(SqliteClientError::CorruptedData(_))
         );
     }
 }
