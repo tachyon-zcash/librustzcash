@@ -10,6 +10,17 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- The tachyon protocol now lives behind `#[cfg(zcash_unstable = "zfuture")]`
+  instead of `#[cfg(zcash_unstable = "nu7")]`, and is deployed by
+  `BranchId::ZFuture` rather than `BranchId::Nu7`. `TxVersion::V7`,
+  `TransactionData::tachyon_bundle`, `TransactionDigest::{TachyonDigest,
+  digest_tachyon}`, `v7_signature_hash`, and the `components::tachyon` module
+  all moved with it, as did the `zcash_tachyon` dependency. Upstream's NU7
+  surface (including ZIP 233) is untouched: `BranchId::Nu7` again suggests and
+  accepts v6 transactions, and `BranchId::ZFuture` is what suggests and accepts
+  v7 transactions.
+
 ## [0.30.0] - 2026-07-23
 
 ### Added

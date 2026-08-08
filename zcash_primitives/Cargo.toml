@@ -77,11 +77,11 @@ corez.workspace = true
 workspace = true
 features = ["pre-zip-212"]
 
-# Tachyon (NU7) is only referenced under `#[cfg(zcash_unstable = "nu7")]`, so gate
+# Tachyon is only referenced under `#[cfg(zcash_unstable = "zfuture")]`, so gate
 # the dependency on the same cfg. This keeps the heavy proving stack (ragu, etc.)
-# out of non-nu7 builds — in particular the `no_std` targets, which the tachyon
+# out of non-zfuture builds — in particular the `no_std` targets, which the tachyon
 # dependency tree does not currently support.
-[target.'cfg(zcash_unstable = "nu7")'.dependencies]
+[target.'cfg(zcash_unstable = "zfuture")'.dependencies]
 zcash_tachyon.workspace = true
 
 [dev-dependencies]

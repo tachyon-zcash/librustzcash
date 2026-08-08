@@ -1579,7 +1579,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
             sapling_bundle,
             orchard_bundle,
             ironwood_bundle,
-            #[cfg(zcash_unstable = "nu7")]
+            #[cfg(zcash_unstable = "zfuture")]
             tachyon_bundle: None,
         };
 
@@ -1690,7 +1690,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
             sapling_bundle,
             orchard_bundle,
             ironwood_bundle,
-            #[cfg(zcash_unstable = "nu7")]
+            #[cfg(zcash_unstable = "zfuture")]
             tachyon_bundle: None,
         };
 
@@ -1967,6 +1967,8 @@ mod tests {
             nu6_3: Some(BlockHeight::from_u32(10)),
             #[cfg(zcash_unstable = "nu7")]
             nu7: None,
+            #[cfg(zcash_unstable = "zfuture")]
+            z_future: None,
         }
     }
 
@@ -1984,6 +1986,8 @@ mod tests {
             nu6_2: Some(BlockHeight::from_u32(9)),
             nu6_3: Some(BlockHeight::from_u32(10)),
             nu7: Some(BlockHeight::from_u32(11)),
+            #[cfg(zcash_unstable = "zfuture")]
+            z_future: Some(BlockHeight::from_u32(12)),
         }
     }
 

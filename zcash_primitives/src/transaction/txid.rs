@@ -59,7 +59,7 @@ fn sapling_spends_noncompact_personalization(version: TxVersion) -> &'static [u8
             ZCASH_SAPLING_SPENDS_NONCOMPACT_HASH_PERSONALIZATION
         }
         TxVersion::V6 => ZCASH_SAPLING_SPENDS_V6_NONCOMPACT_HASH_PERSONALIZATION,
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "zfuture")]
         TxVersion::V7 => ZCASH_SAPLING_SPENDS_V6_NONCOMPACT_HASH_PERSONALIZATION,
     }
 }
@@ -70,7 +70,7 @@ fn sapling_auth_personalization(version: TxVersion) -> &'static [u8; 16] {
             ZCASH_SAPLING_SIGS_HASH_PERSONALIZATION
         }
         TxVersion::V6 => ZCASH_SAPLING_V6_SIGS_HASH_PERSONALIZATION,
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "zfuture")]
         TxVersion::V7 => ZCASH_SAPLING_V6_SIGS_HASH_PERSONALIZATION,
     }
 }
@@ -79,7 +79,7 @@ fn sapling_auth_includes_anchor(version: TxVersion) -> bool {
     match version {
         TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 | TxVersion::V5 => false,
         TxVersion::V6 => true,
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "zfuture")]
         TxVersion::V7 => true,
     }
 }
@@ -95,7 +95,7 @@ fn orchard_commitment_domain(version: TxVersion) -> (ValuePool, OrchardTxVersion
             (ValuePool::Orchard, OrchardTxVersion::V5)
         }
         TxVersion::V6 => (ValuePool::Orchard, OrchardTxVersion::V6),
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "zfuture")]
         TxVersion::V7 => (ValuePool::Orchard, OrchardTxVersion::V6),
     }
 }
@@ -173,7 +173,7 @@ pub(crate) fn hash_sapling_spends<A: sapling::bundle::Authorization>(
             let write_anchor = match version {
                 TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 | TxVersion::V5 => true,
                 TxVersion::V6 => false,
-                #[cfg(zcash_unstable = "nu7")]
+                #[cfg(zcash_unstable = "zfuture")]
                 TxVersion::V7 => false,
             };
             if write_anchor {
@@ -314,7 +314,7 @@ impl<A: Authorization> TransactionDigest<A> for TxIdDigester {
     type SaplingDigest = Option<Blake2bHash>;
     type OrchardDigest = Option<Blake2bHash>;
     type IronwoodDigest = Option<Blake2bHash>;
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "zfuture")]
     type TachyonDigest = Option<[u8; 32]>;
 
     type Digest = TxDigests<Blake2bHash>;
@@ -377,7 +377,7 @@ impl<A: Authorization> TransactionDigest<A> for TxIdDigester {
         })
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "zfuture")]
     fn digest_tachyon(
         &self,
         tachyon_bundle: Option<&zcash_tachyon::TachyonBundle>,
@@ -392,7 +392,7 @@ impl<A: Authorization> TransactionDigest<A> for TxIdDigester {
         sapling_digest: Self::SaplingDigest,
         orchard_digest: Self::OrchardDigest,
         ironwood_digest: Self::IronwoodDigest,
-        #[cfg(zcash_unstable = "nu7")] tachyon_digest: Self::TachyonDigest,
+        #[cfg(zcash_unstable = "zfuture")] tachyon_digest: Self::TachyonDigest,
     ) -> Self::Digest {
         TxDigests {
             header_digest,
@@ -400,7 +400,7 @@ impl<A: Authorization> TransactionDigest<A> for TxIdDigester {
             sapling_digest,
             orchard_digest,
             ironwood_digest,
-            #[cfg(zcash_unstable = "nu7")]
+            #[cfg(zcash_unstable = "zfuture")]
             tachyon_digest,
         }
     }
@@ -497,7 +497,7 @@ pub(crate) fn to_hash_v6(
 /// ([`zcash_tachyon::TachyonBundle::commitment`]); the stamp is excluded because it is
 /// authorizing data and is malleable during aggregation. An absent bundle is combined as
 /// tachyon's "no bundle" commitment digest.
-#[cfg(zcash_unstable = "nu7")]
+#[cfg(zcash_unstable = "zfuture")]
 pub(crate) fn to_hash_v7(
     consensus_branch_id: BranchId,
     header_digest: Blake2bHash,
@@ -561,7 +561,7 @@ pub fn to_txid(
     consensus_branch_id: BranchId,
     digests: &TxDigests<Blake2bHash>,
 ) -> TxId {
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "zfuture")]
     if txversion.has_tachyon() {
         let txid_digest = to_hash_v7(
             consensus_branch_id,
@@ -613,7 +613,7 @@ impl TransactionDigest<Authorized> for BlockTxCommitmentDigester {
     type SaplingDigest = Blake2bHash;
     type OrchardDigest = Blake2bHash;
     type IronwoodDigest = Blake2bHash;
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "zfuture")]
     type TachyonDigest = [u8; 32];
 
     type Digest = Blake2bHash;
@@ -714,7 +714,7 @@ impl TransactionDigest<Authorized> for BlockTxCommitmentDigester {
     /// binding signature, and the stamp digest
     /// ([`zcash_tachyon::TachyonBundle::auth_digest`]). An absent bundle contributes tachyon's
     /// "no bundle" authorizing digest.
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "zfuture")]
     fn digest_tachyon(
         &self,
         tachyon_bundle: Option<&zcash_tachyon::TachyonBundle>,
@@ -732,7 +732,7 @@ impl TransactionDigest<Authorized> for BlockTxCommitmentDigester {
         sapling_digest: Self::SaplingDigest,
         orchard_digest: Self::OrchardDigest,
         ironwood_digest: Self::IronwoodDigest,
-        #[cfg(zcash_unstable = "nu7")] tachyon_digest: Self::TachyonDigest,
+        #[cfg(zcash_unstable = "zfuture")] tachyon_digest: Self::TachyonDigest,
     ) -> Self::Digest {
         let (_txversion, consensus_branch_id) = tx_context;
         let mut personal = [0; 16];
@@ -750,7 +750,7 @@ impl TransactionDigest<Authorized> for BlockTxCommitmentDigester {
             h.write_all(ironwood_digest.as_bytes()).unwrap();
         }
 
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "zfuture")]
         if _txversion.has_tachyon() {
             h.write_all(&tachyon_digest).unwrap();
         }
