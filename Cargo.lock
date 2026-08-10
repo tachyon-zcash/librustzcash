@@ -3681,7 +3681,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "ragu"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "blake2b_simd",
  "ragu_arithmetic",
@@ -3695,7 +3695,7 @@ dependencies = [
 [[package]]
 name = "ragu_arithmetic"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "ff",
  "group",
@@ -3708,7 +3708,7 @@ dependencies = [
 [[package]]
 name = "ragu_circuits"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "blake2b_simd",
  "maybe-rayon 0.1.1 (git+https://github.com/tachyon-zcash/maybe-rayon.git?rev=5c37ee0dd448e8c1edc4529d0b8897ecaff5aad1)",
@@ -3720,7 +3720,7 @@ dependencies = [
 [[package]]
 name = "ragu_core"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "ragu_arithmetic",
  "ragu_macros",
@@ -3730,7 +3730,7 @@ dependencies = [
 [[package]]
 name = "ragu_macros"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -3743,7 +3743,7 @@ dependencies = [
 [[package]]
 name = "ragu_pasta"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "lazy_static",
  "ragu_arithmetic",
@@ -3752,7 +3752,7 @@ dependencies = [
 [[package]]
 name = "ragu_pcd"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "maybe-rayon 0.1.1 (git+https://github.com/tachyon-zcash/maybe-rayon.git?rev=5c37ee0dd448e8c1edc4529d0b8897ecaff5aad1)",
  "ragu_arithmetic",
@@ -3764,7 +3764,7 @@ dependencies = [
 [[package]]
 name = "ragu_primitives"
 version = "0.0.0"
-source = "git+https://github.com/s1nus/ragu?branch=cnode-working#eda373435d851107533762a990124993ce6cb89c"
+source = "git+https://github.com/s1nus/ragu?branch=cnode-working#1d49d72917ea6747fc306e5873628734f4f30965"
 dependencies = [
  "ragu_arithmetic",
  "ragu_core",
