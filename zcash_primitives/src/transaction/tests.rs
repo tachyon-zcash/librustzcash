@@ -1197,7 +1197,7 @@ fn tachyon_v7_test_vectors() {
         assert_eq!(binding_sig_bytes, [0x02u8; 64]);
 
         assert_eq!(stamped.stamp.tachygrams.len(), 1);
-        let tg_fp: Fp = stamped.stamp.tachygrams[0].into();
+        let tg_fp: Fp = (*stamped.stamp.tachygrams.iter().next().unwrap()).into();
         assert_eq!(tg_fp, Fp::from_uniform_bytes(&[0xAAu8; 64]));
         // Zebra fixture builds the anchor by reading 64 zero bytes through
         // tachyon's wire format (height 0, commitment from [0; 32]).
