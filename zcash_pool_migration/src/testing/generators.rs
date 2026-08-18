@@ -5,7 +5,7 @@
 //! so does any downstream store crate: generating the SAME values everywhere is what makes one
 //! store's coverage comparable to another's.
 
-use core::num::NonZeroU32;
+use core::num::{NonZeroU32, NonZeroUsize};
 
 use proptest::prelude::*;
 
@@ -23,18 +23,13 @@ use crate::engine::{
 use crate::preparation::{PrepInput, PrepOutput, PrepTransaction, PreparationPlan};
 use crate::satisfiability::{ReplanThreshold, UnsatisfiableKind};
 use crate::scheduling::AnchorBucketInterval;
-use crate::signing_rounds::{PlannedTx, SigningRoundBudget};
+use crate::signing_rounds::{PlannedTx, RunSigningCapacity, SigningRoundBudget};
 
 use alloc::vec::Vec;
 
 // `arb_planned_txs` is a strategy OVER the shared workload builder, so the random and the
 // fixed paths construct runs the same way.
 use super::scenarios::planned_txs;
-
-/// Convert a bounded `u64` to [`Zatoshis`]; infallible for the ranges the strategies draw from.
-fn zat(value: u64) -> Zatoshis {
-    Zatoshis::from_u64(value).expect("test amount within the money supply")
-}
 
 // --- leaf strategies ---
 
@@ -100,11 +95,11 @@ pub fn arb_preparation_plan() -> impl Strategy<Value = PreparationPlan> {
 pub fn arb_denomination_plan() -> impl Strategy<Value = DenominationPlan> {
     (
         prop::collection::vec(arb_zatoshis(), 0..8),
-        (0u64..1_000_000).prop_map(zat),
+        (0u64..1_000_000).prop_map(Zatoshis::const_from_u64),
         prop::option::of(arb_zatoshis()),
-        (0u64..1_000_000).prop_map(zat),
-        (0u64..1_000_000_000).prop_map(zat),
-        (0u64..1_000_000_000).prop_map(zat),
+        (0u64..1_000_000).prop_map(Zatoshis::const_from_u64),
+        (0u64..1_000_000_000).prop_map(Zatoshis::const_from_u64),
+        (0u64..1_000_000_000).prop_map(Zatoshis::const_from_u64),
     )
         .prop_map(
             |(
@@ -373,6 +368,21 @@ pub fn arb_signing_round_budget() -> impl Strategy<Value = SigningRoundBudget> {
         Just(SigningRoundBudget::DEFAULT),
         (floor..=1024u32)
             .prop_map(|n| SigningRoundBudget::new(NonZeroU32::new(n).expect("nonzero"))),
+    ]
+}
+
+/// An arbitrary [`RunSigningCapacity`], covering the named [`RunSigningCapacity::KEYSTONE`] plus a
+/// spread of budgets, per-run round allowances, and note ceilings.
+pub fn arb_run_signing_capacity() -> impl Strategy<Value = RunSigningCapacity> {
+    prop_oneof![
+        Just(RunSigningCapacity::KEYSTONE),
+        (arb_signing_round_budget(), 1usize..4, 1usize..60).prop_map(
+            |(budget, max_rounds, max_notes)| RunSigningCapacity::new(
+                budget,
+                NonZeroUsize::new(max_rounds).expect("nonzero"),
+                NonZeroUsize::new(max_notes).expect("nonzero"),
+            )
+        ),
     ]
 }
 

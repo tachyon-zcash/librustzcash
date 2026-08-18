@@ -70,15 +70,18 @@ use zcash_primitives::transaction::fees::{FeeRule as _, transparent, zip317};
 #[cfg(feature = "orchard")]
 use crate::satisfiability::{DuenessTargets, UnsatisfiableCause};
 use crate::{
-    denomination::{DenominationPlan, balance_has_canonical_split, plan_denominations},
+    denomination::{
+        DenominationPlan, MIGRATION_MAX_PREPARED_NOTES_PER_RUN, balance_has_canonical_split,
+        plan_denominations,
+    },
     preparation::{
-        PREP_TX_ACTIONS, PrepError, PrepInput, PrepOutput, PreparationPlan, plan_preparation,
+        PREP_TX_ACTIONS, PrepError, PrepInput, PrepOutput, PreparationPlan, plan_preparation_with,
     },
     satisfiability::{ReorgSettleDepth, ReplanThreshold, StepSatisfiability, UnsatisfiableKind},
     scheduling::{self, Schedule},
     signing_rounds::{
-        MinRounds, PlannedSigningRound, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
-        min_budget_for_rounds, min_signing_rounds,
+        MinRounds, PlannedSigningRound, PlannedTx, RunShape, RunSigningCapacity,
+        SigningRoundBudget, SigningRoundStrategy, largest_run_size_within, min_budget_for_rounds,
     },
 };
 
@@ -1390,13 +1393,15 @@ impl MigrationPlan {
         self.preparation.layer_count()
     }
 
+    /// This plan's [`RunShape`]: the transaction counts every signer-facing quantity is derived
+    /// from, so a caller can ask a plan the same questions it asks an estimate.
+    pub fn shape(&self) -> RunShape {
+        RunShape::new(self.preparation_tx_count(), self.transfer_tx_count())
+    }
+
     /// The total Orchard-family actions across every transaction this plan builds.
     pub fn total_actions(&self) -> u32 {
-        let prep = (self.preparation_tx_count() as u64)
-            .saturating_mul(u64::from(crate::signing_rounds::PREPARATION_ACTIONS));
-        let xfer = (self.transfer_tx_count() as u64)
-            .saturating_mul(u64::from(crate::signing_rounds::TRANSFER_ACTIONS));
-        u32::try_from(prep.saturating_add(xfer)).unwrap_or(u32::MAX)
+        self.shape().total_actions()
     }
 
     /// The total value that migrates to the destination pool (the sum of the crossing values).
@@ -1433,11 +1438,7 @@ impl MigrationPlan {
     /// The number of signing rounds this plan needs for a signer bounded by `budget` (the optimal
     /// [`MinRounds`] count), without materializing the packing.
     pub fn signing_round_count(&self, budget: SigningRoundBudget) -> usize {
-        min_signing_rounds(
-            self.preparation_tx_count(),
-            self.transfer_tx_count(),
-            budget,
-        )
+        self.shape().signing_rounds(budget)
     }
 
     /// The smallest per-round budget that signs this whole plan in ONE round: the plan's total
@@ -1572,6 +1573,7 @@ where
 {
     plan_migration_with(
         &crate::preparation::default_portfolio(),
+        MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
         params,
         backend,
         rng,
@@ -1579,14 +1581,232 @@ where
 }
 
 /// As [`plan_migration`], planning the preparation transactions against a chosen set of strategies
-/// rather than the ones the crate ships.
+/// rather than the ones the crate ships, and preparing at most `max_notes` notes in this run rather
+/// than the crate's [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] default.
 ///
-/// The choice reaches the whole plan, not only its preparation transactions: the denomination
-/// decomposition asks the preparation planner what it can mint at every step, so a portfolio that
-/// can build fewer transaction shapes yields different crossings as well as different
-/// preparations.
+/// The portfolio choice reaches the whole plan, not only its preparation transactions: the
+/// denomination decomposition asks the preparation planner what it can mint at every step, so a
+/// portfolio that can build fewer transaction shapes yields different crossings as well as
+/// different preparations.
+///
+/// `max_notes` is the only denomination knob: the `{1, 2, 5} * 10^k` set and its
+/// [`DENOM_CAP`](crate::denomination::DENOM_CAP) /
+/// [`MAX_RESIDUAL_VALUE`](crate::denomination::MAX_RESIDUAL_VALUE) bounds are normative ZIP 318
+/// values and are not settable. Whichever knobs are passed here must also be passed to
+/// [`estimate_migration_runs_with`], or the preview will not describe the runs that get planned.
 pub fn plan_migration_with<Pf, P, B, R>(
     portfolio: &Pf,
+    max_notes: NonZeroUsize,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationPlan, MigrationError<B::Error>>
+where
+    Pf: crate::preparation::Portfolio,
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    plan_migration_sized_with(portfolio, RunSizing::Notes(max_notes), params, backend, rng)
+}
+
+/// As [`plan_migration`], sizing the run to what an external signer of `capacity` will sign rather
+/// than to a fixed note count: the run is capped at the largest number of notes that keeps it within
+/// the signer's rounds, so one run is one signing session.
+///
+/// This is the sizing to use with a capacity-limited hardware signer (for example
+/// [`RunSigningCapacity::KEYSTONE`]). A note cap cannot express that bound: a run's actions are
+/// `16 * preparations + 3 * transfers`, and the preparation count depends on how fragmented the
+/// wallet is, so the same cap yields a one-round run for one wallet and a four-round run for
+/// another. What remains un-migrated is migrated by the next run, exactly as when a run is bounded
+/// by a note cap.
+///
+/// The resulting plan takes more than [`RunSigningCapacity::max_rounds`] rounds only when a
+/// one-note run already exceeds the budget, which no smaller run can fix; check
+/// [`MigrationPlan::signing_round_count`] if that case must be surfaced.
+pub fn plan_migration_for_signer<P, B, R>(
+    capacity: RunSigningCapacity,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationPlan, MigrationError<B::Error>>
+where
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    plan_migration_for_signer_with(
+        &crate::preparation::default_portfolio(),
+        capacity,
+        params,
+        backend,
+        rng,
+    )
+}
+
+/// As [`plan_migration_for_signer`], planning the preparation transactions against a chosen set of
+/// strategies rather than the ones the crate ships.
+///
+/// Sizing the run costs `O(log capacity.max_notes())` denomination and preparation planning passes
+/// before the run is planned, so this is a few times the cost of [`plan_migration_with`]. Whichever
+/// knobs are passed here must also be passed to [`estimate_migration_runs_for_signer_with`], or the
+/// preview will not describe the runs that get planned.
+pub fn plan_migration_for_signer_with<Pf, P, B, R>(
+    portfolio: &Pf,
+    capacity: RunSigningCapacity,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationPlan, MigrationError<B::Error>>
+where
+    Pf: crate::preparation::Portfolio,
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    plan_migration_sized_with(portfolio, RunSizing::Signer(capacity), params, backend, rng)
+}
+
+/// What bounds one migration run: a note COUNT, or an external signer's CAPACITY (an action budget
+/// per interaction, and how many interactions a run may take).
+///
+/// The two are alternatives, and an application that lets the user choose between them stores this
+/// and passes it to [`plan_migration_sized_with`] and [`estimate_migration_runs_sized_with`]. Each
+/// also has its own entry points, so neither requires going through this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunSizing {
+    /// Prepare at most this many notes, whatever that costs the signer.
+    Notes(NonZeroUsize),
+    /// Prepare as many notes as this signer signs within its rounds, at most
+    /// [`RunSigningCapacity::max_notes`].
+    Signer(RunSigningCapacity),
+}
+
+impl Default for RunSizing {
+    /// The crate's default: [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] notes.
+    fn default() -> Self {
+        Self::Notes(MIGRATION_MAX_PREPARED_NOTES_PER_RUN)
+    }
+}
+
+/// The transaction counts a run capped at `max_notes` would have, over the note structure `notes`
+/// (whose validated total is `balance`): what the denomination and preparation planners produce,
+/// before anything is scheduled. The sizing probe of [`largest_run_size_within`].
+/// The denomination plan for one run over the note structure `notes` (whose validated total is
+/// `balance`), capped at `max_notes`: the canonical decomposition, reconciled against what the
+/// preparation planner can actually mint from those notes.
+///
+/// The reconciliation needs to ask "how many preparation transactions would minting this multiset
+/// take, and can it be minted at all", which is the one capability every caller of
+/// [`plan_denominations`] in this module has to supply. Supplying it once here is what keeps the
+/// sizing probe, the planner and the estimator asking the SAME question of the same wallet.
+fn plan_run_denominations<Pf, R>(
+    portfolio: &Pf,
+    notes: &[Zatoshis],
+    balance: Zatoshis,
+    max_notes: NonZeroUsize,
+    transfer_fee_buffer: Zatoshis,
+    prep_tx_fee: Zatoshis,
+    rng: &mut R,
+) -> DenominationPlan
+where
+    Pf: crate::preparation::Portfolio,
+    R: RngCore + rand_core::CryptoRng,
+{
+    plan_denominations(
+        balance,
+        notes.len(),
+        max_notes,
+        transfer_fee_buffer,
+        prep_tx_fee,
+        &|funding: &[Zatoshis]| {
+            plan_preparation_with(portfolio, notes, funding, prep_tx_fee)
+                .ok()
+                .map(|plan| plan.transaction_count())
+        },
+        rng,
+    )
+}
+
+/// The shape a run capped at `max_notes` would have over the note structure `notes`, or `None` if
+/// no such run can be built: the sizing probe of [`largest_run_size_within`].
+///
+/// `None` is what stops a cap the preparation planner rejects from being read as CHEAP. A rejected
+/// multiset has no transaction count, and reporting zero preparation transactions would make the
+/// shape the least expensive one available, so the search would prefer exactly the caps that
+/// [`plan_migration_sized_with`] then fails to plan.
+///
+/// A run that migrates nothing is a different answer: it is genuinely signable, in zero rounds, at
+/// every cap. The caller learns there is nothing to migrate when it plans, not from the sizing.
+fn run_shape_at<Pf, R>(
+    portfolio: &Pf,
+    notes: &[Zatoshis],
+    balance: Zatoshis,
+    max_notes: NonZeroUsize,
+    transfer_fee_buffer: Zatoshis,
+    prep_tx_fee: Zatoshis,
+    rng: &mut R,
+) -> Option<RunShape>
+where
+    Pf: crate::preparation::Portfolio,
+    R: RngCore + rand_core::CryptoRng,
+{
+    let funding = plan_run_denominations(
+        portfolio,
+        notes,
+        balance,
+        max_notes,
+        transfer_fee_buffer,
+        prep_tx_fee,
+        rng,
+    )
+    .migration_outputs();
+    if funding.is_empty() {
+        return Some(RunShape::new(0, 0));
+    }
+    plan_preparation_with(portfolio, notes, &funding, prep_tx_fee)
+        .ok()
+        .map(|plan| RunShape::new(plan.transaction_count(), funding.len()))
+}
+
+/// The note cap `sizing` chooses for a run over the note structure `notes` (whose validated total is
+/// `balance`).
+fn resolve_max_notes<Pf, R>(
+    sizing: RunSizing,
+    portfolio: &Pf,
+    notes: &[Zatoshis],
+    balance: Zatoshis,
+    transfer_fee_buffer: Zatoshis,
+    prep_tx_fee: Zatoshis,
+    rng: &mut R,
+) -> NonZeroUsize
+where
+    Pf: crate::preparation::Portfolio,
+    R: RngCore + rand_core::CryptoRng,
+{
+    match sizing {
+        RunSizing::Notes(max_notes) => max_notes,
+        RunSizing::Signer(capacity) => largest_run_size_within(capacity, |max_notes| {
+            run_shape_at(
+                portfolio,
+                notes,
+                balance,
+                max_notes,
+                transfer_fee_buffer,
+                prep_tx_fee,
+                rng,
+            )
+        }),
+    }
+}
+
+/// As [`plan_migration`], with both knobs explicit: the preparation strategies to plan against, and
+/// whichever [`RunSizing`] bounds the run. For an application that carries the user's choice of
+/// bound as a value; the fixed-bound entry points ([`plan_migration_with`],
+/// [`plan_migration_for_signer_with`]) are this function with one variant pre-chosen.
+pub fn plan_migration_sized_with<Pf, P, B, R>(
+    portfolio: &Pf,
+    sizing: RunSizing,
     params: &P,
     backend: &B,
     rng: &mut R,
@@ -1621,20 +1841,25 @@ where
     let (prep_tx_fee, transfer_fee_buffer) =
         canonical_fees(params, commit_height).map_err(MigrationError::Fee)?;
 
-    // The preparation-layout capability the decomposition's reconciliation consults: how many
-    // preparation transactions minting a candidate funding multiset takes, or `None` when the
-    // wallet's notes cannot mint it (so the split drops its smallest part and asks again).
-    let prep_tx_count = |funding: &[Zatoshis]| {
-        crate::preparation::plan_preparation_with(portfolio, &notes, funding, prep_tx_fee)
-            .ok()
-            .map(|plan| plan.transaction_count())
-    };
-    let denominations = plan_denominations(
+    // This run's note cap: the caller's, or the largest one an external signer of the given capacity
+    // signs within its rounds, measured over this wallet's current notes.
+    let max_notes = resolve_max_notes(
+        sizing,
+        portfolio,
+        &notes,
         balance,
-        notes.len(),
         transfer_fee_buffer,
         prep_tx_fee,
-        &prep_tx_count,
+        rng,
+    );
+
+    let denominations = plan_run_denominations(
+        portfolio,
+        &notes,
+        balance,
+        max_notes,
+        transfer_fee_buffer,
+        prep_tx_fee,
         rng,
     );
     let funding_notes = denominations.migration_outputs();
@@ -1643,7 +1868,13 @@ where
         // value remains), and DEFERRAL when the balance has a canonical split that this wallet's
         // note values cannot fund; the two need different reporting, so they are distinct errors.
         return Err(
-            if balance_has_canonical_split(balance, notes.len(), transfer_fee_buffer, prep_tx_fee) {
+            if balance_has_canonical_split(
+                balance,
+                notes.len(),
+                max_notes,
+                transfer_fee_buffer,
+                prep_tx_fee,
+            ) {
                 MigrationError::UnfundableSplit
             } else {
                 MigrationError::NothingToMigrate
@@ -1759,11 +1990,13 @@ impl RunEstimate {
     /// distinct from the number of interactions ([`signing_rounds`](Self::signing_rounds)): combine
     /// it with the device's per-action time to estimate how long signing this run will take.
     pub fn actions(&self) -> u32 {
-        let prep = (self.prep_transactions as u64)
-            .saturating_mul(u64::from(crate::signing_rounds::PREPARATION_ACTIONS));
-        let xfer = (self.crossings as u64)
-            .saturating_mul(u64::from(crate::signing_rounds::TRANSFER_ACTIONS));
-        u32::try_from(prep.saturating_add(xfer)).unwrap_or(u32::MAX)
+        self.shape().total_actions()
+    }
+
+    /// This run's [`RunShape`]: the transaction counts its signer-facing quantities are derived
+    /// from, and the same value the sizing search measures a candidate run by.
+    pub fn shape(&self) -> RunShape {
+        RunShape::new(self.prep_transactions, self.crossings)
     }
 
     /// The number of signing ROUNDS this run needs when an external signer is bounded by `budget`
@@ -1776,7 +2009,7 @@ impl RunEstimate {
     ///
     /// [ZIP 374]: https://zips.z.cash/zip-0374
     pub fn signing_rounds(&self, budget: SigningRoundBudget) -> usize {
-        min_signing_rounds(self.prep_transactions, self.crossings, budget)
+        self.shape().signing_rounds(budget)
     }
 }
 
@@ -1912,6 +2145,106 @@ where
     B: MigrationBackend,
     R: RngCore + rand_core::CryptoRng,
 {
+    estimate_migration_runs_with(
+        &crate::preparation::default_portfolio(),
+        MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
+        params,
+        backend,
+        rng,
+    )
+}
+
+/// As [`estimate_migration_runs`], estimating against a chosen set of preparation strategies rather
+/// than the ones the crate ships, and with at most `max_notes` prepared notes per run rather than
+/// the crate's [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] default.
+///
+/// These are exactly [`plan_migration_with`]'s knobs, in the same order, because this previews the
+/// runs that function will plan: the same values must be passed to both, or the preview will not
+/// describe the runs that get planned.
+///
+/// Raising `max_notes` migrates more per run and so takes fewer runs; the whole estimate costs
+/// roughly one [`plan_migration_with`] per run, so its cost scales INVERSELY with `max_notes`.
+pub fn estimate_migration_runs_with<Pf, P, B, R>(
+    portfolio: &Pf,
+    max_notes: NonZeroUsize,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationRunEstimate, MigrationError<B::Error>>
+where
+    Pf: crate::preparation::Portfolio,
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    estimate_migration_runs_sized_with(portfolio, RunSizing::Notes(max_notes), params, backend, rng)
+}
+
+/// As [`estimate_migration_runs`], previewing the runs [`plan_migration_for_signer`] will plan: each
+/// run is sized to what an external signer of `capacity` will sign, so the run count is the number
+/// of signing sessions rather than a function of a note cap.
+///
+/// Sizing is per run, over that run's own note structure, so the runs are not uniform: a wallet
+/// whose first runs consolidate deep fragmentation migrates fewer notes per run there than later,
+/// once its notes are larger.
+pub fn estimate_migration_runs_for_signer<P, B, R>(
+    capacity: RunSigningCapacity,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationRunEstimate, MigrationError<B::Error>>
+where
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    estimate_migration_runs_for_signer_with(
+        &crate::preparation::default_portfolio(),
+        capacity,
+        params,
+        backend,
+        rng,
+    )
+}
+
+/// As [`estimate_migration_runs_for_signer`], estimating against a chosen set of preparation
+/// strategies rather than the ones the crate ships.
+///
+/// These are exactly [`plan_migration_for_signer_with`]'s knobs, because this previews the runs that
+/// function will plan: the same values must be passed to both, or the preview will not describe the
+/// runs that get planned.
+pub fn estimate_migration_runs_for_signer_with<Pf, P, B, R>(
+    portfolio: &Pf,
+    capacity: RunSigningCapacity,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationRunEstimate, MigrationError<B::Error>>
+where
+    Pf: crate::preparation::Portfolio,
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
+    estimate_migration_runs_sized_with(portfolio, RunSizing::Signer(capacity), params, backend, rng)
+}
+
+/// As [`estimate_migration_runs`], with both knobs explicit: the preparation strategies to estimate
+/// against, and whichever [`RunSizing`] bounds each run. The preview counterpart of
+/// [`plan_migration_sized_with`], taking exactly its knobs.
+pub fn estimate_migration_runs_sized_with<Pf, P, B, R>(
+    portfolio: &Pf,
+    sizing: RunSizing,
+    params: &P,
+    backend: &B,
+    rng: &mut R,
+) -> Result<MigrationRunEstimate, MigrationError<B::Error>>
+where
+    Pf: crate::preparation::Portfolio,
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend,
+    R: RngCore + rand_core::CryptoRng,
+{
     let height = backend
         .chain_tip_height()
         .map_err(MigrationError::Backend)?;
@@ -1936,21 +2269,28 @@ where
         // — and hence the whole run count — depends on the wallet's note structure, not just its
         // total value. The closure's borrow of `notes` is released with the block, before `notes` is
         // reassigned below.
-        let denominations = {
-            let prep_tx_count = |funding: &[Zatoshis]| {
-                plan_preparation(&notes, funding, prep_tx_fee)
-                    .ok()
-                    .map(|plan| plan.transaction_count())
-            };
-            plan_denominations(
-                balance,
-                notes.len(),
-                transfer_fee_buffer,
-                prep_tx_fee,
-                &prep_tx_count,
-                rng,
-            )
-        };
+        // This run's note cap, chosen over the note structure THIS run starts from: a signer-sized
+        // migration re-sizes every run, since the wallet's fragmentation — and so a run's
+        // preparation cost — changes as earlier runs consolidate it.
+        let max_notes = resolve_max_notes(
+            sizing,
+            portfolio,
+            &notes,
+            balance,
+            transfer_fee_buffer,
+            prep_tx_fee,
+            rng,
+        );
+
+        let denominations = plan_run_denominations(
+            portfolio,
+            &notes,
+            balance,
+            max_notes,
+            transfer_fee_buffer,
+            prep_tx_fee,
+            rng,
+        );
 
         let funding = denominations.migration_outputs();
         if funding.is_empty() {
@@ -1966,8 +2306,8 @@ where
         // the note-preparation side of the estimate, and which notes it spends and which residuals it
         // leaves give the next run's note structure. The denomination plan only ever proposes a funding
         // multiset the preparation planner accepted, so this plan succeeds by construction.
-        let preparation =
-            plan_preparation(&notes, &funding, prep_tx_fee).map_err(MigrationError::Preparation)?;
+        let preparation = plan_preparation_with(portfolio, &notes, &funding, prep_tx_fee)
+            .map_err(MigrationError::Preparation)?;
         runs.push(RunEstimate {
             migratable: denominations.total_migratable(),
             crossings: funding.len(),
@@ -4838,11 +5178,11 @@ pub(crate) mod tests {
             "a whale migrates over several runs, got {}",
             est.run_count()
         );
-        let per_run_cap = MIGRATION_MAX_PREPARED_NOTES_PER_RUN as u64 * u64::from(DENOM_CAP);
+        let per_run_cap = MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get() as u64 * u64::from(DENOM_CAP);
         assert_eq!(u64::from(est.runs()[0].migratable()), per_run_cap);
         assert_eq!(
             est.runs()[0].crossings(),
-            MIGRATION_MAX_PREPARED_NOTES_PER_RUN
+            MIGRATION_MAX_PREPARED_NOTES_PER_RUN.get()
         );
         let summed: usize = est.runs().iter().map(|r| r.crossings()).sum();
         assert_eq!(est.total_crossings(), summed);

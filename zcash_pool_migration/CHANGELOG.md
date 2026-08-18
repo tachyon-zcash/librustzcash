@@ -31,8 +31,77 @@ and this library adheres to Rust's notion of
   match (a migration PCZT carries padding dummies with throwaway keys), so a
   foreign key would sign nothing, succeed, and persist a run recorded as
   `Signed` whose transactions carry no signatures.
+- `denomination::CanonicalOneTwoFive::with_max_notes`, the ZIP 318 canonical
+  strategy with a caller-chosen per-run note count. Only the count is a
+  parameter: the `{1, 2, 5} * 10^k` denomination set and its `DENOM_CAP` and
+  `MAX_RESIDUAL_VALUE` bounds are normative ZIP 318 values, so they are not
+  caller-settable and do not appear in the signature. A wallet chooses how big
+  one run is; it never chooses which values cross the turnstile, because the
+  privacy argument rests on every wallet publishing from the same set.
+  `denomination::CanonicalOneTwoFive::recommended` now delegates to it.
+- `engine::estimate_migration_runs_with`, the preview counterpart of
+  `engine::plan_migration_with`: it takes the same preparation portfolio and the
+  same per-run note cap, in the same order, so an application can preview the
+  runs it is about to plan. The same values must be passed to both, or the
+  preview will not describe the runs that get planned. Its cost scales inversely
+  with the cap, since a bigger run means fewer runs to iterate.
+- `signing_rounds::RunSigningCapacity`, `signing_rounds::RunShape` and
+  `signing_rounds::largest_run_size_within`: bounding a run by what a signer will
+  sign, and the search that turns that bound into a per-run note cap. This is the
+  inverse of the round count in the run SIZE, as
+  `signing_rounds::min_budget_for_rounds` is its inverse in the BUDGET. Under a
+  round count non-decreasing in the cap — which the canonical decomposition
+  gives — the chosen cap is the largest run the signer signs; otherwise it is
+  still one that fits. The shape oracle returns an `Option`, and a `None` — no
+  run can be built at that cap — is treated as not fitting, so a cap that cannot
+  be planned is never preferred over one that can.
+- `signing_rounds::RunShape::total_actions`, `engine::MigrationPlan::shape` and
+  `engine::RunEstimate::shape`. A run's signer-facing quantities all derive from
+  the same pair of transaction counts, so that pair is now named once and asked
+  the questions directly: a plan and an estimate both hand out a
+  `signing_rounds::RunShape` and delegate their action and round counts to it,
+  instead of each deriving them again.
+- `engine::plan_migration_for_signer` and
+  `engine::plan_migration_for_signer_with`, which size a run by an external
+  signer's capacity instead of by a note count, so one run is one signing
+  session. A note cap cannot express that bound: a run's actions are
+  `16 * preparations + 3 * transfers`, and the preparation count follows the
+  wallet's fragmentation, so the same cap yields a one-round run for one wallet
+  and a four-round run for another. Both sizings are supported;
+  `engine::plan_migration` and `engine::plan_migration_with` are unchanged and
+  keep sizing by note count. The resulting plan exceeds the signer's rounds only
+  when a one-note run already does, which no smaller run can fix; the overflow is
+  visible in `engine::MigrationPlan::signing_round_count`.
+- `engine::estimate_migration_runs_for_signer` and
+  `engine::estimate_migration_runs_for_signer_with`, the preview counterparts,
+  taking exactly the planning functions' knobs. Sizing is per run, over that
+  run's own note structure, so a wallet migrates fewer notes in the runs that
+  consolidate its fragmentation and more once its notes are larger.
+- `engine::RunSizing`, `engine::plan_migration_sized_with` and
+  `engine::estimate_migration_runs_sized_with`: the bound as a VALUE (a note
+  count or a signer capacity) and the entry points that take it, for an
+  application that lets the user choose between the two and carries that choice.
+  The fixed-bound entry points are these with one variant pre-chosen.
+- `testing::arb_run_signing_capacity`, a `proptest` strategy over
+  `signing_rounds::RunSigningCapacity`.
 
 ### Changed
+- `denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN` is a `NonZeroUsize` where
+  it was a `usize`. A run that prepares no notes migrates nothing, so zero is
+  not a cap a caller can now express. Read it with `.get()` where a `usize` is
+  wanted.
+- `denomination::plan_denominations` takes a `NonZeroUsize` per-run note cap,
+  after the spendable note count, and `engine::plan_migration_with` takes one in
+  second position, after the portfolio. This is the only denomination knob a
+  wallet may set; the denomination scheme and its ZIP 318 bounds remain fixed.
+  `engine::plan_migration` is unchanged and passes
+  `denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN`, as does
+  `engine::estimate_migration_runs`.
+- `engine::estimate_migration_runs` now plans each estimated run's preparation
+  through the same portfolio the plan will use. It previously always estimated
+  against the crate's default strategies, so an application planning under
+  `engine::plan_migration_with` with a different portfolio could be previewed a
+  run count that its own plans would not produce.
 - `wallet::WalletMigration::new` takes the account's `UnifiedFullViewingKey`
   where it took a `UnifiedSpendingKey`, and is infallible. The adapter holds
   viewing authority and nothing else, and it holds the unified key WHOLE rather
