@@ -7,7 +7,7 @@ use crate::transaction::{
     sighash_v5::transparent_sig_digest, txid::to_hash_v6,
 };
 
-#[cfg(zcash_unstable = "zfuture")]
+#[cfg(zcash_unstable = "nutachyon")]
 use crate::transaction::txid::to_hash_v7;
 
 pub fn v6_signature_hash<
@@ -43,7 +43,7 @@ pub fn v6_signature_hash<
 /// Computes the v7 (tachyon) signature hash: the v6 sighash tree with the tachyon bundle's
 /// effecting commitment appended, so tachyon signatures commit to `hActionsTachyon` and
 /// `valueBalanceTachyon` (the stamp is excluded as malleable authorizing data).
-#[cfg(zcash_unstable = "zfuture")]
+#[cfg(zcash_unstable = "nutachyon")]
 pub fn v7_signature_hash<
     TA: TransparentAuthorizingContext,
     A: Authorization<TransparentAuth = TA>,

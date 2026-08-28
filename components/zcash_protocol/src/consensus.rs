@@ -502,8 +502,8 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(3_428_143)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => None,
         }
     }
 }
@@ -537,8 +537,8 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Nu6_3 => Some(BlockHeight(4_134_000)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => None,
         }
     }
 }
@@ -620,15 +620,9 @@ pub enum NetworkUpgrade {
     /// [Nu7 (proposed)]: https://z.cash/upgrade/nu7/
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
-    /// The ZFUTURE network upgrade.
-    ///
-    /// This upgrade is expected never to activate on mainnet; it is intended for use in
-    /// integration testing of functionality that is a candidate for integration in a future
-    /// network upgrade.
-    ///
-    /// On this fork, ZFUTURE deploys the tachyon protocol.
-    #[cfg(zcash_unstable = "zfuture")]
-    ZFuture,
+    /// The NuTachyon network upgrade.
+    #[cfg(zcash_unstable = "nutachyon")]
+    NuTachyon,
 }
 
 #[cfg(feature = "std")]
@@ -649,8 +643,8 @@ impl fmt::Display for NetworkUpgrade {
             NetworkUpgrade::Nu6_3 => write!(f, "Nu6.3"),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => write!(f, "Nu7"),
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => write!(f, "ZFUTURE"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => write!(f, "NuTachyon"),
         }
     }
 }
@@ -673,8 +667,8 @@ impl NetworkUpgrade {
             NetworkUpgrade::Nu6_3 => BranchId::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => BranchId::Nu7,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => BranchId::ZFuture,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => BranchId::NuTachyon,
         }
     }
 }
@@ -696,8 +690,8 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     NetworkUpgrade::Nu6_3,
     #[cfg(zcash_unstable = "nu7")]
     NetworkUpgrade::Nu7,
-    #[cfg(zcash_unstable = "zfuture")]
-    NetworkUpgrade::ZFuture,
+    #[cfg(zcash_unstable = "nutachyon")]
+    NetworkUpgrade::NuTachyon,
 ];
 
 /// The "grace period" defined in [ZIP 212].
@@ -754,11 +748,9 @@ pub enum BranchId {
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu7`].
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
-    /// Candidates for future consensus rules; this branch will never activate on mainnet.
-    ///
-    /// On this fork, this is the branch that deploys the tachyon protocol.
-    #[cfg(zcash_unstable = "zfuture")]
-    ZFuture,
+    /// The consensus rules deployed by [`NetworkUpgrade::NuTachyon`].
+    #[cfg(zcash_unstable = "nutachyon")]
+    NuTachyon,
 }
 
 #[cfg(feature = "std")]
@@ -781,9 +773,9 @@ impl TryFrom<u32> for BranchId {
             0x5437_f330 => Ok(BranchId::Nu6_2),
             0x37a5_165b => Ok(BranchId::Nu6_3),
             #[cfg(zcash_unstable = "nu7")]
-            0x7719_0ad8 => Ok(BranchId::Nu7),
-            #[cfg(zcash_unstable = "zfuture")]
-            0xffff_fffd => Ok(BranchId::ZFuture),
+            0xffff_ffff => Ok(BranchId::Nu7),
+            #[cfg(zcash_unstable = "nutachyon")]
+            0xffff_fffc => Ok(BranchId::NuTachyon),
             _ => Err("Unknown consensus branch ID"),
         }
     }
@@ -804,9 +796,9 @@ impl From<BranchId> for u32 {
             BranchId::Nu6_2 => 0x5437_f330,
             BranchId::Nu6_3 => 0x37a5_165b,
             #[cfg(zcash_unstable = "nu7")]
-            BranchId::Nu7 => 0x7719_0ad8,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => 0xffff_fffd,
+            BranchId::Nu7 => 0xffff_ffff,
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => 0xffff_fffc,
         }
     }
 }
@@ -846,8 +838,8 @@ impl BranchId {
             BranchId::Nu6_3 => NetworkUpgrade::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => NetworkUpgrade::Nu7,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => NetworkUpgrade::ZFuture,
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => NetworkUpgrade::NuTachyon,
         })
     }
 
@@ -909,25 +901,27 @@ impl BranchId {
             BranchId::Nu6_3 => params
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .map(|lower| {
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    let nu_tachyon = params.activation_height(NetworkUpgrade::NuTachyon);
+                    #[cfg(not(zcash_unstable = "nutachyon"))]
+                    let nu_tachyon = None;
                     #[cfg(zcash_unstable = "nu7")]
-                    let upper = params.activation_height(NetworkUpgrade::Nu7);
-                    #[cfg(all(not(zcash_unstable = "nu7"), zcash_unstable = "zfuture"))]
-                    let upper = params.activation_height(NetworkUpgrade::ZFuture);
-                    #[cfg(not(any(zcash_unstable = "nu7", zcash_unstable = "zfuture")))]
-                    let upper = None;
+                    let upper = params.activation_height(NetworkUpgrade::Nu7).or(nu_tachyon);
+                    #[cfg(not(zcash_unstable = "nu7"))]
+                    let upper = nu_tachyon;
                     (lower, upper)
                 }),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => params.activation_height(NetworkUpgrade::Nu7).map(|lower| {
-                #[cfg(zcash_unstable = "zfuture")]
-                let upper = params.activation_height(NetworkUpgrade::ZFuture);
-                #[cfg(not(zcash_unstable = "zfuture"))]
+                #[cfg(zcash_unstable = "nutachyon")]
+                let upper = params.activation_height(NetworkUpgrade::NuTachyon);
+                #[cfg(not(zcash_unstable = "nutachyon"))]
                 let upper = None;
                 (lower, upper)
             }),
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => params
-                .activation_height(NetworkUpgrade::ZFuture)
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => params
+                .activation_height(NetworkUpgrade::NuTachyon)
                 .map(|lower| (lower, None)),
         }
     }
@@ -945,8 +939,8 @@ impl BranchId {
             BranchId::Nu6_3 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => false,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => false,
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => false,
         }
     }
 
@@ -959,8 +953,8 @@ impl BranchId {
             BranchId::Nu6_3 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => true,
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => true,
         }
     }
 
@@ -973,8 +967,8 @@ impl BranchId {
             BranchId::Nu6_3 => true,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => true,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => true,
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon => true,
         }
     }
 
@@ -990,8 +984,8 @@ impl BranchId {
             Nu6_3 => Some(OrchardProtocolRevision::V3),
             #[cfg(zcash_unstable = "nu7")]
             Nu7 => Some(OrchardProtocolRevision::V3),
-            #[cfg(zcash_unstable = "zfuture")]
-            ZFuture => Some(OrchardProtocolRevision::V3),
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon => Some(OrchardProtocolRevision::V3),
         }
     }
 }
@@ -1041,8 +1035,8 @@ pub mod testing {
             BranchId::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture,
+            #[cfg(zcash_unstable = "nutachyon")]
+            BranchId::NuTachyon,
         ])
     }
 
@@ -1120,6 +1114,11 @@ mod tests {
     #[test]
     fn branch_id_from_u32() {
         assert_eq!(BranchId::try_from(0), Ok(BranchId::Sprout));
+        #[cfg(zcash_unstable = "nutachyon")]
+        {
+            assert_eq!(BranchId::try_from(0xffff_fffc), Ok(BranchId::NuTachyon));
+            assert_eq!(u32::from(BranchId::NuTachyon), 0xffff_fffc);
+        }
         assert!(BranchId::try_from(1).is_err());
     }
 
@@ -1147,6 +1146,11 @@ mod tests {
         #[cfg(zcash_unstable = "nu7")]
         assert_eq!(
             BranchId::Nu7.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::V3)
+        );
+        #[cfg(zcash_unstable = "nutachyon")]
+        assert_eq!(
+            BranchId::NuTachyon.orchard_protocol_revision(),
             Some(OrchardProtocolRevision::V3)
         );
     }

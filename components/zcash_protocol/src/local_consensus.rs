@@ -33,8 +33,8 @@ use crate::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parameters};
 ///         nu6_3: Some(BlockHeight::from_u32(1)),
 ///         #[cfg(zcash_unstable = "nu7")]
 ///         nu7: Some(BlockHeight::from_u32(1)),
-///         #[cfg(zcash_unstable = "zfuture")]
-///         z_future: Some(BlockHeight::from_u32(1)),
+///         #[cfg(zcash_unstable = "nutachyon")]
+///         nu_tachyon: Some(BlockHeight::from_u32(1)),
 ///     };
 ///     ```
 ///
@@ -52,8 +52,8 @@ pub struct LocalNetwork {
     pub nu6_3: Option<BlockHeight>,
     #[cfg(zcash_unstable = "nu7")]
     pub nu7: Option<BlockHeight>,
-    #[cfg(zcash_unstable = "zfuture")]
-    pub z_future: Option<BlockHeight>,
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub nu_tachyon: Option<BlockHeight>,
 }
 
 /// Parameters implementation for `LocalNetwork`
@@ -76,8 +76,8 @@ impl Parameters for LocalNetwork {
             NetworkUpgrade::Nu6_3 => self.nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => self.nu7,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => self.z_future,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => self.nu_tachyon,
         }
     }
 }
@@ -104,8 +104,8 @@ mod tests {
         let expected_nu6_3 = BlockHeight::from_u32(10);
         #[cfg(zcash_unstable = "nu7")]
         let expected_nu7 = BlockHeight::from_u32(11);
-        #[cfg(zcash_unstable = "zfuture")]
-        let expected_z_future = BlockHeight::from_u32(12);
+        #[cfg(zcash_unstable = "nutachyon")]
+        let expected_nu_tachyon = BlockHeight::from_u32(12);
 
         let regtest = LocalNetwork {
             overwinter: Some(expected_overwinter),
@@ -120,8 +120,8 @@ mod tests {
             nu6_3: Some(expected_nu6_3),
             #[cfg(zcash_unstable = "nu7")]
             nu7: Some(expected_nu7),
-            #[cfg(zcash_unstable = "zfuture")]
-            z_future: Some(expected_z_future),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: Some(expected_nu_tachyon),
         };
 
         assert!(regtest.is_nu_active(NetworkUpgrade::Overwinter, expected_overwinter));
@@ -137,9 +137,11 @@ mod tests {
         // nu7 must not be activated at or below the nu6_3 height
         #[cfg(zcash_unstable = "nu7")]
         assert!(!regtest.is_nu_active(NetworkUpgrade::Nu7, expected_nu6_3));
-        // zfuture must not be activated at or below the nu6_3 height
-        #[cfg(zcash_unstable = "zfuture")]
-        assert!(!regtest.is_nu_active(NetworkUpgrade::ZFuture, expected_nu6_3));
+        #[cfg(zcash_unstable = "nutachyon")]
+        {
+            assert!(!regtest.is_nu_active(NetworkUpgrade::NuTachyon, expected_nu6_3));
+            assert!(regtest.is_nu_active(NetworkUpgrade::NuTachyon, expected_nu_tachyon));
+        }
     }
 
     #[test]
@@ -156,8 +158,8 @@ mod tests {
         let expected_nu6_3 = BlockHeight::from_u32(10);
         #[cfg(zcash_unstable = "nu7")]
         let expected_nu7 = BlockHeight::from_u32(11);
-        #[cfg(zcash_unstable = "zfuture")]
-        let expected_z_future = BlockHeight::from_u32(12);
+        #[cfg(zcash_unstable = "nutachyon")]
+        let expected_nu_tachyon = BlockHeight::from_u32(12);
 
         let regtest = LocalNetwork {
             overwinter: Some(expected_overwinter),
@@ -172,8 +174,8 @@ mod tests {
             nu6_3: Some(expected_nu6_3),
             #[cfg(zcash_unstable = "nu7")]
             nu7: Some(expected_nu7),
-            #[cfg(zcash_unstable = "zfuture")]
-            z_future: Some(expected_z_future),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: Some(expected_nu_tachyon),
         };
 
         assert_eq!(
@@ -221,10 +223,10 @@ mod tests {
             regtest.activation_height(NetworkUpgrade::Nu7),
             Some(expected_nu7)
         );
-        #[cfg(zcash_unstable = "zfuture")]
+        #[cfg(zcash_unstable = "nutachyon")]
         assert_eq!(
-            regtest.activation_height(NetworkUpgrade::ZFuture),
-            Some(expected_z_future)
+            regtest.activation_height(NetworkUpgrade::NuTachyon),
+            Some(expected_nu_tachyon)
         );
     }
 
@@ -242,8 +244,8 @@ mod tests {
         let expected_nu6_3 = BlockHeight::from_u32(10);
         #[cfg(zcash_unstable = "nu7")]
         let expected_nu7 = BlockHeight::from_u32(11);
-        #[cfg(zcash_unstable = "zfuture")]
-        let expected_z_future = BlockHeight::from_u32(12);
+        #[cfg(zcash_unstable = "nutachyon")]
+        let expected_nu_tachyon = BlockHeight::from_u32(12);
 
         let regtest = LocalNetwork {
             overwinter: Some(expected_overwinter),
@@ -258,8 +260,8 @@ mod tests {
             nu6_3: Some(expected_nu6_3),
             #[cfg(zcash_unstable = "nu7")]
             nu7: Some(expected_nu7),
-            #[cfg(zcash_unstable = "zfuture")]
-            z_future: Some(expected_z_future),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: Some(expected_nu_tachyon),
         };
 
         assert_eq!(regtest.coin_type(), constants::regtest::COIN_TYPE);
