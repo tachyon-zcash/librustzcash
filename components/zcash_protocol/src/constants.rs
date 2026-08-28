@@ -41,15 +41,11 @@ pub const V6_TX_VERSION: u32 = 6;
 /// The version group ID for Zcash v6 transactions.
 pub const V6_VERSION_GROUP_ID: u32 = 0xD884B698;
 
-/// Transaction version 7, the tachyon transaction format.
-///
-/// V7 reuses the v6 (Ironwood / NU6.3) transaction body and additionally carries a tachyon
-/// bundle. It is used for the tachyon (NU7) activation in this fork.
-///
-/// NOTE: this version group ID is a placeholder chosen by the tachyon fork ("tach" in ASCII); it
-/// is not yet specified in a ZIP. Replace it once the tachyon transaction format is finalized.
+/// Transaction version 7, introduced by the NuTachyon network upgrade.
+#[cfg(zcash_unstable = "nutachyon")]
 pub const V7_TX_VERSION: u32 = 7;
-/// The version group ID for Zcash v7 (tachyon) transactions.
+/// The placeholder version group ID for Zcash v7 transactions ("tach" in ASCII).
+#[cfg(zcash_unstable = "nutachyon")]
 pub const V7_VERSION_GROUP_ID: u32 = 0x74616368;
 
 /// The maximum size in bytes of a Zcash block, and therefore the maximum size of any single

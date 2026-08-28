@@ -18,6 +18,9 @@ use {
     zcash_script::script,
 };
 
+#[cfg(all(test, zcash_unstable = "nutachyon"))]
+use zcash_protocol::constants::{V7_TX_VERSION, V7_VERSION_GROUP_ID};
+
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
 use {
     crate::transaction::{
@@ -27,9 +30,6 @@ use {
     },
     blake2b_simd::Params,
     ff::PrimeField,
-    // Only the `not(nu7)` tests below drive proptest strategies by hand; upstream keeps these
-    // in the ungated block because it never lints with `zcash_unstable = "zfuture"`.
-    proptest::{strategy::ValueTree, test_runner::TestRunner},
     zcash_protocol::value::ZatBalance,
 };
 
@@ -67,6 +67,47 @@ fn suggested_version_for_v5_branches_is_not_v6() {
         TxVersion::suggested_for_branch(BranchId::Nu6_1),
         TxVersion::V5
     );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nutachyon")]
+fn v7_is_enabled_by_nu_tachyon_and_roundtrips() {
+    assert_eq!(
+        TxVersion::suggested_for_branch(BranchId::NuTachyon),
+        TxVersion::V7
+    );
+    assert!(TxVersion::V7.valid_in_branch(BranchId::NuTachyon));
+    assert!(!TxVersion::V7.valid_in_branch(BranchId::Nu6_3));
+
+    let tx = TransactionData::from_parts_v7(
+        BranchId::NuTachyon,
+        0,
+        0u32.into(),
+        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+        Zatoshis::ZERO,
+        None,
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap();
+
+    let mut encoded = Vec::new();
+    tx.write(&mut encoded).unwrap();
+    assert_eq!(&encoded[..4], &(V7_TX_VERSION | (1 << 31)).to_le_bytes());
+    assert_eq!(&encoded[4..8], &V7_VERSION_GROUP_ID.to_le_bytes());
+    assert_eq!(
+        &encoded[8..12],
+        &u32::from(BranchId::NuTachyon).to_le_bytes()
+    );
+
+    let decoded = Transaction::read(&encoded[..], BranchId::Sprout).unwrap();
+    assert_eq!(decoded.version(), TxVersion::V7);
+    assert_eq!(decoded.consensus_branch_id(), BranchId::NuTachyon);
+    let mut reencoded = Vec::new();
+    decoded.write(&mut reencoded).unwrap();
+    assert_eq!(reencoded, encoded);
 }
 
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
@@ -165,6 +206,8 @@ fn v6_empty_orchard_txid_uses_v6_orchard_personalization() {
 #[cfg(all(test, not(zcash_unstable = "nu7")))]
 #[test]
 fn v6_branch_reconstruction_preserves_ironwood_bundle() {
+    use proptest::test_runner::TestRunner;
+
     let mut runner = TestRunner::default();
     let ironwood_bundle = test_ironwood_bundle(&mut runner);
     let tx = TransactionData::from_parts_v6(
@@ -229,6 +272,8 @@ fn test_anchor(byte: u8) -> orchard::Anchor {
 fn test_orchard_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> orchard::Bundle<orchard::bundle::Authorized, ZatBalance> {
+    use proptest::strategy::ValueTree;
+
     let bundle = crate::transaction::components::orchard::testing::arb_bundle(1)
         .new_tree(runner)
         .unwrap()
@@ -243,6 +288,8 @@ fn test_orchard_bundle(
 fn test_ironwood_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> orchard::Bundle<orchard::bundle::Authorized, ZatBalance> {
+    use proptest::strategy::ValueTree;
+
     let bundle = crate::transaction::components::orchard::testing::arb_bundle(1)
         .new_tree(runner)
         .unwrap()
@@ -278,6 +325,8 @@ fn test_sapling_anchor(byte: u8) -> bls12_381::Scalar {
 fn test_sapling_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> sapling::Bundle<sapling::bundle::Authorized, ZatBalance> {
+    use proptest::strategy::ValueTree;
+
     let bundle_strategy =
         crate::transaction::components::sapling::testing::arb_bundle_for_version(TxVersion::V6);
 
@@ -296,6 +345,8 @@ fn test_sapling_bundle(
 fn test_sapling_output_only_bundle(
     runner: &mut proptest::test_runner::TestRunner,
 ) -> sapling::Bundle<sapling::bundle::Authorized, ZatBalance> {
+    use proptest::strategy::ValueTree;
+
     let bundle_strategy =
         crate::transaction::components::sapling::testing::arb_bundle_for_version(TxVersion::V6);
 
@@ -874,6 +925,15 @@ proptest! {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+    #[test]
+    fn tx_serialization_roundtrip_nu_tachyon(tx in arb_tx(BranchId::NuTachyon)) {
+        check_roundtrip(tx)?;
+    }
+}
+
 #[test]
 fn zip_0143() {
     for tv in self::data::zip_0143::make_test_vectors() {
@@ -1110,7 +1170,7 @@ fn zip_0244() {
     }
 }
 
-#[cfg(zcash_unstable = "zfuture")]
+#[cfg(zcash_unstable = "nutachyon")]
 #[test]
 fn tachyon_v7_test_vectors() {
     use self::data::tachyon_vectors::*;
@@ -1129,7 +1189,14 @@ fn tachyon_v7_test_vectors() {
 
     // Helper: deserialize, check version, roundtrip
     let read_and_roundtrip = |data: &[u8]| -> Transaction {
-        let tx = Transaction::read(data, BranchId::ZFuture).unwrap();
+        let mut reader = std::io::Cursor::new(data);
+        let tx = Transaction::read(&mut reader, BranchId::NuTachyon).unwrap_or_else(|error| {
+            panic!(
+                "failed to read {}-byte V7 fixture at byte {}: {error}",
+                data.len(),
+                reader.position()
+            )
+        });
         assert_eq!(tx.version, TxVersion::V7);
 
         let mut encoded = Vec::with_capacity(data.len());
@@ -1208,12 +1275,9 @@ fn tachyon_v7_test_vectors() {
 
 // V7_TX_TACHYON_MULTI_ACTION: 2 actions, stamp with 3 tachygrams, value_balance = 300.
 //
-// Tachyon requires a bundle's actions and a
-// stamp's tachygrams to be in canonical (sorted) order on the wire (see
-// `Bundle::read_body` and `ProofStamp::read`). The fixture is generated with both
-// sorted, so the specific action/tachygram order is determined by that sort rather
-// than by construction order; the assertions below are therefore order-independent.
-#[cfg(zcash_unstable = "zfuture")]
+// A stamp's tachygrams are canonically sorted on the wire. The assertions below
+// are order-independent so they check fixture contents rather than construction order.
+#[cfg(zcash_unstable = "nutachyon")]
 #[test]
 fn tachyon_v7_multi_action() {
     use self::data::tachyon_vectors::*;
@@ -1241,7 +1305,7 @@ fn tachyon_v7_multi_action() {
         bytes
     };
 
-    let tx = Transaction::read(&V7_TX_TACHYON_MULTI_ACTION[..], BranchId::ZFuture).unwrap();
+    let tx = Transaction::read(&V7_TX_TACHYON_MULTI_ACTION[..], BranchId::NuTachyon).unwrap();
     assert_eq!(tx.version, TxVersion::V7);
 
     let mut encoded = Vec::with_capacity(V7_TX_TACHYON_MULTI_ACTION.len());

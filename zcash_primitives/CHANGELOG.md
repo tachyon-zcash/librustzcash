@@ -11,6 +11,16 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- Experimental `TxVersion::V7` and `TransactionData::from_parts_v7` support
+  behind `zcash_unstable="nutachyon"`. V7 is enabled by NuTachyon and extends
+  the V6 transaction body and digest structure with the Tachyon bundle.
+- `TransactionData::tachyon_bundle`,
+  `TransactionDigest::{TachyonDigest, digest_tachyon}`, `v7_signature_hash`,
+  and the `transaction::components::tachyon` module.
+
+## [0.30.1] - 2026-08-18
+
+### Added
 - `zcash_primitives::transaction::components::sapling::SPEND_DESCRIPTION_SIZE` and
   `OUTPUT_DESCRIPTION_SIZE`, the sizes in bytes of a Sapling spend description and
   output description in their v4 (pre-NU5) serialized forms. Each is the full
@@ -32,17 +42,6 @@ workspace.
   `TRANSPARENT_BUNDLE_OVERHEAD`, and `TX_HEADER_SIZE`, the consensus-maximum
   transparent input size, the transparent bundle overhead, and the fixed
   transaction header size used in serialized-size estimation.
-
-### Changed
-- The tachyon protocol now lives behind `#[cfg(zcash_unstable = "zfuture")]`
-  instead of `#[cfg(zcash_unstable = "nu7")]`, and is deployed by
-  `BranchId::ZFuture` rather than `BranchId::Nu7`. `TxVersion::V7`,
-  `TransactionData::tachyon_bundle`, `TransactionDigest::{TachyonDigest,
-  digest_tachyon}`, `v7_signature_hash`, and the `components::tachyon` module
-  all moved with it, as did the `zcash_tachyon` dependency. Upstream's NU7
-  surface (including ZIP 233) is untouched: `BranchId::Nu7` again suggests and
-  accepts v6 transactions, and `BranchId::ZFuture` is what suggests and accepts
-  v7 transactions.
 
 ## [0.30.0] - 2026-07-23
 

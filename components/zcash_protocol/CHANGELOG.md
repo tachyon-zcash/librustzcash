@@ -11,11 +11,13 @@ workspace.
 ## [Unreleased]
 
 ### Added
-- Restored the ZFUTURE network upgrade, behind `#[cfg(zcash_unstable =
-  "zfuture")]`: `NetworkUpgrade::ZFuture`, `BranchId::ZFuture` (consensus branch
-  id `0xffff_fffd`, matching Zebra's value), and `LocalNetwork::z_future`. On
-  this fork ZFUTURE is the network upgrade that deploys the tachyon protocol;
-  upstream had removed ZFUTURE along with Transparent Zcash Extensions.
+- Experimental NuTachyon support behind `zcash_unstable="nutachyon"`, including
+  its network upgrade, consensus branch ID, local-consensus activation parameter,
+  and V7 transaction format constants.
+
+## [0.10.5] - 2026-08-18
+
+### Added
 - `TxId::as_hex`, an encoder producing the canonical byte-reversed display
   form previously only available via `TxId`'s `Display` impl.
 - `TxId::from_hex`, parsing the canonical (byte-reversed) hexadecimal display
